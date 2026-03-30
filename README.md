@@ -4,12 +4,12 @@ import matplotlib.pyplot as plt
 # ==========================================
 # PARAMÈTRES GLOBAUX & SWITCH
 # ==========================================
-dt_imu = 0.01
-dt_gps = 0.1
-sim_time = 30.0 # On allonge un peu pour bien voir la dérive s'accumuler
+dt_imu = 0.01   # IMU à 100 Hz
+dt_gps = 1.0    # NOUVEAU : GPS très lent (1 Hz) pour laisser la dérive s'accumuler
+sim_time = 30.0 
 
 # 🔴 LE BOOLÉEN MAGIQUE 🔴
-USE_RANGING = True  # Mets True pour coupler les drones, False pour les rendre indépendants
+USE_RANGING = True  # Mets True pour coupler les drones, False pour les séparer
 
 N_steps = int(sim_time / dt_imu)
 time = np.arange(0, sim_time, dt_imu)
@@ -19,10 +19,10 @@ time = np.arange(0, sim_time, dt_imu)
 # ==========================================
 class SwarmEKF:
     def __init__(self, start_y2=10.0):
-        # Bruits standard (inchangés, l'EKF croit que l'IMU est bonne)
+        # Bruits standard (l'EKF croit que l'IMU est bonne)
         q = np.diag([0.01, 0.01, 0.1, 0.1, np.deg2rad(1.0)]) ** 2
         self.Q = np.block([[q, np.zeros((5,5))],
-                           [np.zeros((5,5)), q]]) # Matrice 10x10
+                           [np.zeros((5,5)), q]]) 
 
         self.R_gps = np.diag([3.0, 3.0, 3.0, 3.0]) ** 2
         self.R_dist = np.array([[0.5 ** 2]]) # Capteur UWB (ex: 50 cm d'incertitude)
@@ -42,7 +42,7 @@ class SwarmEKF:
 
     def simulate_truth_and_get_imu(self, dt):
         """Met à jour la vérité et génère les IMU des deux drones"""
-        # Consignes de vol nominales (physiquement, ils volent bien)
+        # Consignes de vol nominales 
         ax, ay, omega = 0.5, 0.0, 0.3
 
         for i in [0, 5]:
@@ -57,8 +57,7 @@ class SwarmEKF:
         u_imu1 = np.array([[ax], [ay], [omega]]) + np.random.multivariate_normal([0,0,0], np.diag([0.2, 0.2, 0.05])**2).reshape(3,1)
 
         # 🟠 INJECTION DE BIAIS IMU SUR DRONE 2 🟠
-        # On ajoute un biais constant sur l'accélération X et Y et sur la vitesse de rotation
-        # Le drone 2 *pense* qu'il accélère plus fort qu'il ne le fait réellement.
+        # Le drone 2 accélère "plus fort" et tourne "plus vite" dans sa tête
         bias_u2 = np.array([[0.1], [0.05], [np.deg2rad(0.5)]])
         u_imu2 = np.array([[ax], [ay], [omega]]) + bias_u2 + np.random.multivariate_normal([0,0,0], np.diag([0.2, 0.2, 0.05])**2).reshape(3,1)
 
@@ -151,11 +150,13 @@ for i in range(N_steps):
     u_imu1, u_imu2 = swarm.simulate_truth_and_get_imu(dt_imu)
     swarm.predict(u_imu1, u_imu2, dt_imu)
 
-    if i % 10 == 0:
+    # NOUVEAU : GPS très lent (1 Hz -> toutes les 100 itérations)
+    if i % 100 == 0:
         swarm.update_gps(t_actuel)
 
-        if USE_RANGING:
-            swarm.update_distance()
+    # Ranging rapide (10 Hz -> toutes les 10 itérations)
+    if USE_RANGING and i % 10 == 0:
+        swarm.update_distance()
 
     swarm.save_history()
 
@@ -176,7 +177,6 @@ dist_est = np.sqrt((X_e[:, 5] - X_e[:, 0])**2 + (X_e[:, 6] - X_e[:, 1])**2)
 # ==========================================
 fig = plt.figure(figsize=(18, 18))
 
-# Titre dynamique
 état_ranging = "AVEC Couplage (D2 BIAISÉ)" if USE_RANGING else "SANS Couplage (D2 BIAISÉ Dérive !)"
 
 # --- Plot 1 : Trajectoires 2D ---
@@ -186,7 +186,6 @@ plt.plot(X_e[:,0], X_e[:, 1], 'b-', linewidth=2, label="D1 Estimé")
 
 plt.plot(X_t[:,5], X_t[:, 6], 'k--', linewidth=1, label="D2 Réel")
 plt.plot(X_e[:,5], X_e[:, 6], 'r-', linewidth=2, label="D2 Estimé (BIAISÉ)")
-# plt.scatter(z_g2[:, 0], z_g2[:, 1], color='red', marker='x', s=10, alpha=0.2) # Trop chargé
 
 plt.title(f"Trajectoire 2D : {état_ranging}")
 plt.xlabel("X (m)")
@@ -230,7 +229,6 @@ for j in range(5):
         plt.legend(loc="upper left")
 
 plt.tight_layout()
-# Sauvegarde dynamique selon l'état
 filename = f"resultat_ekf_ranging_bias_{USE_RANGING}.png"
 plt.savefig(filename, dpi=300, bbox_inches='tight')
 print(f"✅ Simulation terminée ! Image sauvegardée sous : {filename}")
