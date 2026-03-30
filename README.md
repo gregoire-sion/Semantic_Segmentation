@@ -1,5 +1,3 @@
-# Semantic_Segmentation
-
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -11,7 +9,9 @@ N_steps = int(sim_time / dt_imu)
 time = np.arange(0, sim_time, dt_imu)
 
 # Bruits standard pour tous les drones
+# Q : Confiance en l'IMU (Processus)
 Q_mat = np.diag([0.01, 0.01, 0.1, 0.1, np.deg2rad(1.0)]) ** 2
+# R : Confiance au GPS (Mesure)
 R_mat = np.diag([3.0, 3.0]) ** 2
 
 # ==========================================
@@ -25,7 +25,7 @@ class DroneEKF:
         self.Q = Q
         self.R = R
         
-        # Vérité terrain (Start Positions distinctes)
+        # Vérité terrain (Positions de départ distinctes)
         self.x_true = np.array([[start_x], [start_y], [0.0], [0.0], [0.0]])
         
         # État estimé (initialisation identique à la vérité pour simplifier)
@@ -87,7 +87,7 @@ class DroneEKF:
         self.hz_gps.append([z_gps[0, 0], z_gps[1, 0]])
         self.t_gps.append(t)
         
-        # Modèle d'observation linéaire
+        # Modèle d'observation linéaire (On n'observe que X et Y)
         H = np.array([
             [1.0, 0.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0, 0.0]
@@ -155,48 +155,59 @@ d2_gps = np.array(drone2.hz_gps)
 d2_P = np.array(drone2.hP_est)
 
 # ==========================================
-# AFFICHAGE DU STYLE COMPLET
+# CALCUL DE LA DISTANCE RELATIVE
 # ==========================================
-fig = plt.figure(figsize=(18, 14))
+dist_true = np.sqrt((d2_true[:, 0] - d1_true[:, 0])**2 + (d2_true[:, 1] - d1_true[:, 1])**2)
+dist_est = np.sqrt((d2_est[:, 0] - d1_est[:, 0])**2 + (d2_est[:, 1] - d1_est[:, 1])**2)
 
-# --- Plot 1 : Trajectoires 2D indépendantes ---
-plt.subplot(3, 2, 1)
-# Drone 1 (Bleu)
+# ==========================================
+# AFFICHAGE DU STYLE COMPLET (Grille 4x2)
+# ==========================================
+fig = plt.figure(figsize=(18, 18))
+
+# --- Plot 1 : Trajectoires 2D indépendantes (En haut à gauche) ---
+plt.subplot(4, 2, 1)
 plt.plot(d1_true[:,0], d1_true[:, 1], 'k--', linewidth=1, label="D1 Réel")
 plt.plot(d1_est[:,0], d1_est[:, 1], 'b-', linewidth=2, label="D1 Estimé (EKF)")
-plt.scatter(d1_gps[:, 0], d1_gps[:, 1], color='blue', marker='x', s=10, alpha=0.2, label="D1 GPS")
+plt.scatter(d1_gps[:, 0], d1_gps[:, 1], color='blue', marker='x', s=10, alpha=0.2)
 
-# Drone 2 (Rouge)
 plt.plot(d2_true[:,0], d2_true[:, 1], 'k--', linewidth=1, label="D2 Réel")
 plt.plot(d2_est[:,0], d2_est[:, 1], 'r-', linewidth=2, label="D2 Estimé (EKF)")
-plt.scatter(d2_gps[:, 0], d2_gps[:, 1], color='red', marker='x', s=10, alpha=0.2, label="D2 GPS")
+plt.scatter(d2_gps[:, 0], d2_gps[:, 1], color='red', marker='x', s=10, alpha=0.2)
 
-plt.title("Trajectoire 2D: Drone 1 vs Drone 2 (Indépendants)")
+plt.title("Trajectoire 2D: Drone 1 vs Drone 2")
 plt.xlabel("X (m)")
 plt.ylabel("Y (m)")
 plt.legend()
 plt.grid(True)
 plt.axis('equal')
 
+# --- Plot 2 : Erreur de distance relative (En haut à droite) ---
+plt.subplot(4, 2, 2)
+plt.plot(time, dist_true, 'k--', linewidth=2, label="Distance Réelle (Truth)")
+plt.plot(time, dist_est, 'g-', linewidth=2, label="Distance Estimée (EKF 1 vs EKF 2)")
+plt.title("Le problème de dérive : Distance relative D1 <-> D2")
+plt.xlabel("Temps (s)")
+plt.ylabel("Distance (m)")
+plt.legend()
+plt.grid(True)
+
+# --- Nouveaux Plots: 5 Variables d'état (Lignes en dessous) ---
 labels = ["Position X (m)", "Position Y (m)", "Vitesse Vx (m/s)", "Vitesse Vy (m/s)", "Cap Theta (rad)"]
 
-# ==========================================
-# Nouveaux Plots: 5 Variables d'état
-# ==========================================
 for j in range(5):
-    plt.subplot(3, 2, j + 2)
+    # On décale l'index de +3 car les cases 1 et 2 sont déjà prises
+    plt.subplot(4, 2, j + 3) 
     
     # --- Drone 1 (Bleu) ---
-    plt.plot(time, d1_true[:, j], 'k--', alpha=0.5) # Réel D1
-    plt.plot(time, d1_est[:, j], 'b-', label="D1 Estimé") # Estimé D1
-    # Couloir 3-sigma Drone 1
+    plt.plot(time, d1_true[:, j], 'k--', alpha=0.5)
+    plt.plot(time, d1_est[:, j], 'b-', label="D1 Estimé")
     sigma1 = np.sqrt(d1_P[:, j])
     plt.fill_between(time, d1_est[:, j] - 3*sigma1, d1_est[:, j] + 3*sigma1, color='blue', alpha=0.1)
 
     # --- Drone 2 (Rouge) ---
-    plt.plot(time, d2_true[:, j], 'k--', alpha=0.5) # Réel D2
-    plt.plot(time, d2_est[:, j], 'r-', label="D2 Estimé") # Estimé D2
-    # Couloir 3-sigma Drone 2
+    plt.plot(time, d2_true[:, j], 'k--', alpha=0.5)
+    plt.plot(time, d2_est[:, j], 'r-', label="D2 Estimé")
     sigma2 = np.sqrt(d2_P[:, j])
     plt.fill_between(time, d2_est[:, j] - 3*sigma2, d2_est[:, j] + 3*sigma2, color='red', alpha=0.1)
     
@@ -213,3 +224,4 @@ for j in range(5):
 
 plt.tight_layout()
 plt.show()
+
