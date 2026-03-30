@@ -8,213 +8,215 @@ sim_time = 20.0
 N_steps = int(sim_time / dt_imu)
 time = np.arange(0, sim_time, dt_imu)
 
-# Bruits standard pour tous les drones
-# Q : Confiance en l'IMU (Processus)
-Q_mat = np.diag([0.01, 0.01, 0.1, 0.1, np.deg2rad(1.0)]) ** 2
-# R : Confiance au GPS (Mesure)
-R_mat = np.diag([3.0, 3.0]) ** 2
-
 # ==========================================
-# CLASSE DRONE (Encapsulation de l'EKF)
+# CLASSE SWARM EKF (Filtre Centralisé)
 # ==========================================
-class DroneEKF:
-    def __init__(self, drone_id, start_x, start_y, Q, R):
-        self.id = drone_id
+class CoupledEKF:
+    def __init__(self, start_y2=10.0):
+        # Bruits (Q: IMU, R_gps: GPS, R_dist: Capteur de distance ex: UWB)
+        q = np.diag([0.01, 0.01, 0.1, 0.1, np.deg2rad(1.0)]) ** 2
+        self.Q = np.block([[q, np.zeros((5,5))], 
+                           [np.zeros((5,5)), q]]) # Matrice 10x10
         
-        # Matrices de bruit
-        self.Q = Q
-        self.R = R
+        self.R_gps = np.diag([3.0, 3.0, 3.0, 3.0]) ** 2 # 4 mesures GPS (x1,y1, x2,y2)
+        self.R_dist = np.array([[0.5 ** 2]]) # Précision du capteur de distance (ex: 50 cm)
         
-        # Vérité terrain (Positions de départ distinctes)
-        self.x_true = np.array([[start_x], [start_y], [0.0], [0.0], [0.0]])
+        # Vérité terrain [x1, y1, vx1, vy1, theta1, x2, y2, vx2, vy2, theta2]
+        self.X_true = np.zeros((10, 1))
+        self.X_true[6, 0] = start_y2 # Le drone 2 commence à Y=10
         
-        # État estimé (initialisation identique à la vérité pour simplifier)
-        self.x_est = np.array([[start_x], [start_y], [0.0], [0.0], [0.0]])
-        self.P_est = np.eye(5) * 5.0 # Incertitude initiale
+        # État estimé (Taille 10x1)
+        self.X_est = np.zeros((10, 1))
+        self.X_est[6, 0] = start_y2
+        self.P_est = np.eye(10) * 5.0 # Matrice de covariance 10x10
         
-        # Historique pour l'affichage
-        self.hx_true = []
-        self.hx_est = []
-        self.hz_gps = []
-        self.hP_est = [] # Sauvegarde de P_est diagonal
-        self.t_gps = []
+        # Historique
+        self.hX_true, self.hX_est, self.hP_est = [], [], []
+        self.hz_gps1, self.hz_gps2, self.t_gps = [], [], []
 
-    def simulate_truth_and_get_imu(self, true_ax, true_ay, true_omega, dt):
-        """Mise à jour VÉRITÉ TERRAIN et génération IMU bruitée (Spécifique à CE drone)"""
-        theta_true = self.x_true[4, 0]
-        # Modèle physique parfait
-        self.x_true[0, 0] += self.x_true[2, 0] * dt
-        self.x_true[1, 0] += self.x_true[3, 0] * dt
-        self.x_true[2, 0] += (true_ax * np.cos(theta_true) - true_ay * np.sin(theta_true)) * dt
-        self.x_true[3, 0] += (true_ax * np.sin(theta_true) + true_ay * np.cos(theta_true)) * dt
-        self.x_true[4, 0] += true_omega * dt
+    def simulate_truth_and_get_imu(self, dt):
+        """Met à jour la vérité et génère les IMU des deux drones"""
+        # Consignes de vol
+        ax, ay, omega = 0.5, 0.0, 0.3
         
-        # Génération des mesures IMU (bruitées, indépendantes)
-        u_imu = np.array([[true_ax], [true_ay], [true_omega]]) + \
-                np.random.multivariate_normal([0, 0, 0], np.diag([0.2, 0.2, 0.05])**2).reshape(3, 1)
-        return u_imu
+        for i in [0, 5]: # Index de base pour D1(0) et D2(5)
+            theta_true = self.X_true[i+4, 0]
+            self.X_true[i, 0]   += self.X_true[i+2, 0] * dt
+            self.X_true[i+1, 0] += self.X_true[i+3, 0] * dt
+            self.X_true[i+2, 0] += (ax * np.cos(theta_true) - ay * np.sin(theta_true)) * dt
+            self.X_true[i+3, 0] += (ax * np.sin(theta_true) + ay * np.cos(theta_true)) * dt
+            self.X_true[i+4, 0] += omega * dt
+            
+        # IMU D1 et D2 (Bruits indépendants)
+        u_imu1 = np.array([[ax], [ay], [omega]]) + np.random.multivariate_normal([0,0,0], np.diag([0.2, 0.2, 0.05])**2).reshape(3,1)
+        u_imu2 = np.array([[ax], [ay], [omega]]) + np.random.multivariate_normal([0,0,0], np.diag([0.2, 0.2, 0.05])**2).reshape(3,1)
+        
+        return u_imu1, u_imu2
 
-    def predict(self, u_imu, dt):
-        """Étape 1 du Kalman : Prédiction avec l'IMU"""
-        theta = self.x_est[4, 0]
-        ax, ay, omega = u_imu[0, 0], u_imu[1, 0], u_imu[2, 0]
+    def predict(self, u_imu1, u_imu2, dt):
+        """Prédiction combinée 10x10"""
+        X_pred = np.zeros((10, 1))
+        F = np.eye(10)
         
-        # Modèle f(x, u)
-        x_pred = np.zeros((5, 1))
-        x_pred[0, 0] = self.x_est[0, 0] + self.x_est[2, 0] * dt
-        x_pred[1, 0] = self.x_est[1, 0] + self.x_est[3, 0] * dt
-        x_pred[2, 0] = self.x_est[2, 0] + (ax * np.cos(theta) - ay * np.sin(theta)) * dt
-        x_pred[3, 0] = self.x_est[3, 0] + (ax * np.sin(theta) + ay * np.cos(theta)) * dt
-        x_pred[4, 0] = self.x_est[4, 0] + omega * dt
-        
-        # Jacobienne F
-        F = np.eye(5)
-        F[0, 2] = dt
-        F[1, 3] = dt
-        F[2, 4] = (-ax * np.sin(theta) - ay * np.cos(theta)) * dt
-        F[3, 4] = ( ax * np.cos(theta) - ay * np.sin(theta)) * dt
-        
-        # P_pred = F P_est F.T + Q
+        # Application du modèle pour chaque drone
+        for idx, u_imu in zip([0, 5], [u_imu1, u_imu2]):
+            x, y, vx, vy, theta = self.X_est[idx:idx+5, 0]
+            a_x, a_y, om = u_imu[0,0], u_imu[1,0], u_imu[2,0]
+            
+            X_pred[idx, 0]   = x + vx * dt
+            X_pred[idx+1, 0] = y + vy * dt
+            X_pred[idx+2, 0] = vx + (a_x * np.cos(theta) - a_y * np.sin(theta)) * dt
+            X_pred[idx+3, 0] = vy + (a_x * np.sin(theta) + a_y * np.cos(theta)) * dt
+            X_pred[idx+4, 0] = theta + om * dt
+            
+            # Sous-Jacobienne
+            F[idx,   idx+2] = dt
+            F[idx+1, idx+3] = dt
+            F[idx+2, idx+4] = (-a_x * np.sin(theta) - a_y * np.cos(theta)) * dt
+            F[idx+3, idx+4] = ( a_x * np.cos(theta) - a_y * np.sin(theta)) * dt
+            
         self.P_est = F @ self.P_est @ F.T + self.Q
-        self.x_est = x_pred
+        self.X_est = X_pred
 
     def update_gps(self, t):
-        """Étape 2 du Kalman : Mise à jour avec le GPS (Tirage indépendant)"""
-        # Simulation d'une mesure GPS avec du bruit (Spécifique à CE drone)
-        z_gps = np.array([[self.x_true[0, 0]], [self.x_true[1, 0]]]) + \
-                np.random.multivariate_normal([0, 0], self.R).reshape(2, 1)
+        """Mise à jour GPS combinée"""
+        z_gps1 = self.X_true[0:2] + np.random.multivariate_normal([0,0], np.diag([3.0, 3.0])**2).reshape(2,1)
+        z_gps2 = self.X_true[5:7] + np.random.multivariate_normal([0,0], np.diag([3.0, 3.0])**2).reshape(2,1)
         
-        self.hz_gps.append([z_gps[0, 0], z_gps[1, 0]])
+        self.hz_gps1.append([z_gps1[0,0], z_gps1[1,0]])
+        self.hz_gps2.append([z_gps2[0,0], z_gps2[1,0]])
         self.t_gps.append(t)
         
-        # Modèle d'observation linéaire (On n'observe que X et Y)
-        H = np.array([
-            [1.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0, 0.0]
-        ])
+        Z = np.vstack((z_gps1, z_gps2)) # Vecteur mesure 4x1
         
-        # Innovation S K
-        y = z_gps - (H @ self.x_est)
-        S = H @ self.P_est @ H.T + self.R
-        K = self.P_est @ H.T @ np.linalg.inv(S)
+        # Matrice d'observation H_gps (4x10)
+        H_gps = np.zeros((4, 10))
+        H_gps[0, 0] = 1.0; H_gps[1, 1] = 1.0 # D1 x,y
+        H_gps[2, 5] = 1.0; H_gps[3, 6] = 1.0 # D2 x,y
         
-        # Correction de l'état
-        self.x_est = self.x_est + K @ y
-        self.P_est = (np.eye(5) - K @ H) @ self.P_est
+        y = Z - (H_gps @ self.X_est)
+        S = H_gps @ self.P_est @ H_gps.T + self.R_gps
+        K = self.P_est @ H_gps.T @ np.linalg.inv(S)
+        
+        self.X_est = self.X_est + K @ y
+        self.P_est = (np.eye(10) - K @ H_gps) @ self.P_est
+
+    def update_distance(self):
+        """NOUVEAUTÉ: Mise à jour avec la mesure de distance relative"""
+        x1, y1 = self.X_true[0, 0], self.X_true[1, 0]
+        x2, y2 = self.X_true[5, 0], self.X_true[6, 0]
+        
+        # Vraie distance + Bruit du capteur
+        true_dist = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+        z_dist = true_dist + np.random.normal(0, np.sqrt(self.R_dist[0,0]))
+        
+        # Distance estimée (h(X_est))
+        e_x1, e_y1 = self.X_est[0, 0], self.X_est[1, 0]
+        e_x2, e_y2 = self.X_est[5, 0], self.X_est[6, 0]
+        est_dist = np.sqrt((e_x2 - e_x1)**2 + (e_y2 - e_y1)**2)
+        
+        # Jacobienne de la distance (H_dist de taille 1x10)
+        H_dist = np.zeros((1, 10))
+        if est_dist > 0.01: # Éviter la division par zéro
+            H_dist[0, 0] = -(e_x2 - e_x1) / est_dist  # dx1
+            H_dist[0, 1] = -(e_y2 - e_y1) / est_dist  # dy1
+            H_dist[0, 5] =  (e_x2 - e_x1) / est_dist  # dx2
+            H_dist[0, 6] =  (e_y2 - e_y1) / est_dist  # dy2
+            
+        y = z_dist - est_dist
+        S = H_dist @ self.P_est @ H_dist.T + self.R_dist
+        K = self.P_est @ H_dist.T @ np.linalg.inv(S)
+        
+        self.X_est = self.X_est + K * y
+        self.P_est = (np.eye(10) - K @ H_dist) @ self.P_est
 
     def save_history(self):
-        """Stockage des états et de la covariance pour l'affichage"""
-        self.hx_true.append(self.x_true.copy())
-        self.hx_est.append(self.x_est.copy())
-        self.hP_est.append(np.diag(self.P_est).copy()) # Covariance diagonale
+        self.hX_true.append(self.X_true.copy())
+        self.hX_est.append(self.X_est.copy())
+        self.hP_est.append(np.diag(self.P_est).copy())
 
 # ==========================================
-# INITIALISATION DES DRONES
+# SIMULATION
 # ==========================================
-# Deux drones avec un décalage en Y de 10 mètres
-drone1 = DroneEKF(drone_id=1, start_x=0.0, start_y=0.0, Q=Q_mat, R=R_mat)
-drone2 = DroneEKF(drone_id=2, start_x=0.0, start_y=10.0, Q=Q_mat, R=R_mat)
+swarm = CoupledEKF(start_y2=10.0)
 
-drones = [drone1, drone2] # Liste pour faciliter les boucles
-
-# ==========================================
-# BOUCLE DE SIMULATION PRINCIPALE
-# ==========================================
 for i in range(N_steps):
     t_actuel = i * dt_imu
     
-    # Consignes de vol (Trajectoire identique pour les deux drones)
-    ax, ay, omega = 0.5, 0.0, 0.3
+    u_imu1, u_imu2 = swarm.simulate_truth_and_get_imu(dt_imu)
+    swarm.predict(u_imu1, u_imu2, dt_imu)
     
-    # Mise à jour de CHAQUE drone indépendamment
-    for drone in drones:
-        # 0. Vérité + IMU bruitée spécifique
-        u_imu = drone.simulate_truth_and_get_imu(ax, ay, omega, dt_imu)
+    if i % 10 == 0:
+        swarm.update_gps(t_actuel)
+        swarm.update_distance() # Couplage activé à 10Hz !
         
-        # 1. Prédiction EKF
-        drone.predict(u_imu, dt_imu)
-        
-        # 2. Mise à jour GPS EKF (10Hz, indépendant)
-        if i % 10 == 0:
-            drone.update_gps(t_actuel)
-            
-        # 3. Stockage
-        drone.save_history()
+    swarm.save_history()
 
 # ==========================================
-# FORMATAGE DES DONNÉES POUR L'AFFICHAGE
+# FORMATAGE DES DONNÉES
 # ==========================================
-d1_true = np.array(drone1.hx_true).squeeze()
-d1_est = np.array(drone1.hx_est).squeeze()
-d1_gps = np.array(drone1.hz_gps)
-d1_P = np.array(drone1.hP_est)
+X_t = np.array(swarm.hX_true).squeeze()
+X_e = np.array(swarm.hX_est).squeeze()
+P_e = np.array(swarm.hP_est)
+z_g1 = np.array(swarm.hz_gps1)
+z_g2 = np.array(swarm.hz_gps2)
 
-d2_true = np.array(drone2.hx_true).squeeze()
-d2_est = np.array(drone2.hx_est).squeeze()
-d2_gps = np.array(drone2.hz_gps)
-d2_P = np.array(drone2.hP_est)
-
-# ==========================================
-# CALCUL DE LA DISTANCE RELATIVE
-# ==========================================
-dist_true = np.sqrt((d2_true[:, 0] - d1_true[:, 0])**2 + (d2_true[:, 1] - d1_true[:, 1])**2)
-dist_est = np.sqrt((d2_est[:, 0] - d1_est[:, 0])**2 + (d2_est[:, 1] - d1_est[:, 1])**2)
+dist_true = np.sqrt((X_t[:, 5] - X_t[:, 0])**2 + (X_t[:, 6] - X_t[:, 1])**2)
+dist_est = np.sqrt((X_e[:, 5] - X_e[:, 0])**2 + (X_e[:, 6] - X_e[:, 1])**2)
 
 # ==========================================
-# AFFICHAGE DU STYLE COMPLET (Grille 4x2)
+# AFFICHAGE 4x2
 # ==========================================
 fig = plt.figure(figsize=(18, 18))
 
-# --- Plot 1 : Trajectoires 2D indépendantes (En haut à gauche) ---
+# --- Plot 1 : Trajectoires 2D ---
 plt.subplot(4, 2, 1)
-plt.plot(d1_true[:,0], d1_true[:, 1], 'k--', linewidth=1, label="D1 Réel")
-plt.plot(d1_est[:,0], d1_est[:, 1], 'b-', linewidth=2, label="D1 Estimé (EKF)")
-plt.scatter(d1_gps[:, 0], d1_gps[:, 1], color='blue', marker='x', s=10, alpha=0.2)
+plt.plot(X_t[:,0], X_t[:, 1], 'k--', linewidth=1, label="D1 Réel")
+plt.plot(X_e[:,0], X_e[:, 1], 'b-', linewidth=2, label="D1 Estimé")
+plt.scatter(z_g1[:, 0], z_g1[:, 1], color='blue', marker='x', s=10, alpha=0.2)
 
-plt.plot(d2_true[:,0], d2_true[:, 1], 'k--', linewidth=1, label="D2 Réel")
-plt.plot(d2_est[:,0], d2_est[:, 1], 'r-', linewidth=2, label="D2 Estimé (EKF)")
-plt.scatter(d2_gps[:, 0], d2_gps[:, 1], color='red', marker='x', s=10, alpha=0.2)
+plt.plot(X_t[:,5], X_t[:, 6], 'k--', linewidth=1, label="D2 Réel")
+plt.plot(X_e[:,5], X_e[:, 6], 'r-', linewidth=2, label="D2 Estimé")
+plt.scatter(z_g2[:, 0], z_g2[:, 1], color='red', marker='x', s=10, alpha=0.2)
 
-plt.title("Trajectoire 2D: Drone 1 vs Drone 2")
+plt.title("Trajectoire 2D Centralisée (Couplage par Distance)")
 plt.xlabel("X (m)")
 plt.ylabel("Y (m)")
 plt.legend()
 plt.grid(True)
 plt.axis('equal')
 
-# --- Plot 2 : Erreur de distance relative (En haut à droite) ---
+# --- Plot 2 : Erreur de distance relative ---
 plt.subplot(4, 2, 2)
-plt.plot(time, dist_true, 'k--', linewidth=2, label="Distance Réelle (Truth)")
-plt.plot(time, dist_est, 'g-', linewidth=2, label="Distance Estimée (EKF 1 vs EKF 2)")
-plt.title("Le problème de dérive : Distance relative D1 <-> D2")
+plt.plot(time, dist_true, 'k--', linewidth=2, label="Distance Réelle (10m)")
+plt.plot(time, dist_est, 'g-', linewidth=2, label="Distance Estimée (EKF Couplé)")
+plt.title("RÉSOLU : La distance estimée colle à la réalité")
 plt.xlabel("Temps (s)")
 plt.ylabel("Distance (m)")
 plt.legend()
 plt.grid(True)
 
-# --- Nouveaux Plots: 5 Variables d'état (Lignes en dessous) ---
+# --- 5 Variables d'état ---
 labels = ["Position X (m)", "Position Y (m)", "Vitesse Vx (m/s)", "Vitesse Vy (m/s)", "Cap Theta (rad)"]
 
 for j in range(5):
-    # On décale l'index de +3 car les cases 1 et 2 sont déjà prises
     plt.subplot(4, 2, j + 3) 
     
-    # --- Drone 1 (Bleu) ---
-    plt.plot(time, d1_true[:, j], 'k--', alpha=0.5)
-    plt.plot(time, d1_est[:, j], 'b-', label="D1 Estimé")
-    sigma1 = np.sqrt(d1_P[:, j])
-    plt.fill_between(time, d1_est[:, j] - 3*sigma1, d1_est[:, j] + 3*sigma1, color='blue', alpha=0.1)
+    # Drone 1 (Index 0 à 4)
+    plt.plot(time, X_t[:, j], 'k--', alpha=0.5)
+    plt.plot(time, X_e[:, j], 'b-', label="D1 Estimé")
+    s1 = np.sqrt(P_e[:, j])
+    plt.fill_between(time, X_e[:, j] - 3*s1, X_e[:, j] + 3*s1, color='blue', alpha=0.1)
 
-    # --- Drone 2 (Rouge) ---
-    plt.plot(time, d2_true[:, j], 'k--', alpha=0.5)
-    plt.plot(time, d2_est[:, j], 'r-', label="D2 Estimé")
-    sigma2 = np.sqrt(d2_P[:, j])
-    plt.fill_between(time, d2_est[:, j] - 3*sigma2, d2_est[:, j] + 3*sigma2, color='red', alpha=0.1)
+    # Drone 2 (Index 5 à 9)
+    plt.plot(time, X_t[:, j+5], 'k--', alpha=0.5)
+    plt.plot(time, X_e[:, j+5], 'r-', label="D2 Estimé")
+    s2 = np.sqrt(P_e[:, j+5])
+    plt.fill_between(time, X_e[:, j+5] - 3*s2, X_e[:, j+5] + 3*s2, color='red', alpha=0.1)
     
-    # Ajout mesures GPS brutes pour X et Y
     if j < 2:
-        plt.scatter(drone1.t_gps, d1_gps[:, j], color='blue', marker='x', s=10, alpha=0.3)
-        plt.scatter(drone2.t_gps, d2_gps[:, j], color='red', marker='x', s=10, alpha=0.3)
+        plt.scatter(swarm.t_gps, z_g1[:, j], color='blue', marker='x', s=10, alpha=0.3)
+        plt.scatter(swarm.t_gps, z_g2[:, j], color='red', marker='x', s=10, alpha=0.3)
         
     plt.title(f"{labels[j]} - D1 vs D2")
     plt.xlabel("Temps (s)")
