@@ -1,3 +1,6 @@
+python3 -c "import torch; print('Initialisation...'); torch.cuda.init(); print('Nom:', torch.cuda.get_device_name(0)); x = torch.ones(1).cuda(); print('Succès !')"
+
+
 import torch
 import pandas as pd
 import numpy as np
