@@ -1,187 +1,202 @@
-import numpy as np
+import torch
 import pandas as pd
+import numpy as np
 import os
-from tqdm import tqdm # Pour la barre de progression
+from tqdm import tqdm
 
 # ==========================================
-# 1. PARAMÈTRES DU DATASET
+# 1. PARAMÈTRES & CONFIGURATION GPU
 # ==========================================
-NUM_TRAJECTORIES = 50   # Mets 1000 ou 5000 pour ton entraînement final
-SIM_TIME = 20.0         # 20 secondes par trajectoire
-DT_IMU = 0.01           # 100 Hz
-DT_GPS = 1.0            # 1 Hz
-DT_UWB = 0.1            # 10 Hz
+# Vérification du GPU (C'est ici que ça active nvidia-smi !)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"🚀 Appareil utilisé : {device.type.upper()}")
+
+BATCH_SIZE = 5000       # Nombre de trajectoires simulées EN MÊME TEMPS
+SIM_TIME = 20.0         
+DT_IMU = 0.01           
+DT_GPS = 1.0            
+DT_UWB = 0.1            
 
 STEPS_PER_TRAJ = int(SIM_TIME / DT_IMU)
 STEP_GPS = int(DT_GPS / DT_IMU)
 STEP_UWB = int(DT_UWB / DT_IMU)
 
-# Bruits de base
-Q_base = np.diag([0.01, 0.01, 0.1, 0.1, np.deg2rad(1.0)]) ** 2
-Q_full = np.block([[Q_base, np.zeros((5,5))], [np.zeros((5,5)), Q_base]])
-R_gps = np.diag([3.0, 3.0, 3.0, 3.0]) ** 2
-R_uwb = np.array([[0.5 ** 2]])
+# ==========================================
+# 2. INITIALISATION DES TENSEURS (SUR GPU)
+# ==========================================
+# Les bruits de base (Tenseurs constants)
+Q_base = torch.diag(torch.tensor([0.01, 0.01, 0.1, 0.1, np.deg2rad(1.0)], device=device)) ** 2
+Q_full = torch.block_diag(Q_base, Q_base).unsqueeze(0).repeat(BATCH_SIZE, 1, 1) # Shape: (B, 10, 10)
+
+R_gps = (torch.diag(torch.tensor([3.0, 3.0, 3.0, 3.0], device=device)) ** 2).unsqueeze(0).repeat(BATCH_SIZE, 1, 1)
+R_uwb = torch.tensor([[[0.5 ** 2]]], device=device).repeat(BATCH_SIZE, 1, 1)
+
+# État Réel et Estimé (Shape: Batch, 10 variables, 1 colonne)
+X_true = torch.zeros((BATCH_SIZE, 10, 1), device=device)
+X_est = torch.zeros((BATCH_SIZE, 10, 1), device=device)
+
+# Le Drone 2 commence à une distance aléatoire Y (entre 5m et 15m) pour chaque trajectoire
+start_y2 = torch.empty((BATCH_SIZE, 1, 1), device=device).uniform_(5.0, 15.0)
+X_true[:, 6:7, :] = start_y2
+X_est[:, 6:7, :] = start_y2
+
+# Matrice de Covariance initiale P (Shape: B, 10, 10)
+P_est = torch.eye(10, device=device).unsqueeze(0).repeat(BATCH_SIZE, 1, 1) * 5.0
+
+# Biais IMU aléatoire par trajectoire (Shape: B, 3, 1)
+bias_d2 = torch.empty((BATCH_SIZE, 3, 1), device=device).uniform_(-0.2, 0.2)
+
+# Matrices d'Observation Constantes
+H_gps = torch.zeros((BATCH_SIZE, 4, 10), device=device)
+H_gps[:, 0, 0] = 1; H_gps[:, 1, 1] = 1; H_gps[:, 2, 5] = 1; H_gps[:, 3, 6] = 1
 
 # ==========================================
-# 2. GÉNÉRATEUR DE DONNÉES
+# 3. STOCKAGE DE L'HISTORIQUE (SUR CPU POUR LA RAM)
 # ==========================================
-def generate_trajectory(traj_id):
-    """Génère un épisode complet de vol et retourne une liste de dictionnaires"""
-    
-    # --- Initialisation Aléatoire ---
-    start_y2 = np.random.uniform(5.0, 15.0) # Le Drone 2 commence à une distance aléatoire
-    X_true = np.zeros((10, 1))
-    X_true[6, 0] = start_y2
-    
-    X_est = np.zeros((10, 1))
-    X_est[6, 0] = start_y2
-    P_est = np.eye(10) * 5.0
-    
-    # Biais IMU aléatoire pour cet épisode (entre -0.2 et +0.2)
-    bias_d2 = np.random.uniform(-0.2, 0.2, (3, 1))
-    
-    # Consignes de vol dynamiques
-    current_ax, current_ay, current_omega = 0.5, 0.0, 0.0
-    
-    trajectory_data = []
-    
-    for step in range(STEPS_PER_TRAJ):
-        t = step * DT_IMU
-        
-        # --- 1. Changement de trajectoire aléatoire (toutes les 4 secondes) ---
-        if step % 400 == 0:
-            current_ax = np.random.uniform(0.0, 1.0)
-            current_omega = np.random.uniform(-0.5, 0.5) # Virage gauche ou droite
-            
-        # --- 2. Mise à jour de la Vérité Terrain ---
-        for i in [0, 5]: 
-            theta = X_true[i+4, 0]
-            X_true[i, 0]   += X_true[i+2, 0] * DT_IMU
-            X_true[i+1, 0] += X_true[i+3, 0] * DT_IMU
-            X_true[i+2, 0] += (current_ax * np.cos(theta) - current_ay * np.sin(theta)) * DT_IMU
-            X_true[i+3, 0] += (current_ax * np.sin(theta) + current_ay * np.cos(theta)) * DT_IMU
-            X_true[i+4, 0] += current_omega * DT_IMU
-            
-        # --- 3. Génération des IMU (avec Biais sur D2) ---
-        u1 = np.array([[current_ax], [current_ay], [current_omega]]) + np.random.normal(0, 0.1, (3,1))
-        u2 = np.array([[current_ax], [current_ay], [current_omega]]) + bias_d2 + np.random.normal(0, 0.1, (3,1))
-        
-        # --- 4. Prédiction EKF (L'état Prior) ---
-        X_prev_est = X_est.copy()
-        X_pred = np.zeros((10, 1))
-        F = np.eye(10)
-        for idx, u in zip([0, 5], [u1, u2]):
-            x, y, vx, vy, theta = X_est[idx:idx+5, 0]
-            a_x, a_y, om = u[0,0], u[1,0], u[2,0]
-            
-            X_pred[idx, 0]   = x + vx * DT_IMU
-            X_pred[idx+1, 0] = y + vy * DT_IMU
-            X_pred[idx+2, 0] = vx + (a_x * np.cos(theta) - a_y * np.sin(theta)) * DT_IMU
-            X_pred[idx+3, 0] = vy + (a_x * np.sin(theta) + a_y * np.cos(theta)) * DT_IMU
-            X_pred[idx+4, 0] = theta + om * DT_IMU
-            
-            F[idx,   idx+2] = DT_IMU; F[idx+1, idx+3] = DT_IMU
-            F[idx+2, idx+4] = (-a_x * np.sin(theta) - a_y * np.cos(theta)) * DT_IMU
-            F[idx+3, idx+4] = ( a_x * np.cos(theta) - a_y * np.sin(theta)) * DT_IMU
-            
-        P_pred = F @ P_est @ F.T + Q_full
-        X_est = X_pred.copy()
-        
-        # Calcul du Delta X (Évolution de l'état)
-        delta_x = X_est - X_prev_est
+# On pré-alloue l'espace sur la RAM standard pour ne pas exploser la VRAM du GPU
+hist_features = torch.zeros((BATCH_SIZE, STEPS_PER_TRAJ, 25), dtype=torch.float32)
 
-        # --- 5. Observations (Innovations et Flags) ---
-        has_gps, has_uwb = 0, 0
-        y_gps = np.zeros((4, 1))
-        y_uwb = np.zeros((1, 1))
-        
-        # Correction GPS
-        if step % STEP_GPS == 0:
-            has_gps = 1
-            z_gps = np.vstack((X_true[0:2], X_true[5:7])) + np.random.normal(0, 3.0, (4,1))
-            H_gps = np.zeros((4, 10))
-            H_gps[0, 0] = 1; H_gps[1, 1] = 1; H_gps[2, 5] = 1; H_gps[3, 6] = 1
-            y_gps = z_gps - (H_gps @ X_est)
-            # MAJ de l'EKF classique (pour continuer la boucle)
-            S = H_gps @ P_pred @ H_gps.T + R_gps
-            K = P_pred @ H_gps.T @ np.linalg.inv(S)
-            X_est = X_est + K @ y_gps
-            P_pred = (np.eye(10) - K @ H_gps) @ P_pred
-            
-        # Correction UWB
-        if step % STEP_UWB == 0:
-            has_uwb = 1
-            true_dist = np.sqrt((X_true[5,0]-X_true[0,0])**2 + (X_true[6,0]-X_true[1,0])**2)
-            z_dist = true_dist + np.random.normal(0, 0.5)
-            e_dist = np.sqrt((X_est[5,0]-X_est[0,0])**2 + (X_est[6,0]-X_est[1,0])**2)
-            y_uwb[0,0] = z_dist - e_dist
-            
-            H_dist = np.zeros((1, 10))
-            if e_dist > 0.01:
-                H_dist[0, 0] = -(X_est[5,0]-X_est[0,0]) / e_dist
-                H_dist[0, 1] = -(X_est[6,0]-X_est[1,0]) / e_dist
-                H_dist[0, 5] =  (X_est[5,0]-X_est[0,0]) / e_dist
-                H_dist[0, 6] =  (X_est[6,0]-X_est[1,0]) / e_dist
-            
-            S = H_dist @ P_pred @ H_dist.T + R_uwb
-            K = P_pred @ H_dist.T @ np.linalg.inv(S)
-            X_est = X_est + K * y_uwb[0,0]
-            P_pred = (np.eye(10) - K @ H_dist) @ P_pred
-            
-        P_est = P_pred # Fin du step
-
-        # --- 6. Enregistrement de la ligne de données ---
-        row = {
-            'traj_id': traj_id,
-            'time_step': step,
-            'has_gps': has_gps,
-            'has_uwb': has_uwb,
-            
-            # --- LES INPUTS DU RÉSEAU (Features) ---
-            'y_gps_x1': y_gps[0,0], 'y_gps_y1': y_gps[1,0],
-            'y_gps_x2': y_gps[2,0], 'y_gps_y2': y_gps[3,0],
-            'y_uwb_dist': y_uwb[0,0],
-        }
-        
-        # Ajout des 10 variables de delta_x
-        for j in range(10): row[f'dx_{j}'] = delta_x[j, 0]
-            
-        # --- LES TARGETS DU RÉSEAU (Pour la Loss) ---
-        # On sauvegarde l'état Prédit (avant correction) et la Vérité Absolue
-        for j in range(10): 
-            row[f'prior_{j}'] = X_pred[j, 0]
-            row[f'true_{j}'] = X_true[j, 0]
-            
-        trajectory_data.append(row)
-        
-    return trajectory_data
+current_ax = torch.zeros((BATCH_SIZE, 1), device=device)
+current_omega = torch.zeros((BATCH_SIZE, 1), device=device)
 
 # ==========================================
-# 3. CRÉATION ET SAUVEGARDE
+# 4. LA BOUCLE TEMPORELLE BATCHÉE
 # ==========================================
-print(f"🚀 Génération du Dataset ({NUM_TRAJECTORIES} trajectoires)...")
-all_data = []
+print(f"⚙️ Simulation de {BATCH_SIZE} trajectoires sur {STEPS_PER_TRAJ} itérations...")
 
-for traj_idx in tqdm(range(NUM_TRAJECTORIES)):
-    traj_data = generate_trajectory(traj_idx)
-    all_data.extend(traj_data)
+for step in tqdm(range(STEPS_PER_TRAJ)):
+    
+    # 1. Changement de consigne aléatoire (toutes les 4 sec)
+    if step % 400 == 0:
+        current_ax.uniform_(0.0, 1.0)
+        current_omega.uniform_(-0.5, 0.5)
+        current_ay = torch.zeros_like(current_ax) # Pas de glissement latéral
+        
+    # 2. Mise à jour de la Vérité (Opérations vectorielles sur les 5000 d'un coup)
+    for i in [0, 5]: 
+        theta_t = X_true[:, i+4, 0:1]
+        X_true[:, i, 0:1]   += X_true[:, i+2, 0:1] * DT_IMU
+        X_true[:, i+1, 0:1] += X_true[:, i+3, 0:1] * DT_IMU
+        X_true[:, i+2, 0:1] += (current_ax * torch.cos(theta_t) - current_ay * torch.sin(theta_t)) * DT_IMU
+        X_true[:, i+3, 0:1] += (current_ax * torch.sin(theta_t) + current_ay * torch.cos(theta_t)) * DT_IMU
+        X_true[:, i+4, 0:1] += current_omega * DT_IMU
+        
+    # 3. Mesures IMU Bruitées
+    u_base = torch.cat([current_ax.unsqueeze(-1), current_ay.unsqueeze(-1), current_omega.unsqueeze(-1)], dim=1) # Shape: (B, 3, 1)
+    u1 = u_base + torch.randn((BATCH_SIZE, 3, 1), device=device) * 0.1
+    u2 = u_base + bias_d2 + torch.randn((BATCH_SIZE, 3, 1), device=device) * 0.1
 
-# Conversion en DataFrame Pandas
-df = pd.DataFrame(all_data)
+    # 4. Prédiction EKF (L'état Prior)
+    X_prev_est = X_est.clone()
+    X_pred = torch.zeros_like(X_est)
+    F = torch.eye(10, device=device).unsqueeze(0).repeat(BATCH_SIZE, 1, 1)
+    
+    for idx, u in zip([0, 5], [u1, u2]):
+        x, y, vx, vy, theta_e = X_est[:, idx, 0:1], X_est[:, idx+1, 0:1], X_est[:, idx+2, 0:1], X_est[:, idx+3, 0:1], X_est[:, idx+4, 0:1]
+        a_x, a_y, om = u[:, 0, :], u[:, 1, :], u[:, 2, :]
+        
+        X_pred[:, idx, 0:1]   = x + vx * DT_IMU
+        X_pred[:, idx+1, 0:1] = y + vy * DT_IMU
+        X_pred[:, idx+2, 0:1] = vx + (a_x * torch.cos(theta_e) - a_y * torch.sin(theta_e)) * DT_IMU
+        X_pred[:, idx+3, 0:1] = vy + (a_x * torch.sin(theta_e) + a_y * torch.cos(theta_e)) * DT_IMU
+        X_pred[:, idx+4, 0:1] = theta_e + om * DT_IMU
+        
+        F[:, idx, idx+2] = DT_IMU; F[:, idx+1, idx+3] = DT_IMU
+        F[:, idx+2, idx+4] = (-a_x * torch.sin(theta_e) - a_y * torch.cos(theta_e)).squeeze() * DT_IMU
+        F[:, idx+3, idx+4] = ( a_x * torch.cos(theta_e) - a_y * torch.sin(theta_e)).squeeze() * DT_IMU
+        
+    P_pred = torch.bmm(F, torch.bmm(P_est, F.mT)) + Q_full
+    X_est = X_pred.clone()
+    delta_x = X_est - X_prev_est
 
-# Sauvegarde
+    # 5. Corrections (Innovations)
+    has_gps, has_uwb = 0.0, 0.0
+    y_gps = torch.zeros((BATCH_SIZE, 4, 1), device=device)
+    y_uwb = torch.zeros((BATCH_SIZE, 1, 1), device=device)
+    
+    # --- GPS ---
+    if step % STEP_GPS == 0:
+        has_gps = 1.0
+        z_gps = torch.cat([X_true[:, 0:2, :], X_true[:, 5:7, :]], dim=1) + torch.randn((BATCH_SIZE, 4, 1), device=device) * 3.0
+        y_gps = z_gps - torch.bmm(H_gps, X_est)
+        
+        S = torch.bmm(H_gps, torch.bmm(P_pred, H_gps.mT)) + R_gps
+        K = torch.bmm(P_pred, torch.bmm(H_gps.mT, torch.linalg.inv(S)))
+        X_est = X_est + torch.bmm(K, y_gps)
+        P_pred = torch.bmm(torch.eye(10, device=device).unsqueeze(0).repeat(BATCH_SIZE, 1, 1) - torch.bmm(K, H_gps), P_pred)
+        
+    # --- UWB ---
+    if step % STEP_UWB == 0:
+        has_uwb = 1.0
+        dx_true = X_true[:, 5, 0] - X_true[:, 0, 0]
+        dy_true = X_true[:, 6, 0] - X_true[:, 1, 0]
+        true_dist = torch.sqrt(dx_true**2 + dy_true**2).unsqueeze(-1).unsqueeze(-1)
+        z_dist = true_dist + torch.randn((BATCH_SIZE, 1, 1), device=device) * 0.5
+        
+        dx_est = X_est[:, 5, 0] - X_est[:, 0, 0]
+        dy_est = X_est[:, 6, 0] - X_est[:, 1, 0]
+        e_dist = torch.sqrt(dx_est**2 + dy_est**2).unsqueeze(-1).unsqueeze(-1)
+        
+        y_uwb = z_dist - e_dist
+        
+        H_dist = torch.zeros((BATCH_SIZE, 1, 10), device=device)
+        safe_dist = torch.clamp(e_dist.squeeze(), min=0.01) # Éviter division par zéro
+        H_dist[:, 0, 0] = -dx_est / safe_dist
+        H_dist[:, 0, 1] = -dy_est / safe_dist
+        H_dist[:, 0, 5] = dx_est / safe_dist
+        H_dist[:, 0, 6] = dy_est / safe_dist
+        
+        S = torch.bmm(H_dist, torch.bmm(P_pred, H_dist.mT)) + R_uwb
+        K = torch.bmm(P_pred, torch.bmm(H_dist.mT, torch.linalg.inv(S)))
+        X_est = X_est + torch.bmm(K, y_uwb)
+        P_pred = torch.bmm(torch.eye(10, device=device).unsqueeze(0).repeat(BATCH_SIZE, 1, 1) - torch.bmm(K, H_dist), P_pred)
+
+    P_est = P_pred
+
+    # 6. Enregistrement dans le CPU (Vectorisé)
+    # [has_gps, has_uwb, y_gps(4), y_uwb(1), delta_x(10), prior(4), true(4)] = 25 colonnes
+    # On stocke seulement les positions (X,Y) dans Prior et True pour alléger le dataset
+    step_data = torch.cat([
+        torch.full((BATCH_SIZE, 1), has_gps),
+        torch.full((BATCH_SIZE, 1), has_uwb),
+        y_gps.squeeze(-1).cpu(),
+        y_uwb.squeeze(-1).cpu(),
+        delta_x.squeeze(-1).cpu(),
+        X_pred[:, [0,1,5,6], 0].cpu(), # Prior X, Y (D1 et D2)
+        X_true[:, [0,1,5,6], 0].cpu()  # True X, Y (D1 et D2)
+    ], dim=1)
+    
+    hist_features[:, step, :] = step_data
+
+# ==========================================
+# 5. FORMATAGE DATAFRAME ET SAUVEGARDE
+# ==========================================
+print("💾 Conversion du tenseur 3D en DataFrame Pandas...")
+
+# Création des index (Traj_ID, Time_Step)
+traj_ids = torch.arange(BATCH_SIZE).view(-1, 1).repeat(1, STEPS_PER_TRAJ).view(-1, 1).numpy()
+time_steps = torch.arange(STEPS_PER_TRAJ).view(1, -1).repeat(BATCH_SIZE, 1).view(-1, 1).numpy()
+
+# Aplatissement du tenseur (Batch * Steps, Features)
+flat_features = hist_features.view(-1, 25).numpy()
+
+# Fusion des identifiants et des données
+final_array = np.hstack((traj_ids, time_steps, flat_features))
+
+columns = [
+    'traj_id', 'time_step', 'has_gps', 'has_uwb',
+    'y_gps_x1', 'y_gps_y1', 'y_gps_x2', 'y_gps_y2', 'y_uwb_dist',
+    'dx_0', 'dx_1', 'dx_2', 'dx_3', 'dx_4', 'dx_5', 'dx_6', 'dx_7', 'dx_8', 'dx_9',
+    'prior_x1', 'prior_y1', 'prior_x2', 'prior_y2',
+    'true_x1', 'true_y1', 'true_x2', 'true_y2'
+]
+
+df = pd.DataFrame(final_array, columns=columns)
+
 os.makedirs("dataset", exist_ok=True)
-csv_path = "dataset/kalman_dataset.csv"
-parquet_path = "dataset/kalman_dataset.parquet"
+parquet_path = "dataset/kalman_dataset_gpu.parquet"
 
-print("💾 Sauvegarde en cours...")
-df.to_csv(csv_path, index=False)
-try:
-    df.to_parquet(parquet_path, engine='pyarrow', index=False)
-    print(f"✅ Succès ! Fichier Parquet créé : {parquet_path} (Ultra-rapide pour PyTorch)")
-except ImportError:
-    print("⚠️ Module 'pyarrow' ou 'fastparquet' non installé. Seul le CSV a été créé.")
-
-print(f"✅ Fichier CSV créé : {csv_path} (Idéal pour DataWrangler)")
-print(f"📊 Taille du Dataset : {len(df)} lignes x {len(df.columns)} colonnes.")
-print("\nAperçu des colonnes :", list(df.columns)[:10], "...")
+# On sauvegarde directement en Parquet (Le CSV serait trop lourd : ~3 millions de lignes !)
+df.to_parquet(parquet_path, engine='pyarrow', index=False)
+print(f"✅ Terminé ! Dataset sauvegardé : {parquet_path}")
+print(f"📊 Taille finale : {len(df)} lignes ({BATCH_SIZE} trajectoires)")
