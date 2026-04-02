@@ -1,3 +1,8 @@
+export CUDA_VISIBLE_DEVICES=0
+export NCCL_P2P_DISABLE=1
+export NCCL_IB_DISABLE=1
+
+
 python3 -c "import torch; print('Initialisation...'); torch.cuda.init(); print('Nom:', torch.cuda.get_device_name(0)); x = torch.ones(1).cuda(); print('Succès !')"
 
 
