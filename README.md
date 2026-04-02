@@ -1,202 +1,187 @@
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
+import os
+from tqdm import tqdm # Pour la barre de progression
 
 # ==========================================
-# PARAMÈTRES GLOBAUX
+# 1. PARAMÈTRES DU DATASET
 # ==========================================
-dt_imu = 0.01   # 100 Hz
-dt_gps = 2.0    # GPS lent (0.5 Hz) pour créer de gros sauts
-dt_uwb = 0.1    # Capteur de distance rapide (10 Hz)
-sim_time = 30.0 
+NUM_TRAJECTORIES = 50   # Mets 1000 ou 5000 pour ton entraînement final
+SIM_TIME = 20.0         # 20 secondes par trajectoire
+DT_IMU = 0.01           # 100 Hz
+DT_GPS = 1.0            # 1 Hz
+DT_UWB = 0.1            # 10 Hz
 
-# 🔴 LE SWITCH 🔴
-USE_RANGING = True  
+STEPS_PER_TRAJ = int(SIM_TIME / DT_IMU)
+STEP_GPS = int(DT_GPS / DT_IMU)
+STEP_UWB = int(DT_UWB / DT_IMU)
 
-step_gps = int(dt_gps / dt_imu)
-step_uwb = int(dt_uwb / dt_imu)
-N_steps = int(sim_time / dt_imu)
-time = np.arange(0, sim_time, dt_imu)
+# Bruits de base
+Q_base = np.diag([0.01, 0.01, 0.1, 0.1, np.deg2rad(1.0)]) ** 2
+Q_full = np.block([[Q_base, np.zeros((5,5))], [np.zeros((5,5)), Q_base]])
+R_gps = np.diag([3.0, 3.0, 3.0, 3.0]) ** 2
+R_uwb = np.array([[0.5 ** 2]])
 
 # ==========================================
-# CLASSE SWARM EKF (Baseline Simple 10x10)
+# 2. GÉNÉRATEUR DE DONNÉES
 # ==========================================
-class SwarmEKF_Baseline:
-    def __init__(self, start_y2=10.0):
-        # Bruits standard
-        q = np.diag([0.01, 0.01, 0.1, 0.1, np.deg2rad(1.0)]) ** 2
-        self.Q = np.block([[q, np.zeros((5,5))], [np.zeros((5,5)), q]])
-        self.R_gps = np.diag([3.0, 3.0, 3.0, 3.0]) ** 2
-        self.R_dist = np.array([[0.5 ** 2]]) # Incertitude UWB
+def generate_trajectory(traj_id):
+    """Génère un épisode complet de vol et retourne une liste de dictionnaires"""
+    
+    # --- Initialisation Aléatoire ---
+    start_y2 = np.random.uniform(5.0, 15.0) # Le Drone 2 commence à une distance aléatoire
+    X_true = np.zeros((10, 1))
+    X_true[6, 0] = start_y2
+    
+    X_est = np.zeros((10, 1))
+    X_est[6, 0] = start_y2
+    P_est = np.eye(10) * 5.0
+    
+    # Biais IMU aléatoire pour cet épisode (entre -0.2 et +0.2)
+    bias_d2 = np.random.uniform(-0.2, 0.2, (3, 1))
+    
+    # Consignes de vol dynamiques
+    current_ax, current_ay, current_omega = 0.5, 0.0, 0.0
+    
+    trajectory_data = []
+    
+    for step in range(STEPS_PER_TRAJ):
+        t = step * DT_IMU
         
-        # Initialisation Vérité et Estimation (10 variables)
-        self.X_true = np.zeros((10, 1))
-        self.X_true[6, 0] = start_y2 
-        
-        self.X_est = np.zeros((10, 1))
-        self.X_est[6, 0] = start_y2
-        self.P_est = np.eye(10) * 5.0
-        
-        # Historique
-        self.hX_true, self.hX_est, self.hP_est = [], [], []
-
-    def simulate_truth_and_get_imu(self, dt):
-        ax, ay, omega = 0.5, 0.0, 0.3
-        
-        # Mise à jour de la vérité pour D1 (index 0) et D2 (index 5)
-        for i in [0, 5]: 
-            theta = self.X_true[i+4, 0]
-            self.X_true[i, 0]   += self.X_true[i+2, 0] * dt
-            self.X_true[i+1, 0] += self.X_true[i+3, 0] * dt
-            self.X_true[i+2, 0] += (ax * np.cos(theta) - ay * np.sin(theta)) * dt
-            self.X_true[i+3, 0] += (ax * np.sin(theta) + ay * np.cos(theta)) * dt
-            self.X_true[i+4, 0] += omega * dt
+        # --- 1. Changement de trajectoire aléatoire (toutes les 4 secondes) ---
+        if step % 400 == 0:
+            current_ax = np.random.uniform(0.0, 1.0)
+            current_omega = np.random.uniform(-0.5, 0.5) # Virage gauche ou droite
             
-        # IMU D1 (Parfaite + Bruit blanc)
-        u1 = np.array([[ax], [ay], [omega]]) + np.random.normal(0, 0.1, (3,1))
+        # --- 2. Mise à jour de la Vérité Terrain ---
+        for i in [0, 5]: 
+            theta = X_true[i+4, 0]
+            X_true[i, 0]   += X_true[i+2, 0] * DT_IMU
+            X_true[i+1, 0] += X_true[i+3, 0] * DT_IMU
+            X_true[i+2, 0] += (current_ax * np.cos(theta) - current_ay * np.sin(theta)) * DT_IMU
+            X_true[i+3, 0] += (current_ax * np.sin(theta) + current_ay * np.cos(theta)) * DT_IMU
+            X_true[i+4, 0] += current_omega * DT_IMU
+            
+        # --- 3. Génération des IMU (avec Biais sur D2) ---
+        u1 = np.array([[current_ax], [current_ay], [current_omega]]) + np.random.normal(0, 0.1, (3,1))
+        u2 = np.array([[current_ax], [current_ay], [current_omega]]) + bias_d2 + np.random.normal(0, 0.1, (3,1))
         
-        # IMU D2 (Défectueuse : Biais + Bruit blanc)
-        bias_d2 = np.array([[0.1], [0.05], [np.deg2rad(0.5)]])
-        u2 = np.array([[ax], [ay], [omega]]) + bias_d2 + np.random.normal(0, 0.1, (3,1))
-        
-        return u1, u2
-
-    def predict(self, u1, u2, dt):
+        # --- 4. Prédiction EKF (L'état Prior) ---
+        X_prev_est = X_est.copy()
         X_pred = np.zeros((10, 1))
         F = np.eye(10)
-        
         for idx, u in zip([0, 5], [u1, u2]):
-            x, y, vx, vy, theta = self.X_est[idx:idx+5, 0]
+            x, y, vx, vy, theta = X_est[idx:idx+5, 0]
             a_x, a_y, om = u[0,0], u[1,0], u[2,0]
             
-            X_pred[idx, 0]   = x + vx * dt
-            X_pred[idx+1, 0] = y + vy * dt
-            X_pred[idx+2, 0] = vx + (a_x * np.cos(theta) - a_y * np.sin(theta)) * dt
-            X_pred[idx+3, 0] = vy + (a_x * np.sin(theta) + a_y * np.cos(theta)) * dt
-            X_pred[idx+4, 0] = theta + om * dt
+            X_pred[idx, 0]   = x + vx * DT_IMU
+            X_pred[idx+1, 0] = y + vy * DT_IMU
+            X_pred[idx+2, 0] = vx + (a_x * np.cos(theta) - a_y * np.sin(theta)) * DT_IMU
+            X_pred[idx+3, 0] = vy + (a_x * np.sin(theta) + a_y * np.cos(theta)) * DT_IMU
+            X_pred[idx+4, 0] = theta + om * DT_IMU
             
-            F[idx,   idx+2] = dt
-            F[idx+1, idx+3] = dt
-            F[idx+2, idx+4] = (-a_x * np.sin(theta) - a_y * np.cos(theta)) * dt
-            F[idx+3, idx+4] = ( a_x * np.cos(theta) - a_y * np.sin(theta)) * dt
+            F[idx,   idx+2] = DT_IMU; F[idx+1, idx+3] = DT_IMU
+            F[idx+2, idx+4] = (-a_x * np.sin(theta) - a_y * np.cos(theta)) * DT_IMU
+            F[idx+3, idx+4] = ( a_x * np.cos(theta) - a_y * np.sin(theta)) * DT_IMU
             
-        self.P_est = F @ self.P_est @ F.T + self.Q
-        self.X_est = X_pred
+        P_pred = F @ P_est @ F.T + Q_full
+        X_est = X_pred.copy()
+        
+        # Calcul du Delta X (Évolution de l'état)
+        delta_x = X_est - X_prev_est
 
-    def update_gps(self):
-        # Mesure brute X, Y pour les deux drones
-        Z = np.vstack((self.X_true[0:2], self.X_true[5:7])) + np.random.normal(0, 3, (4,1))
+        # --- 5. Observations (Innovations et Flags) ---
+        has_gps, has_uwb = 0, 0
+        y_gps = np.zeros((4, 1))
+        y_uwb = np.zeros((1, 1))
         
-        H = np.zeros((4, 10))
-        H[0, 0] = 1; H[1, 1] = 1
-        H[2, 5] = 1; H[3, 6] = 1
-        
-        y = Z - (H @ self.X_est)
-        S = H @ self.P_est @ H.T + self.R_gps
-        K = self.P_est @ H.T @ np.linalg.inv(S)
-        
-        self.X_est = self.X_est + K @ y
-        self.P_est = (np.eye(10) - K @ H) @ self.P_est
-
-    def update_distance(self):
-        # Mesure brute de la distance relative
-        true_dist = np.sqrt((self.X_true[5,0]-self.X_true[0,0])**2 + (self.X_true[6,0]-self.X_true[1,0])**2)
-        z_dist = true_dist + np.random.normal(0, np.sqrt(self.R_dist[0,0]))
-        
-        e_dist = np.sqrt((self.X_est[5,0]-self.X_est[0,0])**2 + (self.X_est[6,0]-self.X_est[1,0])**2)
-        
-        H = np.zeros((1, 10))
-        if e_dist > 0.01:
-            H[0, 0] = -(self.X_est[5,0]-self.X_est[0,0]) / e_dist
-            H[0, 1] = -(self.X_est[6,0]-self.X_est[1,0]) / e_dist
-            H[0, 5] =  (self.X_est[5,0]-self.X_est[0,0]) / e_dist
-            H[0, 6] =  (self.X_est[6,0]-self.X_est[1,0]) / e_dist
+        # Correction GPS
+        if step % STEP_GPS == 0:
+            has_gps = 1
+            z_gps = np.vstack((X_true[0:2], X_true[5:7])) + np.random.normal(0, 3.0, (4,1))
+            H_gps = np.zeros((4, 10))
+            H_gps[0, 0] = 1; H_gps[1, 1] = 1; H_gps[2, 5] = 1; H_gps[3, 6] = 1
+            y_gps = z_gps - (H_gps @ X_est)
+            # MAJ de l'EKF classique (pour continuer la boucle)
+            S = H_gps @ P_pred @ H_gps.T + R_gps
+            K = P_pred @ H_gps.T @ np.linalg.inv(S)
+            X_est = X_est + K @ y_gps
+            P_pred = (np.eye(10) - K @ H_gps) @ P_pred
             
-        y = z_dist - e_dist
-        S = H @ self.P_est @ H.T + self.R_dist
-        K = self.P_est @ H.T @ np.linalg.inv(S)
+        # Correction UWB
+        if step % STEP_UWB == 0:
+            has_uwb = 1
+            true_dist = np.sqrt((X_true[5,0]-X_true[0,0])**2 + (X_true[6,0]-X_true[1,0])**2)
+            z_dist = true_dist + np.random.normal(0, 0.5)
+            e_dist = np.sqrt((X_est[5,0]-X_est[0,0])**2 + (X_est[6,0]-X_est[1,0])**2)
+            y_uwb[0,0] = z_dist - e_dist
+            
+            H_dist = np.zeros((1, 10))
+            if e_dist > 0.01:
+                H_dist[0, 0] = -(X_est[5,0]-X_est[0,0]) / e_dist
+                H_dist[0, 1] = -(X_est[6,0]-X_est[1,0]) / e_dist
+                H_dist[0, 5] =  (X_est[5,0]-X_est[0,0]) / e_dist
+                H_dist[0, 6] =  (X_est[6,0]-X_est[1,0]) / e_dist
+            
+            S = H_dist @ P_pred @ H_dist.T + R_uwb
+            K = P_pred @ H_dist.T @ np.linalg.inv(S)
+            X_est = X_est + K * y_uwb[0,0]
+            P_pred = (np.eye(10) - K @ H_dist) @ P_pred
+            
+        P_est = P_pred # Fin du step
+
+        # --- 6. Enregistrement de la ligne de données ---
+        row = {
+            'traj_id': traj_id,
+            'time_step': step,
+            'has_gps': has_gps,
+            'has_uwb': has_uwb,
+            
+            # --- LES INPUTS DU RÉSEAU (Features) ---
+            'y_gps_x1': y_gps[0,0], 'y_gps_y1': y_gps[1,0],
+            'y_gps_x2': y_gps[2,0], 'y_gps_y2': y_gps[3,0],
+            'y_uwb_dist': y_uwb[0,0],
+        }
         
-        self.X_est = self.X_est + K * y
-        self.P_est = (np.eye(10) - K @ H) @ self.P_est
-
-    def save_history(self):
-        self.hX_true.append(self.X_true.copy())
-        self.hX_est.append(self.X_est.copy())
-        self.hP_est.append(np.diag(self.P_est).copy())
-
-# ==========================================
-# BOUCLE PRINCIPALE
-# ==========================================
-swarm = SwarmEKF_Baseline()
-
-for i in range(N_steps):
-    u1, u2 = swarm.simulate_truth_and_get_imu(dt_imu)
-    swarm.predict(u1, u2, dt_imu)
-    
-    if i % step_gps == 0:
-        swarm.update_gps()
+        # Ajout des 10 variables de delta_x
+        for j in range(10): row[f'dx_{j}'] = delta_x[j, 0]
+            
+        # --- LES TARGETS DU RÉSEAU (Pour la Loss) ---
+        # On sauvegarde l'état Prédit (avant correction) et la Vérité Absolue
+        for j in range(10): 
+            row[f'prior_{j}'] = X_pred[j, 0]
+            row[f'true_{j}'] = X_true[j, 0]
+            
+        trajectory_data.append(row)
         
-    if USE_RANGING and i % step_uwb == 0:
-        swarm.update_distance()
-        
-    swarm.save_history()
+    return trajectory_data
 
 # ==========================================
-# FORMATAGE DES DONNÉES
+# 3. CRÉATION ET SAUVEGARDE
 # ==========================================
-X_t = np.array(swarm.hX_true).squeeze()
-X_e = np.array(swarm.hX_est).squeeze()
-P_e = np.array(swarm.hP_est)
+print(f"🚀 Génération du Dataset ({NUM_TRAJECTORIES} trajectoires)...")
+all_data = []
 
-dist_t = np.sqrt((X_t[:,5]-X_t[:,0])**2 + (X_t[:,6]-X_t[:,1])**2)
-dist_e = np.sqrt((X_e[:,5]-X_e[:,0])**2 + (X_e[:,6]-X_e[:,1])**2)
+for traj_idx in tqdm(range(NUM_TRAJECTORIES)):
+    traj_data = generate_trajectory(traj_idx)
+    all_data.extend(traj_data)
 
-# ==========================================
-# AFFICHAGE PROPRE (Bug de la vérité corrigé)
-# ==========================================
-fig = plt.figure(figsize=(16, 18))
-plt.subplots_adjust(hspace=0.4)
+# Conversion en DataFrame Pandas
+df = pd.DataFrame(all_data)
 
-état_txt = "AVEC UWB (Couplé)" if USE_RANGING else "SANS UWB (Dérive totale)"
+# Sauvegarde
+os.makedirs("dataset", exist_ok=True)
+csv_path = "dataset/kalman_dataset.csv"
+parquet_path = "dataset/kalman_dataset.parquet"
 
-# --- 1. Trajectoire 2D ---
-plt.subplot(4, 2, 1)
-plt.plot(X_t[:,0], X_t[:,1], 'k--', label="D1 Réel")
-plt.plot(X_e[:,0], X_e[:,1], 'b-', label="D1 Est")
-plt.plot(X_t[:,5], X_t[:,6], 'k:', linewidth=2, label="D2 Réel") # Changé en pointillés
-plt.plot(X_e[:,5], X_e[:,6], 'r-', label="D2 Est (Biaisé)")
-plt.title(f"Trajectoire 2D ({état_txt})"); plt.xlabel("X (m)"); plt.ylabel("Y (m)")
-plt.legend(); plt.grid(True); plt.axis('equal')
+print("💾 Sauvegarde en cours...")
+df.to_csv(csv_path, index=False)
+try:
+    df.to_parquet(parquet_path, engine='pyarrow', index=False)
+    print(f"✅ Succès ! Fichier Parquet créé : {parquet_path} (Ultra-rapide pour PyTorch)")
+except ImportError:
+    print("⚠️ Module 'pyarrow' ou 'fastparquet' non installé. Seul le CSV a été créé.")
 
-# --- 2. Distance ---
-plt.subplot(4, 2, 2)
-plt.plot(time, dist_t, 'k--', label="Distance Réelle")
-plt.plot(time, dist_e, 'g-', label="Distance Estimée")
-plt.title(f"Distance D1-D2 ({état_txt})"); plt.xlabel("Temps (s)"); plt.ylabel("Distance (m)")
-plt.legend(); plt.grid(True)
-
-# --- 3 à 7. Les 5 variables d'états ---
-labels = ["Position X (m)", "Position Y (m)", "Vitesse Vx (m/s)", "Vitesse Vy (m/s)", "Cap Theta (rad)"]
-
-for j in range(5):
-    plt.subplot(4, 2, j + 3)
-    
-    # Drone 1 (Vérité et Estimé)
-    plt.plot(time, X_t[:, j], 'k--', alpha=0.5, label="D1 Réel" if j==0 else "")
-    plt.plot(time, X_e[:, j], 'b-', label="D1 Est" if j==0 else "")
-    s1 = np.sqrt(P_e[:, j])
-    plt.fill_between(time, X_e[:, j]-3*s1, X_e[:, j]+3*s1, color='blue', alpha=0.1)
-    
-    # Drone 2 (Vérité et Estimé) -> C'était le bug ! C'est X_t[:, j+5]
-    plt.plot(time, X_t[:, j+5], 'k:', alpha=0.7, label="D2 Réel" if j==0 else "")
-    plt.plot(time, X_e[:, j+5], 'r-', label="D2 Est" if j==0 else "")
-    s2 = np.sqrt(P_e[:, j+5])
-    plt.fill_between(time, X_e[:, j+5]-3*s2, X_e[:, j+5]+3*s2, color='red', alpha=0.1)
-
-    plt.title(labels[j]); plt.xlabel("Temps (s)"); plt.grid(True)
-    if j == 0: plt.legend(loc="upper left")
-
-plt.savefig(f"baseline_simple_ranging_{USE_RANGING}.png", dpi=300, bbox_inches='tight')
-plt.close(fig)
-print(f"Terminé ! Image sauvegardée : baseline_simple_ranging_{USE_RANGING}.png")
-
-
+print(f"✅ Fichier CSV créé : {csv_path} (Idéal pour DataWrangler)")
+print(f"📊 Taille du Dataset : {len(df)} lignes x {len(df.columns)} colonnes.")
+print("\nAperçu des colonnes :", list(df.columns)[:10], "...")
