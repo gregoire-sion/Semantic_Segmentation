@@ -1,4 +1,23 @@
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+# Mise à jour de pip à l'intérieur du venv
+python -m pip install --upgrade pip
+
+# Installation de PyTorch 2.0+ avec support CUDA 11.8
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+import os
+# Ces 3 lignes empêchent le GPU de "freezer" au démarrage
+os.environ["NCCL_P2P_DISABLE"] = "1"
+os.environ["NCCL_IB_DISABLE"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+
+import torch
+print(f"Initialisation réussie sur : {torch.cuda.get_device_name(0)}")
+
+python -c "import torch; print('CUDA disponible:', torch.cuda.is_available()); print('Nom du GPU:', torch.cuda.get_device_name(0)); x = torch.ones(1).cuda(); print('Calcul réussi !')"
+
+
+wget 
+https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
 bash Miniconda3-latest-Linux-x86_64.sh
 # Réponds "yes" à tout, puis redémarre ton terminal.
 
