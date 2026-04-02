@@ -1,3 +1,9 @@
+conda create -n k_net_env python=3.10
+conda activate k_net_env
+# Installation de PyTorch avec CUDA 11.8 (Le plus stable pour P40)
+pip install torch --index-url https://download.pytorch.org/whl/cu118
+
+
 export CUDA_VISIBLE_DEVICES=0
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
