@@ -1,3 +1,9 @@
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh
+# Réponds "yes" à tout, puis redémarre ton terminal.
+
+
+
 conda create -n k_net_env python=3.10
 conda activate k_net_env
 # Installation de PyTorch avec CUDA 11.8 (Le plus stable pour P40)
