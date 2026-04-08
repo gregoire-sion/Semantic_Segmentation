@@ -1,3 +1,6 @@
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+
 # Mise à jour de pip à l'intérieur du venv
 python -m pip install --upgrade pip
 
