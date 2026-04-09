@@ -1,47 +1,5 @@
-curl -O https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-
-
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-
-
-# Mise à jour de pip à l'intérieur du venv
-python -m pip install --upgrade pip
-
-# Installation de PyTorch 2.0+ avec support CUDA 11.8
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-
 import os
-# Ces 3 lignes empêchent le GPU de "freezer" au démarrage
-os.environ["NCCL_P2P_DISABLE"] = "1"
-os.environ["NCCL_IB_DISABLE"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
-
-import torch
-print(f"Initialisation réussie sur : {torch.cuda.get_device_name(0)}")
-
-python -c "import torch; print('CUDA disponible:', torch.cuda.is_available()); print('Nom du GPU:', torch.cuda.get_device_name(0)); x = torch.ones(1).cuda(); print('Calcul réussi !')"
-
-
-wget 
-https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-bash Miniconda3-latest-Linux-x86_64.sh
-# Réponds "yes" à tout, puis redémarre ton terminal.
-
-
-
-conda create -n k_net_env python=3.10
-conda activate k_net_env
-# Installation de PyTorch avec CUDA 11.8 (Le plus stable pour P40)
-pip install torch --index-url https://download.pytorch.org/whl/cu118
-
-
-export CUDA_VISIBLE_DEVICES=0
-export NCCL_P2P_DISABLE=1
-export NCCL_IB_DISABLE=1
-
-
-python3 -c "import torch; print('Initialisation...'); torch.cuda.init(); print('Nom:', torch.cuda.get_device_name(0)); x = torch.ones(1).cuda(); print('Succès !')"
-
 
 import torch
 import pandas as pd
@@ -56,7 +14,7 @@ from tqdm import tqdm
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"🚀 Appareil utilisé : {device.type.upper()}")
 
-BATCH_SIZE = 5000       # Nombre de trajectoires simulées EN MÊME TEMPS
+BATCH_SIZE = 500 #5000 initalement      # Nombre de trajectoires simulées EN MÊME TEMPS
 SIM_TIME = 20.0         
 DT_IMU = 0.01           
 DT_GPS = 1.0            
@@ -239,7 +197,7 @@ columns = [
 df = pd.DataFrame(final_array, columns=columns)
 
 os.makedirs("dataset", exist_ok=True)
-parquet_path = "dataset/kalman_dataset_gpu.parquet"
+parquet_path = "dataset/data/kalman_dataset_gpu.parquet"
 
 # On sauvegarde directement en Parquet (Le CSV serait trop lourd : ~3 millions de lignes !)
 df.to_parquet(parquet_path, engine='pyarrow', index=False)
