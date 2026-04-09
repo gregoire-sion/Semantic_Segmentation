@@ -1,3 +1,6 @@
+curl -O https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+
+
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
 
