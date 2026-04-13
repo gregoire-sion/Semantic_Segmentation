@@ -1,3 +1,7 @@
+python -c "import torch; print(f'🚀 GPU disponible : {torch.cuda.is_available()}'); print(f'📟 Carte : {torch.cuda.get_device_name(0)}')"
+
+
+
 python -c "import torch; print('\n✅ Import réussi !'); print(f'🔥 PyTorch version: {torch.__version__}'); print(f'🎮 GPU disponible: {torch.cuda.is_available()}'); print(f'📟 Nom du GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"}')"
 
 
