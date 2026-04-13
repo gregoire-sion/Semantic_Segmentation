@@ -1,3 +1,6 @@
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+
+
 ldd ~/miniconda3/envs/drone_gpu/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so | grep "not found"
 
 
