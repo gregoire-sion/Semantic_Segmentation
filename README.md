@@ -1,3 +1,8 @@
+(env_GPU) scvmpr12.fr.mbda.priv:/home/gsionsua/Work_bis/GRU/dataset $export LD_PRELOAD=$CONDA_PREFIX/lib/libmkl_rt.so python -c "import torch; print('Succes'); print(f'GPU: {torch.cuda.is_available()}')"
+bash: export: « -c » : identifiant non valable
+bash: export: « import torch; print('Succes'); print(f'GPU: {torch.cuda.is_available()}') » : identifiant non valable
+
+
 export LD_PRELOAD=$CONDA_PREFIX/lib/libmkl_rt.so
 python -c "import torch; print('Succes'); print(f'GPU: {torch.cuda.is_available()}')"
 
