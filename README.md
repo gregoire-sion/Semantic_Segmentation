@@ -1,3 +1,7 @@
+export LD_PRELOAD=$HOME/miniconda3/envs/env_GPU/lib/libmkl_rt.so:$HOME/miniconda3/envs/env_GPU/lib/libintel_thunder.so.5
+python -c "import torch; print('✅ Succès !'); print(f'GPU: {torch.cuda.is_available()}')"
+
+
 python -c "
 import torch; 
 import pandas; 
