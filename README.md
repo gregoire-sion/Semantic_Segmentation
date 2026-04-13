@@ -1,3 +1,6 @@
+ldd ~/miniconda3/envs/drone_gpu/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so | grep "not found"
+
+
 import torch
 import sys
 import time
