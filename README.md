@@ -1,3 +1,6 @@
+python -c "import torch; print('\n✅ Import réussi !'); print(f'🔥 PyTorch version: {torch.__version__}'); print(f'🎮 GPU disponible: {torch.cuda.is_available()}'); print(f'📟 Nom du GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"}')"
+
+
 (env_GPU) scvmpr12.fr.mbda.priv:/home/gsionsua/Work_bis/GRU/dataset $python test_env.py 
 Traceback (most recent call last):
   File "/home/gsionsua/Work_bis/GRU/dataset/test_env.py", line 1, in <module>
