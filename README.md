@@ -1,3 +1,59 @@
+import torch
+import sys
+import time
+
+def run_diagnostic():
+    print("="*30)
+    print("🔍 DIAGNOSTIC ENVIRONNEMENT")
+    print("="*30)
+    
+    # 1. Version de Python et PyTorch
+    print(f"🐍 Python : {sys.version.split()[0]}")
+    print(f"🔥 PyTorch : {torch.__version__}")
+    
+    # 2. Vérification CUDA
+    cuda_disponible = torch.cuda.is_available()
+    print(f"🎮 CUDA disponible : {'OUI ✅' if cuda_disponible else 'NON ❌'}")
+    
+    if cuda_disponible:
+        # 3. Infos sur le GPU et Driver
+        current_device = torch.cuda.current_device()
+        gpu_name = torch.cuda.get_device_name(current_device)
+        cuda_version = torch.version.cuda
+        print(f"📟 Nom du GPU : {gpu_name}")
+        print(f"🛠️ Version CUDA de PyTorch : {cuda_version}")
+        
+        # 4. Test de calcul réel (Multiplication de matrices)
+        print("\n🚀 Lancement du test de calcul...")
+        try:
+            start_time = time.time()
+            # On crée deux grosses matrices directement sur le GPU
+            a = torch.randn(5000, 5000).cuda()
+            b = torch.randn(5000, 5000).cuda()
+            
+            # Multiplication matricielle (très gourmand en GPU)
+            c = torch.matmul(a, b)
+            
+            # On attend que le GPU finisse (asynchrone par défaut)
+            torch.cuda.synchronize()
+            duration = time.time() - start_time
+            
+            print(f"✅ Test réussi en {duration:.4f} secondes !")
+            print(f"📦 Mémoire GPU utilisée : {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            
+        except Exception as e:
+            print(f"💥 Erreur lors du calcul : {e}")
+    else:
+        print("\n⚠️ ATTENTION : Le GPU n'est pas détecté.")
+        print("Vérifie que ton driver NVIDIA est bien chargé avec 'nvidia-smi'.")
+
+    print("="*30)
+
+if __name__ == "__main__":
+    run_diagnostic()
+
+
+
 python -c "import torch; print(f'Statut : GPU OK' if torch.cuda.is_available() else 'Erreur : Driver non reconnu'); print(f'Version CUDA interne : {torch.version.cuda}')"
 
 
