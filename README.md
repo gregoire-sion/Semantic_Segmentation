@@ -1,3 +1,6 @@
+python -c "import torch; print(f'Statut : GPU OK' if torch.cuda.is_available() else 'Erreur : Driver non reconnu'); print(f'Version CUDA interne : {torch.version.cuda}')"
+
+
 python -c "import torch; import pandas; print('--- CHECK-UP ---'); print(f'PyTorch OK (v{torch.__version__})'); print(f'GPU visible: {torch.cuda.is_available()}'); print(f'Pandas OK (v{pandas.__version__})')"
 
 
