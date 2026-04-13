@@ -1,3 +1,7 @@
+
+export LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6
+python test_gpu.py
+
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 
