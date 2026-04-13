@@ -1,3 +1,15 @@
+python -c "
+import torch; 
+import pandas; 
+import tqdm; 
+print('\n' + '='*20);
+print(f'🔥 PyTorch GPU : {torch.cuda.is_available()}');
+print(f'📊 Pandas OK   : {pandas.__version__}');
+print(f'🚀 TQDM OK     : Prêt');
+print('='*20);
+"
+
+
 python -c "import torch; print(f'🚀 GPU disponible : {torch.cuda.is_available()}'); print(f'📟 Carte : {torch.cuda.get_device_name(0)}')"
 
 
