@@ -1,3 +1,6 @@
+python -c "import torch; import pandas; print('--- CHECK-UP ---'); print(f'PyTorch OK (v{torch.__version__})'); print(f'GPU visible: {torch.cuda.is_available()}'); print(f'Pandas OK (v{pandas.__version__})')"
+
+
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
