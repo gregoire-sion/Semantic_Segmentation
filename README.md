@@ -1,3 +1,7 @@
+export LD_PRELOAD=$CONDA_PREFIX/lib/libmkl_rt.so
+python -c "import torch; print('Succes'); print(f'GPU: {torch.cuda.is_available()}')"
+
+
 (env_GPU) scvmpr12.fr.mbda.priv:/home/gsionsua/Work_bis/GRU/dataset $python -c "
 > import torch; 
 > import pandas; 
