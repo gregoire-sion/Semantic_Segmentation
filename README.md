@@ -1,3 +1,13 @@
+(env_GPU) scvmpr12.fr.mbda.priv:/home/gsionsua/Work_bis/GRU/dataset $python test_env.py 
+Traceback (most recent call last):
+  File "/home/gsionsua/Work_bis/GRU/dataset/test_env.py", line 1, in <module>
+    import torch
+  File "/home/gsionsua/miniconda3/envs/env_GPU/lib/python3.11/site-packages/torch/__init__.py", line 367, in <module>
+    from torch._C import *  # noqa: F403
+    ^^^^^^^^^^^^^^^^^^^^^^
+ImportError: /home/gsionsua/miniconda3/envs/env_GPU/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so: undefined symbol: iJIT_NotifyEvent
+
+
 
 export LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6
 python test_gpu.py
