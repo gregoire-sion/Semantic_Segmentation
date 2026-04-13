@@ -1,4 +1,7 @@
-(env_GPU) scvmpr12.fr.mbda.priv:/home/gsionsua/Work_bis/GRU/dataset $rm -rf ~/miniconda3
+python -c "import torch; print('\n' + '='*25); print(f'🚀 PyTorch Version: {torch.__version__}'); print(f'🎮 GPU Disponible: {torch.cuda.is_available()}'); print('='*25)"
+
+
+env_GPU) scvmpr12.fr.mbda.priv:/home/gsionsua/Work_bis/GRU/dataset $rm -rf ~/miniconda3
 rm: impossible de supprimer '/home/gsionsua/miniconda3/envs/env_GPU/lib': Le dossier n'est pas vide
 ERROR: ld.so: object '/home/gsionsua/miniconda3/envs/env_GPU/lib/libmkl_rt.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
 
