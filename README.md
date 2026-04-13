@@ -1,3 +1,30 @@
+(env_GPU) scvmpr12.fr.mbda.priv:/home/gsionsua/Work_bis/GRU/dataset $python -c "
+> import torch; 
+> import pandas; 
+> import tqdm; 
+> print('\n' + '='*20);
+> print(f'🔥 PyTorch GPU : {torch.cuda.is_available()}');
+> print(f'📊 Pandas OK   : {pandas.__version__}');
+> print(f'🚀 TQDM OK     : Prêt');
+> print('='*20);
+> "
+Traceback (most recent call last):
+  File "<string>", line 2, in <module>
+  File "/home/gsionsua/miniconda3/envs/env_GPU/lib/python3.11/site-packages/torch/__init__.py", line 367, in <module>
+    from torch._C import *  # noqa: F403
+    ^^^^^^^^^^^^^^^^^^^^^^
+ImportError: /home/gsionsua/miniconda3/envs/env_GPU/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so: undefined symbol: iJIT_NotifyEvent
+(env_GPU) scvmpr12.fr.mbda.priv:/home/gsionsua/Work_bis/GRU/dataset $export LD_PRELOAD=$HOME/miniconda3/envs/env_GPU/lib/libmkl_rt.so:$HOME/miniconda3/envs/env_GPU/lib/libintel_thunder.so.5
+ERROR: ld.so: object '/home/gsionsua/miniconda3/envs/env_GPU/lib/libintel_thunder.so.5' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+(env_GPU) scvmpr12.fr.mbda.priv:/home/gsionsua/Work_bis/GRU/dataset $python -c "import torch; print('✅ Succès !'); print(f'GPU: {torch.cuda.is_available()}')"
+bash: !': event not found
+(env_GPU) scvmpr12.fr.mbda.priv:/home/gsionsua/Work_bis/GRU/dataset $
+ERROR: ld.so: object '/home/gsionsua/miniconda3/envs/env_GPU/lib/libintel_thunder.so.5' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+(env_GPU) scvmpr12.fr.mbda.priv:/home/gsionsua/Work_bis/GRU/dataset $export LD_PRELOAD=$HOME/miniconda3/envs/env_GPU/lib/libmkl_rt.so:$HOME/miniconda3/envs/env_GPU/lib/libintel_thunder.so.5
+ERROR: ld.so: object '/home/gsionsua/miniconda3/envs/env_GPU/lib/libintel_thunder.so.5' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+(env_GPU) scvmpr12.fr.mbda.priv:/home/gsionsua/Work_bis/GRU/dataset $
+ERROR: ld.so: object '/home/gsionsua/minico
+
 export LD_PRELOAD=$HOME/miniconda3/envs/env_GPU/lib/libmkl_rt.so:$HOME/miniconda3/envs/env_GPU/lib/libintel_thunder.so.5
 python -c "import torch; print('✅ Succès !'); print(f'GPU: {torch.cuda.is_available()}')"
 
