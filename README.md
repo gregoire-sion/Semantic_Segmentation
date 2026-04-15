@@ -1,3 +1,12 @@
+(Environnement) scvmpr10.fr.mbda.priv:/home/gsionsua/Work_bis/GRU/dataset $python generate_dataset.py 
+🚀 Appareil utilisé : CUDA
+⚙️ Simulation de 500 trajectoires sur 2000 itérations...
+  0%|                                                                                                 | 0/2000 [00:00<?, ?it/s]
+Traceback (most recent call last):
+  File "/home/gsionsua/Work_bis/GRU/dataset/generate_dataset.py", line 148, in <module>
+    H_dist[:, 0, 0] = -dx_est / safe_dist
+RuntimeError: expand(torch.cuda.FloatTensor{[500, 500]}, size=[500]): the number of sizes provided (1) must be greater or equal to the number of dimensions in the tensor (2)
+
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
