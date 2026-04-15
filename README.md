@@ -1,4 +1,133 @@
 import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+DATASET_PATH = "dataset/data/kalman_dataset_gpu.pkl"
+OUTPUT_DIR = "analyse_resultats"
+
+# Création du dossier pour ranger les graphiques proprement
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ==========================================
+# 1. CHARGEMENT DES DONNÉES
+# ==========================================
+print("📂 Chargement du dataset en cours... (Cela peut prendre quelques secondes)")
+df = pd.read_pickle(DATASET_PATH)
+
+print(f"✅ Dataset chargé avec succès !")
+print(f"   -> Nombre de lignes : {len(df):,}")
+print(f"   -> Nombre de trajectoires : {df['traj_id'].nunique()}")
+print(f"   -> Itérations par trajectoire : {df['time_step'].nunique()}")
+
+# ==========================================
+# 2. CALCUL DES ERREURS (MÉTRIQUES)
+# ==========================================
+print("\n🧮 Calcul des erreurs de positionnement (RMSE)...")
+
+# Erreur de positionnement Euclidienne (Prior vs True)
+df['error_d1'] = np.sqrt((df['prior_x1'] - df['true_x1'])**2 + (df['prior_y1'] - df['true_y1'])**2)
+df['error_d2'] = np.sqrt((df['prior_x2'] - df['true_x2'])**2 + (df['prior_y2'] - df['true_y2'])**2)
+
+# Filtrer pour analyser les moments où les capteurs s'activent
+df_gps = df[df['has_gps'] == 1.0]
+df_uwb = df[df['has_uwb'] == 1.0]
+
+# Affichage des statistiques dans le terminal
+print("\n" + "="*40)
+print("📊 RAPPPORT STATISTIQUE GLOBAL")
+print("="*40)
+print(f"📍 Erreur moyenne Drone 1 : {df['error_d1'].mean():.3f} m (Max: {df['error_d1'].max():.3f} m)")
+print(f"📍 Erreur moyenne Drone 2 : {df['error_d2'].mean():.3f} m (Max: {df['error_d2'].max():.3f} m)")
+print(f"📡 Nombre de corrections GPS totales : {len(df_gps):,}")
+print(f"📏 Nombre de corrections UWB totales : {len(df_uwb):,}")
+print(f"🎯 Innovation UWB moyenne (erreur distance) : {df_uwb['y_uwb_dist'].abs().mean():.3f} m")
+
+# ==========================================
+# 3. GÉNÉRATION DES GRAPHIQUES
+# ==========================================
+print("\n🎨 Génération des graphiques d'analyse...")
+
+# --- GRAPHIQUE 1 : Trajectoire 2D (Vrai vs Estimé) ---
+# On prend la trajectoire 0 en exemple
+TRAJ_ID = 0
+df_traj = df[df['traj_id'] == TRAJ_ID]
+
+plt.figure(figsize=(10, 8))
+plt.plot(df_traj['true_x1'], df_traj['true_y1'], label="Drone 1 (Vérité)", linestyle="--", color="blue", linewidth=2)
+plt.plot(df_traj['prior_x1'], df_traj['prior_y1'], label="Drone 1 (Filtre)", color="cyan", alpha=0.7)
+
+plt.plot(df_traj['true_x2'], df_traj['true_y2'], label="Drone 2 (Vérité)", linestyle="--", color="red", linewidth=2)
+plt.plot(df_traj['prior_x2'], df_traj['prior_y2'], label="Drone 2 (Filtre)", color="orange", alpha=0.7)
+
+# Ajouter les points où le GPS a corrigé (pour le Drone 1 par ex)
+gps_points = df_traj[df_traj['has_gps'] == 1.0]
+plt.scatter(gps_points['true_x1'], gps_points['true_y1'], color='black', marker='x', label="Correction GPS", zorder=5)
+
+plt.title(f"Vue 2D de la trajectoire (ID: {TRAJ_ID})")
+plt.xlabel("Position X (m)")
+plt.ylabel("Position Y (m)")
+plt.legend()
+plt.grid(True)
+plt.savefig(f"{OUTPUT_DIR}/1_trajectoire_2D.png", dpi=300)
+plt.close()
+print(f"  📸 Sauvegardé : {OUTPUT_DIR}/1_trajectoire_2D.png")
+
+# --- GRAPHIQUE 2 : Évolution de l'erreur dans le temps ---
+plt.figure(figsize=(12, 5))
+plt.plot(df_traj['time_step'] * 0.01, df_traj['error_d1'], label="Erreur Drone 1", color="blue")
+plt.plot(df_traj['time_step'] * 0.01, df_traj['error_d2'], label="Erreur Drone 2", color="red")
+
+# Lignes verticales pour les corrections UWB
+uwb_times = df_traj[df_traj['has_uwb'] == 1.0]['time_step'] * 0.01
+for t in uwb_times:
+    plt.axvline(x=t, color='green', alpha=0.1, linestyle='-', linewidth=0.5)
+
+plt.title(f"Évolution de l'erreur de position dans le temps (Traj {TRAJ_ID})")
+plt.xlabel("Temps (secondes)")
+plt.ylabel("Erreur de positionnement (mètres)")
+plt.legend()
+plt.grid(True)
+plt.savefig(f"{OUTPUT_DIR}/2_erreur_temporelle.png", dpi=300)
+plt.close()
+print(f"  📸 Sauvegardé : {OUTPUT_DIR}/2_erreur_temporelle.png")
+
+# --- GRAPHIQUE 3 : Distribution des erreurs (Histogramme global) ---
+plt.figure(figsize=(10, 5))
+plt.hist(df['error_d1'], bins=100, alpha=0.5, label="Drone 1", color='blue', density=True)
+plt.hist(df['error_d2'], bins=100, alpha=0.5, label="Drone 2", color='red', density=True)
+plt.title("Distribution (Histogramme) de l'erreur de positionnement (Tout le dataset)")
+plt.xlabel("Erreur Euclidienne (m)")
+plt.ylabel("Densité")
+plt.xlim(0, max(df['error_d1'].max(), df['error_d2'].max()) * 0.5) # Zoomer sur la partie intéressante
+plt.legend()
+plt.grid(True)
+plt.savefig(f"{OUTPUT_DIR}/3_histogramme_erreurs.png", dpi=300)
+plt.close()
+print(f"  📸 Sauvegardé : {OUTPUT_DIR}/3_histogramme_erreurs.png")
+
+# --- GRAPHIQUE 4 : Innovation UWB (Résidus) ---
+plt.figure(figsize=(10, 5))
+# On ne trace que les moments où l'UWB est actif
+df_traj_uwb = df_traj[df_traj['has_uwb'] == 1.0]
+plt.plot(df_traj_uwb['time_step'] * 0.01, df_traj_uwb['y_uwb_dist'], marker='o', linestyle='-', color='purple', markersize=3)
+plt.axhline(0, color='black', linestyle='--')
+plt.title("Innovation UWB (Différence entre distance mesurée et estimée)")
+plt.xlabel("Temps (secondes)")
+plt.ylabel("Innovation y_uwb (mètres)")
+plt.grid(True)
+plt.savefig(f"{OUTPUT_DIR}/4_innovation_uwb.png", dpi=300)
+plt.close()
+print(f"  📸 Sauvegardé : {OUTPUT_DIR}/4_innovation_uwb.png")
+
+print("\n🚀 Analyse terminée avec succès !")
+print(f"Tu peux maintenant ouvrir les images dans le dossier '{OUTPUT_DIR}' via ton explorateur de fichiers.")
+
+
+import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
 import torch
