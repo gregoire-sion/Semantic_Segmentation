@@ -1,3 +1,160 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+import numpy as np # Au cas où tes données sont en .npy
+
+# ==========================================
+# 1. ARCHITECTURE DU KALMANNET
+# ==========================================
+
+class KalmanGainNetwork(nn.Module):
+    def __init__(self, state_dim, obs_dim, hidden_dim=64):
+        super(KalmanGainNetwork, self).__init__()
+        self.state_dim = state_dim
+        self.obs_dim = obs_dim
+        
+        self.gru = nn.GRU(input_size=obs_dim, hidden_size=hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, state_dim * obs_dim)
+
+    def forward(self, features, hidden_state):
+        out, hidden_state = self.gru(features, hidden_state)
+        out = self.fc(out)
+        K = out.view(-1, self.state_dim, self.obs_dim)
+        return K, hidden_state
+
+class EKF_KalmanNet(nn.Module):
+    def __init__(self, state_dim, obs_dim, f_func, h_func):
+        super(EKF_KalmanNet, self).__init__()
+        self.state_dim = state_dim
+        self.obs_dim = obs_dim
+        self.f = f_func
+        self.h = h_func
+        
+        self.kalman_net = KalmanGainNetwork(state_dim, obs_dim)
+
+    def forward(self, y_seq):
+        batch_size, seq_len, _ = y_seq.shape
+        device = y_seq.device
+        
+        x_hat = torch.zeros(batch_size, self.state_dim, device=device)
+        h_gru = torch.zeros(1, batch_size, self.kalman_net.gru.hidden_size, device=device)
+        
+        x_hat_seq = []
+
+        for t in range(seq_len):
+            y_t = y_seq[:, t, :]
+            
+            # Prédiction EKF
+            x_pred = self.f(x_hat) 
+            y_pred = self.h(x_pred)
+            
+            # Innovation
+            innovation = y_t - y_pred 
+            
+            # Calcul du Gain K
+            features = innovation.unsqueeze(1)
+            K_t, h_gru = self.kalman_net(features, h_gru)
+            
+            # Mise à jour
+            innovation_unsqueezed = innovation.unsqueeze(2) 
+            update_term = torch.bmm(K_t, innovation_unsqueezed).squeeze(2)
+            
+            x_hat = x_pred + update_term
+            x_hat_seq.append(x_hat)
+
+        return torch.stack(x_hat_seq, dim=1)
+
+# ==========================================
+# 2. BOUCLE D'ENTRAÎNEMENT
+# ==========================================
+
+def train_kalman_net(model, dataloader, epochs=50, lr=1e-3):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    criterion = nn.MSELoss()
+    
+    print(f"Début de l'entraînement sur {device}...")
+    
+    for epoch in range(epochs):
+        model.train()
+        epoch_loss = 0.0
+        
+        for batch_obs, batch_true_states in dataloader:
+            batch_obs, batch_true_states = batch_obs.to(device), batch_true_states.to(device)
+            
+            optimizer.zero_grad()
+            estimated_states = model(batch_obs)
+            loss = criterion(estimated_states, batch_true_states)
+            loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            epoch_loss += loss.item()
+            
+        avg_loss = epoch_loss / len(dataloader)
+        
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"Epoch [{epoch+1}/{epochs}] | MSE Loss: {avg_loss:.6f}")
+            
+    print("Entraînement terminé !")
+    return model
+
+# ==========================================
+# 3. EXÉCUTION : CHARGEMENT ET ENTRAÎNEMENT
+# ==========================================
+
+if __name__ == "__main__":
+    # --- A REMPLIR AVEC TES PROPRES FONCTIONS PHYSIQUES ---
+    def f_systeme(x):
+        # Ta fonction de transition d'état f(x)
+        return x 
+
+    def h_systeme(x):
+        # Ta fonction d'observation h(x)
+        return x 
+
+    # --- 1. CHARGEMENT DE TON DATASET ---
+    print("Chargement des données...")
+    
+    # Option A : Si tu as sauvegardé tes données avec torch.save()
+    observations_tensor = torch.load("chemin/vers/tes_observations.pt") # Shape: [N, seq_len, obs_dim]
+    true_states_tensor = torch.load("chemin/vers/tes_etats_vrais.pt")   # Shape: [N, seq_len, state_dim]
+    
+    # Option B : Si tu as sauvegardé en Numpy (.npy)
+    # obs_np = np.load("chemin/vers/tes_observations.npy")
+    # states_np = np.load("chemin/vers/tes_etats_vrais.npy")
+    # observations_tensor = torch.tensor(obs_np, dtype=torch.float32)
+    # true_states_tensor = torch.tensor(states_np, dtype=torch.float32)
+
+    # Paramètres déduits automatiquement de tes données
+    BATCH_SIZE = 32 # A ajuster selon ta RAM/VRAM
+    STATE_DIM = true_states_tensor.shape[-1]
+    OBS_DIM = observations_tensor.shape[-1]
+    EPOCHS = 100
+    
+    dataset = TensorDataset(observations_tensor, true_states_tensor)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    # --- 2. INSTANCIATION DU MODÈLE ---
+    model = EKF_KalmanNet(
+        state_dim=STATE_DIM, 
+        obs_dim=OBS_DIM, 
+        f_func=f_systeme, 
+        h_func=h_systeme
+    )
+
+    # --- 3. LANCEMENT DE L'ENTRAÎNEMENT ---
+    trained_model = train_kalman_net(model, dataloader, epochs=EPOCHS, lr=1e-3)
+    
+    # Sauvegarde du modèle entraîné (optionnel mais recommandé)
+    torch.save(trained_model.state_dict(), "kalmannet_weights.pth")
+    print("Modèle sauvegardé sous 'kalmannet_weights.pth'")
+
+
 import numpy as np
 import matplotlib.pyplot as plt
 
