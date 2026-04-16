@@ -1,3 +1,158 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+
+def analyze_training(csv_path="training_history.csv"):
+    try:
+        df = pd.read_csv(csv_path)
+    except FileNotFoundError:
+        print(f"Erreur : Le fichier {csv_path} est introuvable. As-tu lancé l'entraînement ?")
+        return
+
+    # --- 1. Extraction des statistiques ---
+    total_epochs = len(df)
+    final_train_loss = df['train_loss'].iloc[-1]
+    final_val_loss = df['val_loss'].iloc[-1]
+    
+    best_epoch_row = df.loc[df['val_loss'].idxmin()]
+    best_epoch = int(best_epoch_row['epoch'])
+    min_val_loss = best_epoch_row['val_loss']
+    
+    # Détection de l'overfitting (si la val loss remonte à la fin)
+    overfitting_gap = final_val_loss - min_val_loss
+
+    # --- 2. Affichage en console ---
+    print("========================================")
+    print("📊 STATISTIQUES D'ENTRAÎNEMENT")
+    print("========================================")
+    print(f"Époques totales        : {total_epochs}")
+    print(f"Loss Train finale      : {final_train_loss:.6f}")
+    print(f"Loss Val finale        : {final_val_loss:.6f}")
+    print("-" * 40)
+    print(f"⭐ Meilleur modèle      : Époque {best_epoch}")
+    print(f"📉 Loss Val minimale    : {min_val_loss:.6f}")
+    
+    if overfitting_gap > 0.05 * min_val_loss: # Tolérance de 5%
+        print(f"⚠️ Sur-apprentissage détecté (La validation a remonté de {overfitting_gap:.6f} depuis le minimum)")
+    else:
+        print("✅ Pas de signe majeur de sur-apprentissage à la fin de l'entraînement.")
+    print("========================================\n")
+
+    # --- 3. Création du graphique ---
+    plt.figure(figsize=(10, 6))
+    
+    plt.plot(df['epoch'], df['train_loss'], label='Train Loss', color='blue', linewidth=2)
+    plt.plot(df['epoch'], df['val_loss'], label='Validation Loss', color='red', linewidth=2)
+    
+    # Ligne verticale pour indiquer où se trouve le meilleur modèle
+    plt.axvline(x=best_epoch, color='gray', linestyle='--', alpha=0.7, 
+                label=f'Meilleur modèle (Ép. {best_epoch})')
+    
+    # Point marquant le minimum exact
+    plt.scatter([best_epoch], [min_val_loss], color='black', zorder=5)
+
+    plt.title("Courbes d'apprentissage du KalmanNet", fontsize=14, fontweight='bold')
+    plt.xlabel("Époques", fontsize=12)
+    plt.ylabel("Loss (Smooth L1)", fontsize=12)
+    
+    # Échelle logarithmique en Y (très utile pour voir les petites variations des Loss à la fin)
+    plt.yscale('log')
+    
+    plt.legend(fontsize=11)
+    plt.grid(True, which="both", ls="-", alpha=0.2)
+    
+    # Sauvegarde de l'image
+    plot_filename = "learning_curves.png"
+    plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+    print(f"🖼️ Courbes d'apprentissage sauvegardées sous '{plot_filename}'")
+    
+    plt.show()
+
+if __name__ == "__main__":
+    analyze_training()
+
+
+def train_model():
+    train_loader, val_loader = load_and_prepare_data()
+    
+    model = KalmanNet_Gain().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    criterion = nn.SmoothL1Loss()
+    
+    epochs = 50
+    print("\n🔥 Début de l'entraînement...")
+    
+    # --- NOUVEAU : Dictionnaire pour l'historique ---
+    history = {'epoch': [], 'train_loss': [], 'val_loss': []}
+    
+    # Pour sauvegarder le meilleur modèle
+    best_val_loss = float('inf')
+    
+    for epoch in range(epochs):
+        # --- Phase d'entraînement ---
+        model.train()
+        train_loss = 0.0
+        
+        for batch_features, batch_yt, batch_priors, batch_targets in train_loader:
+            batch_features, batch_yt = batch_features.to(device), batch_yt.to(device)
+            batch_priors, batch_targets = batch_priors.to(device), batch_targets.to(device)
+            
+            optimizer.zero_grad()
+            
+            K = model(batch_features)
+            state_update = torch.matmul(K, batch_yt).squeeze(-1) 
+            pos_update = state_update[:, :, [0, 1, 5, 6]]
+            estimated_positions = batch_priors + pos_update
+            
+            loss = criterion(estimated_positions, batch_targets)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            train_loss += loss.item()
+            
+        avg_train_loss = train_loss / len(train_loader)
+            
+        # --- Phase de validation ---
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch_features, batch_yt, batch_priors, batch_targets in val_loader:
+                batch_features, batch_yt = batch_features.to(device), batch_yt.to(device)
+                batch_priors, batch_targets = batch_priors.to(device), batch_targets.to(device)
+                
+                K = model(batch_features)
+                state_update = torch.matmul(K, batch_yt).squeeze(-1)
+                pos_update = state_update[:, :, [0, 1, 5, 6]]
+                estimated_positions = batch_priors + pos_update
+                
+                loss = criterion(estimated_positions, batch_targets)
+                val_loss += loss.item()
+                
+        avg_val_loss = val_loss / len(val_loader)
+        
+        # --- NOUVEAU : Enregistrement des métriques ---
+        history['epoch'].append(epoch + 1)
+        history['train_loss'].append(avg_train_loss)
+        history['val_loss'].append(avg_val_loss)
+        
+        # Sauvegarde conditionnelle du meilleur modèle
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), "kalmannet_best_weights.pth")
+            
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+
+    # --- NOUVEAU : Sauvegarde de l'historique et du modèle final ---
+    df_history = pd.DataFrame(history)
+    df_history.to_csv("training_history.csv", index=False)
+    torch.save(model.state_dict(), "kalmannet_final_weights.pth")
+    
+    print("\n✅ Entraînement terminé !")
+    print("💾 Historique sauvegardé sous 'training_history.csv'")
+    print("💾 Meilleur modèle sauvegardé sous 'kalmannet_best_weights.pth'")
+
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
