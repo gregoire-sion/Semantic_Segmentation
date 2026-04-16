@@ -2,6 +2,180 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
+import pandas as pd
+import numpy as np
+
+# ==========================================
+# 1. PARAMÈTRES ET CONFIGURATION
+# ==========================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"🚀 Appareil utilisé : {device.type.upper()}")
+
+# ==========================================
+# 2. ARCHITECTURE DU KALMANNET (SEQ2SEQ)
+# ==========================================
+class KalmanNet_Gain(nn.Module):
+    def __init__(self, input_dim=17, obs_dim=5, state_dim=10, hidden_dim=128):
+        """
+        Le réseau calcule uniquement le Gain K.
+        - input_dim (17) : has_gps(1) + has_uwb(1) + y_gps(4) + y_uwb(1) + dx(10)
+        - obs_dim (5) : Les 5 innovations (4 GPS + 1 UWB)
+        - state_dim (10) : Les 10 dimensions de ton système pour la matrice K
+        """
+        super(KalmanNet_Gain, self).__init__()
+        self.state_dim = state_dim
+        self.obs_dim = obs_dim
+        
+        # Un GRU pour modéliser l'évolution de l'incertitude dans le temps
+        self.gru = nn.GRU(input_size=input_dim, hidden_size=hidden_dim, num_layers=2, batch_first=True)
+        
+        # Couche de sortie pour prédire les 50 valeurs (10x5) de la matrice de Gain
+        self.fc = nn.Linear(hidden_dim, state_dim * obs_dim)
+
+    def forward(self, features):
+        # features shape: [batch_size, seq_len, 17]
+        gru_out, _ = self.gru(features)
+        
+        # On passe la séquence entière dans le réseau dense
+        K_flat = self.fc(gru_out)
+        
+        # On reshape pour avoir une séquence de matrices K
+        # K shape : [batch_size, seq_len, 10, 5]
+        K = K_flat.view(features.size(0), features.size(1), self.state_dim, self.obs_dim)
+        return K
+
+# ==========================================
+# 3. CHARGEMENT ET PRÉPARATION DES DONNÉES
+# ==========================================
+def load_and_prepare_data(pickle_path="data/kalman_dataset_gpu_.pkl", batch_size=256):
+    print("💾 Chargement des données...")
+    df = pd.read_pickle(pickle_path)
+    
+    # On vérifie les dimensions déduites du dataset
+    num_trajectories = df['traj_id'].nunique()
+    seq_len = df['time_step'].nunique()
+    
+    # Tri sécurisé pour garantir l'ordre temporel
+    df = df.sort_values(by=['traj_id', 'time_step'])
+    
+    # Extraction des tenseurs en numpy puis torch
+    data_np = df.drop(columns=['traj_id', 'time_step']).values
+    data_tensor = torch.tensor(data_np, dtype=torch.float32)
+    
+    # Reshape en [Batch, Sequence, Features]
+    data_tensor = data_tensor.view(num_trajectories, seq_len, -1)
+    
+    # --- Indexation basée sur tes colonnes ---
+    # Colonnes restantes (0 à 24) :
+    # 0: has_gps | 1: has_uwb | 2:5: y_gps (4) | 6: y_uwb (1) | 7:16: dx (10)
+    # 17:20: prior (4) | 21:24: true (4)
+    
+    # Features pour le réseau (17 dimensions : has_*, innovations, dx)
+    features = data_tensor[:, :, 0:17] 
+    
+    # Vecteur d'innovation y_t (5 dimensions : 4 GPS + 1 UWB)
+    y_t = data_tensor[:, :, 2:7].unsqueeze(-1) # [B, Seq, 5, 1] pour la multiplication matricielle
+    
+    # États a priori (prédictions EKF) pour l'addition finale (4 positions)
+    priors = data_tensor[:, :, 17:21]
+    
+    # Vérité terrain pour le calcul de la loss (4 positions)
+    targets = data_tensor[:, :, 21:25]
+
+    dataset = TensorDataset(features, y_t, priors, targets)
+    
+    # Division Train / Validation (80% / 20%)
+    train_size = int(0.8 * num_trajectories)
+    val_size = num_trajectories - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    return train_loader, val_loader
+
+# ==========================================
+# 4. BOUCLE D'ENTRAÎNEMENT
+# ==========================================
+def train_model():
+    train_loader, val_loader = load_and_prepare_data()
+    
+    model = KalmanNet_Gain().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    
+    # On utilise une SmoothL1Loss (Huber Loss) qui est plus robuste aux outliers (comme les sauts GPS) que la MSE
+    criterion = nn.SmoothL1Loss()
+    
+    epochs = 50
+    print("\n🔥 Début de l'entraînement...")
+    
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        
+        for batch_features, batch_yt, batch_priors, batch_targets in train_loader:
+            batch_features = batch_features.to(device)
+            batch_yt = batch_yt.to(device)
+            batch_priors = batch_priors.to(device)
+            batch_targets = batch_targets.to(device)
+            
+            optimizer.zero_grad()
+            
+            # 1. Le réseau prédit K_t pour toute la séquence d'un coup
+            K = model(batch_features) # Shape: [B, Seq, 10, 5]
+            
+            # 2. Multiplication matricielle : K_t * y_t pour obtenir le delta x (correction d'état)
+            # K est [B, Seq, 10, 5], batch_yt est [B, Seq, 5, 1]
+            # Résultat = [B, Seq, 10, 1]
+            state_update = torch.matmul(K, batch_yt).squeeze(-1) 
+            
+            # 3. On extrait seulement les corrections de position (indices 0, 1, 5, 6 de ton vecteur d'état de 10)
+            # Cela correspond à dx_0 (x1), dx_1 (y1), dx_5 (x2), dx_6 (y2)
+            pos_update = state_update[:, :, [0, 1, 5, 6]]
+            
+            # 4. L'état estimé final est l'état a priori + la correction
+            estimated_positions = batch_priors + pos_update
+            
+            # 5. Calcul de l'erreur par rapport à la trajectoire réelle
+            loss = criterion(estimated_positions, batch_targets)
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            train_loss += loss.item()
+            
+        # --- Validation ---
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch_features, batch_yt, batch_priors, batch_targets in val_loader:
+                batch_features, batch_yt = batch_features.to(device), batch_yt.to(device)
+                batch_priors, batch_targets = batch_priors.to(device), batch_targets.to(device)
+                
+                K = model(batch_features)
+                state_update = torch.matmul(K, batch_yt).squeeze(-1)
+                pos_update = state_update[:, :, [0, 1, 5, 6]]
+                estimated_positions = batch_priors + pos_update
+                
+                loss = criterion(estimated_positions, batch_targets)
+                val_loss += loss.item()
+                
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {train_loss/len(train_loader):.4f} | Val Loss: {val_loss/len(val_loader):.4f}")
+
+    # Sauvegarde
+    torch.save(model.state_dict(), "kalmannet_gain_weights.pth")
+    print("✅ Modèle sauvegardé sous 'kalmannet_gain_weights.pth'")
+
+if __name__ == "__main__":
+    train_model()
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
 import numpy as np # Au cas où tes données sont en .npy
 
 # ==========================================
