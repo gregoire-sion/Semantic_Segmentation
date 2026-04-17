@@ -4,6 +4,192 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 import pandas as pd
 import numpy as np
+import os
+
+# ==========================================
+# 1. PARAMÈTRES ET CONFIGURATION
+# ==========================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"🚀 Appareil utilisé : {device.type.upper()}")
+
+# Création du dossier de poids si inexistant
+os.makedirs("weights/train4", exist_ok=True)
+
+# ==========================================
+# 2. ARCHITECTURE DU KALMANNET OPTIMISÉE
+# ==========================================
+class KalmanNet_Gain(nn.Module):
+    def __init__(self, input_dim=17, obs_dim=5, state_dim=10, hidden_dim=64):
+        super(KalmanNet_Gain, self).__init__()
+        self.state_dim = state_dim
+        self.obs_dim = obs_dim
+        
+        # Normalisation des entrées pour stabiliser le GRU
+        self.bn_input = nn.BatchNorm1d(input_dim)
+        
+        # GRU multicouche
+        self.gru = nn.GRU(input_size=input_dim, hidden_size=hidden_dim, num_layers=2, batch_first=True)
+        
+        # Activation Tanh pour borner l'état caché avant la FC
+        self.activation = nn.Tanh()
+        
+        # Couche de sortie
+        self.fc = nn.Linear(hidden_dim, state_dim * obs_dim)
+        
+        # Initialisation très faible pour commencer avec un Gain quasi-nul (confiance EKF)
+        nn.init.normal_(self.fc.weight, mean=0.0, std=0.001)
+        nn.init.constant_(self.fc.bias, 0.0)
+
+    def forward(self, features):
+        # features: [B, Seq, 17]
+        # BatchNorm attend [B, C, L], donc on transpose
+        x = features.transpose(1, 2)
+        x = self.bn_input(x)
+        x = x.transpose(1, 2)
+        
+        gru_out, _ = self.gru(x)
+        gru_out = self.activation(gru_out)
+        
+        K_flat = self.fc(gru_out)
+        
+        # Reshape en [Batch, Seq, 10, 5]
+        K = K_flat.view(features.size(0), features.size(1), self.state_dim, self.obs_dim)
+        return K
+
+# ==========================================
+# 3. CHARGEMENT ET PRÉPARATION DES DONNÉES
+# ==========================================
+def load_and_prepare_data(pickle_path="data/kalman_dataset_gpu_.pkl", batch_size=256):
+    print("💾 Chargement des données...")
+    df = pd.read_pickle(pickle_path)
+    
+    df = df.sort_values(by=['traj_id', 'time_step'])
+    num_trajectories = df['traj_id'].nunique()
+    seq_len = df['time_step'].nunique()
+    
+    data_np = df.drop(columns=['traj_id', 'time_step']).values
+    data_tensor = torch.tensor(data_np, dtype=torch.float32)
+    data_tensor = data_tensor.view(num_trajectories, seq_len, -1)
+    
+    # Slicing des colonnes selon ton format (0:25)
+    features = data_tensor[:, :, 0:17] 
+    y_t = data_tensor[:, :, 2:7].unsqueeze(-1) 
+    priors = data_tensor[:, :, 17:21]
+    targets = data_tensor[:, :, 21:25]
+
+    dataset = TensorDataset(features, y_t, priors, targets)
+    
+    train_size = int(0.8 * num_trajectories)
+    val_size = num_trajectories - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    return train_loader, val_loader
+
+# ==========================================
+# 4. BOUCLE D'ENTRAÎNEMENT AMÉLIORÉE
+# ==========================================
+def train_model():
+    train_loader, val_loader = load_and_prepare_data()
+    
+    model = KalmanNet_Gain().to(device)
+    
+    # Optimizer avec Weight Decay pour éviter l'overfitting
+    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    
+    # Scheduler : Réduit le LR si la val_loss ne s'améliore pas pendant 10 époques
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    
+    criterion = nn.SmoothL1Loss()
+    
+    epochs = 300
+    history = {'epoch': [], 'train_loss': [], 'val_loss': []}
+    best_val_loss = float('inf')
+    
+    print(f"\n🔥 Début de l'entraînement pour {epochs} époques...")
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        
+        for batch_features, batch_yt, batch_priors, batch_targets in train_loader:
+            batch_features, batch_yt = batch_features.to(device), batch_yt.to(device)
+            batch_priors, batch_targets = batch_priors.to(device), batch_targets.to(device)
+            
+            optimizer.zero_grad()
+            
+            # 1. Prédire K
+            K = model(batch_features)
+            
+            # 2. Update : x_est = x_prior + K * y
+            # K: [B, S, 10, 5], yt: [B, S, 5, 1] -> [B, S, 10, 1]
+            state_update = torch.matmul(K, batch_yt).squeeze(-1) 
+            
+            # On ne corrige que les positions [x1, y1, x2, y2]
+            pos_update = state_update[:, :, [0, 1, 5, 6]]
+            estimated_positions = batch_priors + pos_update
+            
+            loss = criterion(estimated_positions, batch_targets)
+            loss.backward()
+            
+            # Gradient clipping pour la stabilité des RNN
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            optimizer.step()
+            train_loss += loss.item()
+            
+        avg_train_loss = train_loss / len(train_loader)
+            
+        # Phase de validation
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch_features, batch_yt, batch_priors, batch_targets in val_loader:
+                batch_features, batch_yt = batch_features.to(device), batch_yt.to(device)
+                batch_priors, batch_targets = batch_priors.to(device), batch_targets.to(device)
+                
+                K = model(batch_features)
+                state_update = torch.matmul(K, batch_yt).squeeze(-1)
+                pos_update = state_update[:, :, [0, 1, 5, 6]]
+                estimated_positions = batch_priors + pos_update
+                
+                loss = criterion(estimated_positions, batch_targets)
+                val_loss += loss.item()
+                
+        avg_val_loss = val_loss / len(val_loader)
+        
+        # Mise à jour du scheduler
+        scheduler.step(avg_val_loss)
+        
+        history['epoch'].append(epoch + 1)
+        history['train_loss'].append(avg_train_loss)
+        history['val_loss'].append(avg_val_loss)
+        
+        # Sauvegarde du meilleur modèle
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), "weights/train4/kalmannet_best_weights.pth")
+            
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.6e}")
+
+    # Finalisation
+    pd.DataFrame(history).to_csv("training_history.csv", index=False)
+    torch.save(model.state_dict(), "weights/train4/kalmannet_final_weights.pth")
+    print("\n✅ Entraînement terminé !")
+
+if __name__ == "__main__":
+    train_model()
+
+
+mport torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+import pandas as pd
+import numpy as np
 
 # ==========================================
 # 1. PARAMÈTRES ET CONFIGURATION
