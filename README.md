@@ -1,3 +1,7 @@
+    P_pred = torch.bmm(F, torch.bmm(P_est, F.mT)) + Q_full
+RuntimeError: The size of tensor a (10) must match the size of tensor b (5) at non-singleton dimension 2
+
+
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
