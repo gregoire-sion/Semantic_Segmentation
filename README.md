@@ -1,4 +1,56 @@
 import torch
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Importer ta classe KalmanNet_Gain depuis ton fichier d'entraînement
+# from train_script import KalmanNet_Gain 
+
+def run_test_inference(model_path, data_path, state_dim=10, obs_dim=5):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 1. Charger le modèle
+    model = KalmanNet_Gain(state_dim=state_dim, obs_dim=obs_dim).to(device)
+    model.load_state_dict(torch.load(model_path))
+    model.eval()
+    
+    # 2. Charger une trajectoire de test (ou générer via ton script de simulation)
+    # Ici, on prend la première trajectoire d'un dataset de test
+    df_test = pd.read_pickle(data_path)
+    traj_id = df_test['traj_id'].unique()[0]
+    df_single = df_test[df_test['traj_id'] == traj_id].sort_values('time_step')
+    
+    # Préparation des tenseurs
+    features = torch.tensor(df_single.iloc[:, 2:19].values, dtype=torch.float32).unsqueeze(0).to(device)
+    y_t = torch.tensor(df_single.iloc[:, 4:9].values, dtype=torch.float32).unsqueeze(0).unsqueeze(-1).to(device)
+    priors = df_single[['prior_x1', 'prior_y1', 'prior_x2', 'prior_y2']].values
+    truths = df_single[['true_x1', 'true_y1', 'true_x2', 'true_y2']].values
+    
+    # 3. Inférence
+    with torch.no_grad():
+        K = model(features)
+        state_update = torch.matmul(K, y_t).squeeze(-1)
+        pos_update = state_update[:, :, [0, 1, 5, 6]].cpu().numpy().squeeze(0)
+        
+    # 4. Reconstruction de la trajectoire estimée
+    # Estimation = Prior (EKF prediction) + Correction (KalmanNet Gain * Innovation)
+    estimations = priors + pos_update
+    
+    # 5. Visualisation
+    plt.figure(figsize=(12, 6))
+    plt.plot(truths[:, 0], truths[:, 1], 'k--', label="Vérité Terrain (Drone 1)")
+    plt.plot(priors[:, 0], priors[:, 1], 'r:', label="Baseline EKF (Prior)")
+    plt.plot(estimations[:, 0], estimations[:, 1], 'b-', label="KalmanNet")
+    plt.title(f"Comparaison sur trajectoire de test #{traj_id}")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+# run_test_inference("weights/train4/kalmannet_best_weights.pth", "data/test_dataset.pkl")
+
+
+
+import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
