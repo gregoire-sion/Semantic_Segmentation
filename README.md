@@ -1,3 +1,172 @@
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns # NOUVEAU : Pour de plus beaux graphiques statistiques
+
+# ==========================================
+# 1. REDÉFINITION DE L'ARCHITECTURE
+# ==========================================
+class KalmanNet_Gain(nn.Module):
+    def __init__(self, input_dim=17, obs_dim=5, state_dim=10, hidden_dim=64):
+        super(KalmanNet_Gain, self).__init__()
+        self.state_dim = state_dim
+        self.obs_dim = obs_dim
+        self.bn_input = nn.BatchNorm1d(input_dim)
+        self.gru = nn.GRU(input_size=input_dim, hidden_size=hidden_dim, num_layers=2, batch_first=True)
+        self.activation = nn.Tanh()
+        self.fc = nn.Linear(hidden_dim, state_dim * obs_dim)
+
+    def forward(self, features):
+        x = features.transpose(1, 2)
+        x = self.bn_input(x)
+        x = x.transpose(1, 2)
+        gru_out, _ = self.gru(x)
+        gru_out = self.activation(gru_out)
+        K_flat = self.fc(gru_out)
+        K = K_flat.view(features.size(0), features.size(1), self.state_dim, self.obs_dim)
+        return K
+
+# ==========================================
+# 2. FONCTION D'ÉVALUATION ET PLOTS RICHES
+# ==========================================
+def evaluate_and_plot(model_path="weights/train4/kalmannet_best_weights.pth", test_data_path="data/kalman_dataset_test.pkl"):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"📊 Évaluation sur : {device.type.upper()}")
+
+    # 1. Chargement
+    model = KalmanNet_Gain().to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model.eval()
+
+    print("Chargement du dataset de test...")
+    df = pd.read_pickle(test_data_path)
+    df = df.sort_values(by=['traj_id', 'time_step'])
+    
+    num_trajectories = df['traj_id'].nunique()
+    seq_len = df['time_step'].nunique()
+    
+    data_np = df.drop(columns=['traj_id', 'time_step']).values
+    data_tensor = torch.tensor(data_np, dtype=torch.float32).view(num_trajectories, seq_len, -1).to(device)
+    
+    features = data_tensor[:, :, 0:17] 
+    y_t = data_tensor[:, :, 2:7].unsqueeze(-1) 
+    priors = data_tensor[:, :, 17:21]   # Baseline EKF (seulement x1,y1,x2,y2)
+    truths = data_tensor[:, :, 21:25]   # Vérité terrain (seulement x1,y1,x2,y2)
+
+    # 2. Inférence
+    print("Inférence en cours...")
+    with torch.no_grad():
+        K = model(features)
+        state_update = torch.matmul(K, y_t).squeeze(-1)
+        pos_update = state_update[:, :, [0, 1, 5, 6]]
+        kalmannet_est = priors + pos_update 
+
+    # 3. Calcul des Métriques
+    err_baseline_d1 = torch.sqrt((priors[:,:,0]-truths[:,:,0])**2 + (priors[:,:,1]-truths[:,:,1])**2)
+    err_baseline_d2 = torch.sqrt((priors[:,:,2]-truths[:,:,2])**2 + (priors[:,:,3]-truths[:,:,3])**2)
+    
+    err_knet_d1 = torch.sqrt((kalmannet_est[:,:,0]-truths[:,:,0])**2 + (kalmannet_est[:,:,1]-truths[:,:,1])**2)
+    err_knet_d2 = torch.sqrt((kalmannet_est[:,:,2]-truths[:,:,2])**2 + (kalmannet_est[:,:,3]-truths[:,:,3])**2)
+    
+    rmse_baseline = torch.mean((err_baseline_d1 + err_baseline_d2) / 2.0).item()
+    rmse_knet = torch.mean((err_knet_d1 + err_knet_d2) / 2.0).item()
+
+    # --- AFFICHAGE DES STATISTIQUES ---
+    print("\n" + "="*50)
+    print("🎯 RÉSULTATS STATISTIQUES GLOBAUX")
+    print("="*50)
+    print(f"Nombre de trajectoires testées : {num_trajectories}")
+    print(f"Durée par trajectoire          : {seq_len * 0.01:.1f} secondes")
+    print("-" * 50)
+    print(f"RMSE Baseline (EKF) : {rmse_baseline:.4f} mètres")
+    print(f"RMSE KalmanNet      : {rmse_knet:.4f} mètres")
+    improvement = ((rmse_baseline - rmse_knet) / rmse_baseline) * 100
+    print(f"Amélioration Globale: {improvement:.2f} %")
+    print("="*50 + "\n")
+
+    # ==========================================
+    # 4. GÉNÉRATION DES GRAPHIQUES RICHES
+    # ==========================================
+    print("Génération des graphiques...")
+    sns.set_theme(style="whitegrid")
+    
+    # Choix d'une trajectoire représentative (la première)
+    traj_idx = 0
+    t0_truths = truths[traj_idx].cpu().numpy()
+    t0_priors = priors[traj_idx].cpu().numpy()
+    t0_knet = kalmannet_est[traj_idx].cpu().numpy()
+    time_axis = np.arange(seq_len) * 0.01
+
+    fig = plt.figure(figsize=(18, 12))
+    gs = fig.add_gridspec(3, 2, height_ratios=[1.5, 1, 1])
+
+    # --- PLOT 1 : Vue de dessus 2D (Trajectoire Globale) ---
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.plot(t0_truths[:, 0], t0_truths[:, 1], 'k-', linewidth=2, label="Vérité D1")
+    ax1.plot(t0_priors[:, 0], t0_priors[:, 1], 'r--', alpha=0.6, label="EKF D1")
+    ax1.plot(t0_knet[:, 0], t0_knet[:, 1], 'b-', linewidth=2, label="KalmanNet D1")
+    
+    ax1.plot(t0_truths[:, 2], t0_truths[:, 3], 'k:', linewidth=2, label="Vérité D2")
+    ax1.plot(t0_priors[:, 2], t0_priors[:, 3], 'm--', alpha=0.6, label="EKF D2")
+    ax1.plot(t0_knet[:, 2], t0_knet[:, 3], 'c-', linewidth=2, label="KalmanNet D2")
+    
+    ax1.set_title(f"Trajectoire 2D (Test ID : {traj_idx})", fontsize=14, fontweight='bold')
+    ax1.set_xlabel("Position X (m)")
+    ax1.set_ylabel("Position Y (m)")
+    ax1.legend(loc="upper right", ncol=2)
+    ax1.axis('equal')
+
+    # --- PLOT 2 & 3 : États Temporels (X et Y séparés pour D1) ---
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax2.plot(time_axis, t0_truths[:, 0], 'k-', label="Vrai X")
+    ax2.plot(time_axis, t0_priors[:, 0], 'r--', alpha=0.7, label="EKF X")
+    ax2.plot(time_axis, t0_knet[:, 0], 'b-', alpha=0.8, label="KalmanNet X")
+    ax2.set_title("Évolution de la variable d'état X_1(t)")
+    ax2.set_ylabel("Position X (m)")
+    
+    ax3 = fig.add_subplot(gs[1, 1], sharex=ax2)
+    ax3.plot(time_axis, t0_truths[:, 1], 'k-', label="Vrai Y")
+    ax3.plot(time_axis, t0_priors[:, 1], 'r--', alpha=0.7, label="EKF Y")
+    ax3.plot(time_axis, t0_knet[:, 1], 'b-', alpha=0.8, label="KalmanNet Y")
+    ax3.set_title("Évolution de la variable d'état Y_1(t)")
+    ax3.set_ylabel("Position Y (m)")
+
+    # --- PLOT 4 : Erreur Absolue dans le temps ---
+    ax4 = fig.add_subplot(gs[2, 0], sharex=ax2)
+    ax4.plot(time_axis, err_baseline_d1[traj_idx].cpu().numpy(), 'r--', label="Erreur EKF")
+    ax4.plot(time_axis, err_knet_d1[traj_idx].cpu().numpy(), 'b-', label="Erreur KalmanNet")
+    ax4.set_title("Erreur de Position D1 en fonction du temps")
+    ax4.set_xlabel("Temps (s)")
+    ax4.set_ylabel("Erreur Absolue (m)")
+    ax4.legend()
+
+    # --- PLOT 5 : Distribution des erreurs (Boxplot sur tout le dataset) ---
+    # Cette visualisation est très prisée en Machine Learning pour montrer la robustesse
+    ax5 = fig.add_subplot(gs[2, 1])
+    # On aplatit les erreurs pour toutes les trajectoires et tous les pas de temps
+    flat_err_b = err_baseline_d1.cpu().numpy().flatten()
+    flat_err_k = err_knet_d1.cpu().numpy().flatten()
+    
+    error_data = pd.DataFrame({
+        'Erreur (m)': np.concatenate([flat_err_b, flat_err_k]),
+        'Modèle': ['EKF Baseline']*len(flat_err_b) + ['KalmanNet']*len(flat_err_k)
+    })
+    
+    sns.boxplot(x='Modèle', y='Erreur (m)', data=error_data, ax=ax5, showfliers=False, palette=['#ff9999', '#99ccff'])
+    ax5.set_title("Distribution des Erreurs (Vue sans valeurs extrêmes)")
+    
+    plt.tight_layout()
+    plt.savefig("analyse_kalmannet_complete.png", dpi=300)
+    print("✅ Dashboard complet sauvegardé sous 'analyse_kalmannet_complete.png'")
+    plt.show()
+
+if __name__ == "__main__":
+    evaluate_and_plot()
+
+
+
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
