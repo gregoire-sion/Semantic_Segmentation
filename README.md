@@ -1,5 +1,224 @@
 import torch
 import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+# ==========================================
+# 1. REDÉFINITION DU MODÈLE
+# ==========================================
+class KalmanNet_Gain(nn.Module):
+    def __init__(self, input_dim=17, obs_dim=5, state_dim=10, hidden_dim=64):
+        super(KalmanNet_Gain, self).__init__()
+        self.state_dim = state_dim
+        self.obs_dim = obs_dim
+        self.bn_input = nn.BatchNorm1d(input_dim)
+        self.gru = nn.GRU(input_size=input_dim, hidden_size=hidden_dim, num_layers=2, batch_first=True)
+        self.activation = nn.Tanh()
+        self.fc = nn.Linear(hidden_dim, state_dim * obs_dim)
+
+    def forward(self, features):
+        x = features.transpose(1, 2)
+        x = self.bn_input(x)
+        x = x.transpose(1, 2)
+        gru_out, _ = self.gru(x)
+        gru_out = self.activation(gru_out)
+        K_flat = self.fc(gru_out)
+        K = K_flat.view(features.size(0), features.size(1), self.state_dim, self.obs_dim)
+        return K
+
+# ==========================================
+# 2. GÉNÉRATION DE LA TRAJECTOIRE EXOTIQUE
+# ==========================================
+def simulate_exotic_trajectory(model_path="weights/train4/kalmannet_best_weights.pth"):
+    device = torch.device("cpu") # On fait ce test sur CPU car il n'y a qu'une trajectoire
+    print("🌪️ Génération de la trajectoire exotique (Torture Test)...")
+    
+    SIM_TIME = 20.0         
+    DT_IMU = 0.01           
+    DT_GPS = 1.0            
+    DT_UWB = 0.1            
+    STEPS = int(SIM_TIME / DT_IMU)
+
+    # Bruits fixes pour le test
+    Q_vals = [0.01, 0.01, 0.1, 0.1, np.deg2rad(1.0)]
+    Q_base = torch.diag(torch.tensor(Q_vals, dtype=torch.float32)) ** 2
+    Q_full = torch.block_diag(Q_base, Q_base).unsqueeze(0)
+    R_gps = (torch.diag(torch.tensor([3.0, 3.0, 3.0, 3.0], dtype=torch.float32)) ** 2).unsqueeze(0)
+    R_uwb = torch.tensor([[[0.5 ** 2]]], dtype=torch.float32)
+
+    X_true = torch.zeros((1, 10, 1))
+    X_est = torch.zeros((1, 10, 1))
+    X_true[:, 6:7, :] = 10.0 # Y initial du Drone 2
+    X_est[:, 6:7, :] = 10.0
+    P_est = torch.eye(10).unsqueeze(0) * 5.0
+    H_gps = torch.zeros((1, 4, 10)); H_gps[:, 0, 0] = 1; H_gps[:, 1, 1] = 1; H_gps[:, 2, 5] = 1; H_gps[:, 3, 6] = 1
+
+    features_list = []
+    y_t_list = []
+    priors_list = []
+    truths_list = []
+
+    for step in range(STEPS):
+        t = step * DT_IMU
+        
+        # --- COMMANDES EXOTIQUES ---
+        # Accélération sinusoïdale et rotation folle
+        current_ax = torch.tensor([[1.0 + 0.5 * np.sin(t)]])
+        current_omega = torch.tensor([[0.5 * np.cos(t * 1.5)]])
+        current_ay = torch.zeros((1, 1))
+        
+        # Rafale de vent vicieuse (non modélisée dans l'EKF) pendant la panne GPS
+        if 8.0 < t < 14.0:
+            wind_ay = 1.5 # Le vent pousse le drone sur le côté
+        else:
+            wind_ay = 0.0
+
+        # Vérité Terrain
+        for i in [0, 5]:
+            theta_t = X_true[:, i+4, 0:1]
+            X_true[:, i, 0:1]   += X_true[:, i+2, 0:1] * DT_IMU
+            X_true[:, i+1, 0:1] += X_true[:, i+3, 0:1] * DT_IMU
+            X_true[:, i+2, 0:1] += (current_ax * torch.cos(theta_t) - (current_ay + wind_ay) * torch.sin(theta_t)) * DT_IMU
+            X_true[:, i+3, 0:1] += (current_ax * torch.sin(theta_t) + (current_ay + wind_ay) * torch.cos(theta_t)) * DT_IMU
+            X_true[:, i+4, 0:1] += current_omega * DT_IMU
+
+        # IMU Bruitée
+        u_base = torch.cat([current_ax.unsqueeze(-1), current_ay.unsqueeze(-1), current_omega.unsqueeze(-1)], dim=1)
+        u = u_base + torch.randn((1, 3, 1)) * 0.05
+
+        # EKF Prédiction
+        X_prev_est = X_est.clone()
+        X_pred = torch.zeros_like(X_est)
+        F = torch.eye(10).unsqueeze(0)
+        
+        for idx in [0, 5]:
+            theta_e = X_est[:, idx+4, 0:1]
+            a_x, a_y, om = u[:, 0, :], u[:, 1, :], u[:, 2, :]
+            
+            X_pred[:, idx, 0]   = X_est[:, idx, 0] + X_est[:, idx+2, 0] * DT_IMU
+            X_pred[:, idx+1, 0] = X_est[:, idx+1, 0] + X_est[:, idx+3, 0] * DT_IMU
+            X_pred[:, idx+2, 0] = X_est[:, idx+2, 0] + (a_x * torch.cos(theta_e) - a_y * torch.sin(theta_e)).squeeze(-1) * DT_IMU
+            X_pred[:, idx+3, 0] = X_est[:, idx+3, 0] + (a_x * torch.sin(theta_e) + a_y * torch.cos(theta_e)).squeeze(-1) * DT_IMU
+            X_pred[:, idx+4, 0] = theta_e.squeeze(-1) + om.squeeze(-1) * DT_IMU
+            
+            F[:, idx, idx+2] = DT_IMU; F[:, idx+1, idx+3] = DT_IMU
+            F[:, idx+2, idx+4] = (-a_x * torch.sin(theta_e) - a_y * torch.cos(theta_e)).squeeze(-1) * DT_IMU
+            F[:, idx+3, idx+4] = ( a_x * torch.cos(theta_e) - a_y * torch.sin(theta_e)).squeeze(-1) * DT_IMU
+            
+        P_pred = torch.bmm(F, torch.bmm(P_est, F.mT)) + Q_full
+        X_est = X_pred.clone()
+        dx = X_est - X_prev_est
+
+        # Mises à jour Capteurs
+        has_gps, has_uwb = 0.0, 0.0
+        y_gps = torch.zeros((1, 4, 1))
+        y_uwb = torch.zeros((1, 1, 1))
+        
+        # PANNE GPS MASSIVE ENTRE 8s ET 14s
+        is_gps_outage = 8.0 < t < 14.0
+
+        if step % STEP_GPS == 0 and not is_gps_outage:
+            has_gps = 1.0
+            z_gps = torch.cat([X_true[:, 0:2, :], X_true[:, 5:7, :]], dim=1) + torch.randn((1, 4, 1)) * 3.0
+            y_gps = z_gps - torch.bmm(H_gps, X_est)
+            
+            S = torch.bmm(H_gps, torch.bmm(P_pred, H_gps.mT)) + R_gps
+            K_ekf = torch.bmm(P_pred, torch.bmm(H_gps.mT, torch.linalg.inv(S)))
+            X_est = X_est + torch.bmm(K_ekf, y_gps)
+            P_pred = torch.bmm(torch.eye(10) - torch.bmm(K_ekf, H_gps), P_pred)
+            
+        if step % STEP_UWB == 0:
+            has_uwb = 1.0
+            dist_t = torch.sqrt((X_true[:, 5, 0]-X_true[:, 0, 0])**2 + (X_true[:, 6, 0]-X_true[:, 1, 0])**2).unsqueeze(-1).unsqueeze(-1)
+            z_dist = dist_t + torch.randn((1, 1, 1)) * 0.5
+            dx_e, dy_e = X_est[:, 5, 0]-X_est[:, 0, 0], X_est[:, 6, 0]-X_est[:, 1, 0]
+            e_dist = torch.sqrt(dx_e**2 + dy_e**2).unsqueeze(-1).unsqueeze(-1)
+            y_uwb = z_dist - e_dist
+            
+            H_dist = torch.zeros((1, 1, 10))
+            safe_dist = torch.clamp(e_dist.squeeze(), min=0.01) 
+            H_dist[:, 0, 0] = -dx_e / safe_dist; H_dist[:, 0, 1] = -dy_e / safe_dist
+            H_dist[:, 0, 5] = dx_e / safe_dist; H_dist[:, 0, 6] = dy_e / safe_dist
+            
+            S = torch.bmm(H_dist, torch.bmm(P_pred, H_dist.mT)) + R_uwb
+            K_ekf = torch.bmm(P_pred, torch.bmm(H_dist.mT, torch.linalg.inv(S)))
+            X_est = X_est + torch.bmm(K_ekf, y_uwb)
+            P_pred = torch.bmm(torch.eye(10) - torch.bmm(K_ekf, H_dist), P_pred)
+
+        P_est = P_pred
+
+        # Stockage pour le KalmanNet
+        feat = torch.cat([torch.tensor([[has_gps]]), torch.tensor([[has_uwb]]), y_gps.squeeze(-1), y_uwb.squeeze(-1), dx.squeeze(-1)], dim=1)
+        yt = torch.cat([y_gps.squeeze(-1), y_uwb.squeeze(-1)], dim=1)
+        
+        features_list.append(feat)
+        y_t_list.append(yt)
+        priors_list.append(X_pred[:, [0,1,5,6], 0])
+        truths_list.append(X_true[:, [0,1,5,6], 0])
+
+    # Empilage des séquences
+    features = torch.stack(features_list, dim=1)
+    y_t = torch.stack(y_t_list, dim=1).unsqueeze(-1)
+    priors = torch.stack(priors_list, dim=1)
+    truths = torch.stack(truths_list, dim=1)
+
+    # --- 3. INFÉRENCE KALMANNET ---
+    print("🧠 Inférence du KalmanNet...")
+    model = KalmanNet_Gain()
+    model.load_state_dict(torch.load(model_path, map_location="cpu"))
+    model.eval()
+
+    with torch.no_grad():
+        K_net = model(features)
+        state_update = torch.matmul(K_net, y_t).squeeze(-1)
+        pos_update = state_update[:, :, [0, 1, 5, 6]]
+        kalmannet_est = priors + pos_update
+
+    # --- 4. AFFICHAGE DES RÉSULTATS ---
+    print("📊 Génération du graphique de la trajectoire exotique...")
+    t_truths = truths.numpy()[0]
+    t_priors = priors.numpy()[0]
+    t_knet = kalmannet_est.numpy()[0]
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Trace les trajectoires du Drone 1
+    ax.plot(t_truths[:, 0], t_truths[:, 1], 'k-', linewidth=3, label="Vérité D1 (Avec rafale secrète)")
+    ax.plot(t_priors[:, 0], t_priors[:, 1], 'r--', linewidth=2, alpha=0.8, label="EKF D1 (Dérive)")
+    ax.plot(t_knet[:, 0], t_knet[:, 1], 'b-', linewidth=2, label="KalmanNet D1")
+    
+    # Ajout d'une zone grisée pour indiquer la panne GPS
+    # On trouve approximativement où est le drone entre t=8 et t=14
+    idx_start, idx_end = 800, 1400
+    x_min = min(t_truths[idx_start:idx_end, 0]) - 5
+    x_max = max(t_truths[idx_start:idx_end, 0]) + 5
+    y_min = min(t_truths[idx_start:idx_end, 1]) - 5
+    y_max = max(t_truths[idx_start:idx_end, 1]) + 5
+    
+    rect = patches.Rectangle((x_min, y_min), x_max-x_min, y_max-y_min, linewidth=1, edgecolor='none', facecolor='red', alpha=0.15, label="Zone de Panne GPS (8s - 14s)")
+    ax.add_patch(rect)
+
+    # Indiquer le point de départ
+    ax.scatter(t_truths[0, 0], t_truths[0, 1], color='green', s=150, marker='*', zorder=5, label="Départ")
+    
+    ax.set_title("Torture Test : Panne GPS + Vent + Spirale", fontsize=16, fontweight='bold')
+    ax.set_xlabel("Position X (m)")
+    ax.set_ylabel("Position Y (m)")
+    ax.legend(loc="upper left")
+    ax.grid(True)
+    ax.axis('equal')
+    
+    plt.tight_layout()
+    plt.savefig("test_exotique_panne_gps.png", dpi=300)
+    plt.show()
+
+if __name__ == "__main__":
+    simulate_exotic_trajectory()
+
+
+import torch
+import torch.nn as nn
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
