@@ -1,3 +1,301 @@
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+
+import torch
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+
+def generate_test_dataset():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🚀 Génération du Test Set sur : {device.type.upper()}")
+
+    BATCH_SIZE = 500       # 500 trajectoires pour le test
+    SIM_TIME = 20.0         
+    DT_IMU = 0.01           
+    DT_GPS = 1.0            
+    DT_UWB = 0.1            
+
+    STEPS_PER_TRAJ = int(SIM_TIME / DT_IMU)
+    STEP_GPS = int(DT_GPS / DT_IMU)
+    STEP_UWB = int(DT_UWB / DT_IMU)
+
+    noise_scale_Q = torch.empty((BATCH_SIZE, 1, 1), device=device).uniform_(0.5, 2.0)
+    noise_scale_R = torch.empty((BATCH_SIZE, 1, 1), device=device).uniform_(0.5, 2.0)
+
+    Q_base_vals = [0.01, 0.01, 0.1, 0.1, np.deg2rad(1.0)]
+    Q_single = torch.diag(torch.tensor(Q_base_vals, dtype=torch.float32, device=device)) ** 2
+    Q_combined = torch.block_diag(Q_single, Q_single)
+    Q_full = Q_combined.unsqueeze(0).repeat(BATCH_SIZE, 1, 1) * noise_scale_Q
+
+    R_gps_base = torch.diag(torch.tensor([3.0, 3.0, 3.0, 3.0], dtype=torch.float32, device=device)) ** 2
+    R_gps = R_gps_base.unsqueeze(0).repeat(BATCH_SIZE, 1, 1) * noise_scale_R
+
+    R_uwb_base = torch.tensor([[[0.5 ** 2]]], dtype=torch.float32, device=device)
+    R_uwb = R_uwb_base.repeat(BATCH_SIZE, 1, 1) * noise_scale_R
+
+    X_true = torch.zeros((BATCH_SIZE, 10, 1), device=device)
+    X_est = torch.zeros((BATCH_SIZE, 10, 1), device=device)
+
+    start_y2 = torch.empty((BATCH_SIZE, 1, 1), device=device).uniform_(5.0, 15.0)
+    X_true[:, 6:7, :] = start_y2
+    X_est[:, 6:7, :] = start_y2
+
+    P_est = torch.eye(10, device=device).unsqueeze(0).repeat(BATCH_SIZE, 1, 1) * 5.0
+    bias_d2 = torch.empty((BATCH_SIZE, 3, 1), device=device).uniform_(-0.1, 0.1)
+
+    H_gps = torch.zeros((BATCH_SIZE, 4, 10), device=device)
+    H_gps[:, 0, 0] = 1; H_gps[:, 1, 1] = 1; H_gps[:, 2, 5] = 1; H_gps[:, 3, 6] = 1
+
+    hist_features = torch.zeros((BATCH_SIZE, STEPS_PER_TRAJ, 25), dtype=torch.float32)
+
+    current_ax = torch.zeros((BATCH_SIZE, 1), device=device)
+    current_omega = torch.zeros((BATCH_SIZE, 1), device=device)
+
+    print(f"⚙️ Simulation en cours...")
+    for step in tqdm(range(STEPS_PER_TRAJ)):
+        
+        if step % 400 == 0:
+            current_ax.uniform_(0.1, 1.0)
+            current_omega.uniform_(-0.5, 0.5)
+            current_ay = torch.zeros_like(current_ax)
+            
+        for i in [0, 5]: 
+            theta_t = X_true[:, i+4, 0:1]
+            X_true[:, i, 0:1]   += X_true[:, i+2, 0:1] * DT_IMU
+            X_true[:, i+1, 0:1] += X_true[:, i+3, 0:1] * DT_IMU
+            X_true[:, i+2, 0:1] += (current_ax * torch.cos(theta_t) - current_ay * torch.sin(theta_t)) * DT_IMU
+            X_true[:, i+3, 0:1] += (current_ax * torch.sin(theta_t) + current_ay * torch.cos(theta_t)) * DT_IMU
+            X_true[:, i+4, 0:1] += current_omega * DT_IMU
+            
+        u_base = torch.cat([current_ax.unsqueeze(-1), current_ay.unsqueeze(-1), current_omega.unsqueeze(-1)], dim=1) 
+        u1 = u_base + torch.randn((BATCH_SIZE, 3, 1), device=device) * 0.05
+        u2 = u_base + bias_d2 + torch.randn((BATCH_SIZE, 3, 1), device=device) * 0.05
+
+        X_prev_est = X_est.clone()
+        X_pred = torch.zeros_like(X_est)
+        F = torch.eye(10, device=device).unsqueeze(0).repeat(BATCH_SIZE, 1, 1)
+        
+        for idx, u in zip([0, 5], [u1, u2]):
+            theta_e = X_est[:, idx+4, 0:1]
+            a_x, a_y, om = u[:, 0, :], u[:, 1, :], u[:, 2, :]
+            
+            X_pred[:, idx, 0]   = X_est[:, idx, 0] + X_est[:, idx+2, 0] * DT_IMU
+            X_pred[:, idx+1, 0] = X_est[:, idx+1, 0] + X_est[:, idx+3, 0] * DT_IMU
+            X_pred[:, idx+2, 0] = X_est[:, idx+2, 0] + (a_x * torch.cos(theta_e) - a_y * torch.sin(theta_e)).squeeze(-1) * DT_IMU
+            X_pred[:, idx+3, 0] = X_est[:, idx+3, 0] + (a_x * torch.sin(theta_e) + a_y * torch.cos(theta_e)).squeeze(-1) * DT_IMU
+            X_pred[:, idx+4, 0] = theta_e.squeeze(-1) + om.squeeze(-1) * DT_IMU
+            
+            F[:, idx, idx+2] = DT_IMU; F[:, idx+1, idx+3] = DT_IMU
+            F[:, idx+2, idx+4] = (-a_x * torch.sin(theta_e) - a_y * torch.cos(theta_e)).squeeze(-1) * DT_IMU
+            F[:, idx+3, idx+4] = ( a_x * torch.cos(theta_e) - a_y * torch.sin(theta_e)).squeeze(-1) * DT_IMU
+            
+        P_pred = torch.bmm(F, torch.bmm(P_est, F.mT)) + Q_full
+        X_est = X_pred.clone()
+        delta_x = X_est - X_prev_est
+
+        has_gps, has_uwb = 0.0, 0.0
+        y_gps = torch.zeros((BATCH_SIZE, 4, 1), device=device)
+        y_uwb = torch.zeros((BATCH_SIZE, 1, 1), device=device)
+        
+        if step % STEP_GPS == 0:
+            has_gps = 1.0
+            z_gps = torch.cat([X_true[:, 0:2, :], X_true[:, 5:7, :]], dim=1) + torch.randn((BATCH_SIZE, 4, 1), device=device) * 3.0 * torch.sqrt(noise_scale_R)
+            y_gps = z_gps - torch.bmm(H_gps, X_est)
+            
+            S = torch.bmm(H_gps, torch.bmm(P_pred, H_gps.mT)) + R_gps
+            K = torch.bmm(P_pred, torch.bmm(H_gps.mT, torch.linalg.inv(S)))
+            X_est = X_est + torch.bmm(K, y_gps)
+            P_pred = torch.bmm(torch.eye(10, device=device).unsqueeze(0).repeat(BATCH_SIZE, 1, 1) - torch.bmm(K, H_gps), P_pred)
+            
+        if step % STEP_UWB == 0:
+            has_uwb = 1.0
+            dist_t = torch.sqrt((X_true[:, 5, 0]-X_true[:, 0, 0])**2 + (X_true[:, 6, 0]-X_true[:, 1, 0])**2).unsqueeze(-1).unsqueeze(-1)
+            z_dist = dist_t + torch.randn((BATCH_SIZE, 1, 1), device=device) * 0.5 * torch.sqrt(noise_scale_R)
+            
+            dx_e, dy_e = X_est[:, 5, 0]-X_est[:, 0, 0], X_est[:, 6, 0]-X_est[:, 1, 0]
+            e_dist = torch.sqrt(dx_e**2 + dy_e**2).unsqueeze(-1).unsqueeze(-1)
+            y_uwb = z_dist - e_dist
+            
+            H_dist = torch.zeros((BATCH_SIZE, 1, 10), device=device)
+            safe_dist = torch.clamp(e_dist.squeeze(), min=0.01) 
+            H_dist[:, 0, 0] = -dx_e / safe_dist; H_dist[:, 0, 1] = -dy_e / safe_dist
+            H_dist[:, 0, 5] = dx_e / safe_dist; H_dist[:, 0, 6] = dy_e / safe_dist
+            
+            S = torch.bmm(H_dist, torch.bmm(P_pred, H_dist.mT)) + R_uwb
+            K = torch.bmm(P_pred, torch.bmm(H_dist.mT, torch.linalg.inv(S)))
+            X_est = X_est + torch.bmm(K, y_uwb)
+            P_pred = torch.bmm(torch.eye(10, device=device).unsqueeze(0).repeat(BATCH_SIZE, 1, 1) - torch.bmm(K, H_dist), P_pred)
+
+        P_est = P_pred
+
+        step_data = torch.cat([
+            torch.full((BATCH_SIZE, 1), has_gps, dtype=torch.float32),
+            torch.full((BATCH_SIZE, 1), has_uwb, dtype=torch.float32),
+            y_gps.squeeze(-1).cpu(),
+            y_uwb.squeeze(-1).cpu(),
+            delta_x.squeeze(-1).cpu(),
+            X_pred[:, [0,1,5,6], 0].cpu(), 
+            X_true[:, [0,1,5,6], 0].cpu()  
+        ], dim=1)
+        hist_features[:, step, :] = step_data
+
+    print("💾 Sauvegarde du Test Set...")
+    traj_ids = torch.arange(BATCH_SIZE).view(-1, 1).repeat(1, STEPS_PER_TRAJ).view(-1, 1).numpy()
+    time_steps = torch.arange(STEPS_PER_TRAJ).view(1, -1).repeat(BATCH_SIZE, 1).view(-1, 1).numpy()
+    flat_features = hist_features.view(-1, 25).numpy()
+
+    final_array = np.hstack((traj_ids, time_steps, flat_features))
+    columns = [
+        'traj_id', 'time_step', 'has_gps', 'has_uwb',
+        'y_gps_x1', 'y_gps_y1', 'y_gps_x2', 'y_gps_y2', 'y_uwb_dist',
+        'dx_0', 'dx_1', 'dx_2', 'dx_3', 'dx_4', 'dx_5', 'dx_6', 'dx_7', 'dx_8', 'dx_9',
+        'prior_x1', 'prior_y1', 'prior_x2', 'prior_y2',
+        'true_x1', 'true_y1', 'true_x2', 'true_y2'
+    ]
+
+    df = pd.DataFrame(final_array, columns=columns)
+    os.makedirs("data", exist_ok=True)
+    df.to_pickle("data/kalman_dataset_test.pkl") # NOUVEAU NOM DE FICHIER
+    print(f"✅ Test Set sauvegardé : data/kalman_dataset_test.pkl ({len(df)} lignes)")
+
+if __name__ == "__main__":
+    generate_test_dataset()
+
+
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. REDÉFINITION DE L'ARCHITECTURE
+# ==========================================
+class KalmanNet_Gain(nn.Module):
+    def __init__(self, input_dim=17, obs_dim=5, state_dim=10, hidden_dim=64):
+        super(KalmanNet_Gain, self).__init__()
+        self.state_dim = state_dim
+        self.obs_dim = obs_dim
+        self.bn_input = nn.BatchNorm1d(input_dim)
+        self.gru = nn.GRU(input_size=input_dim, hidden_size=hidden_dim, num_layers=2, batch_first=True)
+        self.activation = nn.Tanh()
+        self.fc = nn.Linear(hidden_dim, state_dim * obs_dim)
+
+    def forward(self, features):
+        x = features.transpose(1, 2)
+        x = self.bn_input(x)
+        x = x.transpose(1, 2)
+        gru_out, _ = self.gru(x)
+        gru_out = self.activation(gru_out)
+        K_flat = self.fc(gru_out)
+        K = K_flat.view(features.size(0), features.size(1), self.state_dim, self.obs_dim)
+        return K
+
+# ==========================================
+# 2. FONCTION D'ÉVALUATION
+# ==========================================
+def evaluate_and_plot(model_path="weights/train4/kalmannet_best_weights.pth", test_data_path="data/kalman_dataset_test.pkl"):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"📊 Évaluation sur : {device.type.upper()}")
+
+    # 1. Chargement du modèle
+    model = KalmanNet_Gain().to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    # 2. Chargement et formatage des données de test
+    print("Chargement du dataset de test...")
+    df = pd.read_pickle(test_data_path)
+    df = df.sort_values(by=['traj_id', 'time_step'])
+    
+    num_trajectories = df['traj_id'].nunique()
+    seq_len = df['time_step'].nunique()
+    
+    data_np = df.drop(columns=['traj_id', 'time_step']).values
+    data_tensor = torch.tensor(data_np, dtype=torch.float32).view(num_trajectories, seq_len, -1).to(device)
+    
+    features = data_tensor[:, :, 0:17] 
+    y_t = data_tensor[:, :, 2:7].unsqueeze(-1) 
+    priors = data_tensor[:, :, 17:21]   # Baseline EKF
+    truths = data_tensor[:, :, 21:25]   # Vérité terrain
+
+    # 3. Inférence massive (sans calcul de gradients)
+    print("Inférence en cours...")
+    with torch.no_grad():
+        K = model(features)
+        state_update = torch.matmul(K, y_t).squeeze(-1)
+        pos_update = state_update[:, :, [0, 1, 5, 6]]
+        kalmannet_est = priors + pos_update # Prédiction finale du KalmanNet
+
+    # 4. Calcul des Métriques Globales (RMSE 2D)
+    # Erreur Baseline = distance entre Prior et Vérité
+    err_baseline_d1 = torch.sqrt((priors[:,:,0]-truths[:,:,0])**2 + (priors[:,:,1]-truths[:,:,1])**2)
+    err_baseline_d2 = torch.sqrt((priors[:,:,2]-truths[:,:,2])**2 + (priors[:,:,3]-truths[:,:,3])**2)
+    rmse_baseline = torch.mean((err_baseline_d1 + err_baseline_d2) / 2.0).item()
+
+    # Erreur KalmanNet = distance entre KalmanNet et Vérité
+    err_knet_d1 = torch.sqrt((kalmannet_est[:,:,0]-truths[:,:,0])**2 + (kalmannet_est[:,:,1]-truths[:,:,1])**2)
+    err_knet_d2 = torch.sqrt((kalmannet_est[:,:,2]-truths[:,:,2])**2 + (kalmannet_est[:,:,3]-truths[:,:,3])**2)
+    rmse_knet = torch.mean((err_knet_d1 + err_knet_d2) / 2.0).item()
+
+    print("\n" + "="*40)
+    print("🎯 RÉSULTATS GLOBAUX SUR LE TEST SET")
+    print("="*40)
+    print(f"RMSE Baseline (EKF) : {rmse_baseline:.3f} mètres")
+    print(f"RMSE KalmanNet      : {rmse_knet:.3f} mètres")
+    improvement = ((rmse_baseline - rmse_knet) / rmse_baseline) * 100
+    print(f"Amélioration        : {improvement:.1f} %")
+    print("="*40 + "\n")
+
+    # 5. Visualisation de la Trajectoire N°0
+    print("Génération du graphique...")
+    t0_truths = truths[0].cpu().numpy()
+    t0_priors = priors[0].cpu().numpy()
+    t0_knet = kalmannet_est[0].cpu().numpy()
+
+    fig, axs = plt.subplots(1, 2, figsize=(16, 6))
+
+    # Sous-graphe 1 : Trajectoires X/Y
+    axs[0].plot(t0_truths[:, 0], t0_truths[:, 1], 'k-', linewidth=2, label="Vérité D1")
+    axs[0].plot(t0_priors[:, 0], t0_priors[:, 1], 'r--', alpha=0.7, label="EKF Baseline D1")
+    axs[0].plot(t0_knet[:, 0], t0_knet[:, 1], 'b-', linewidth=2, label="KalmanNet D1")
+    
+    axs[0].plot(t0_truths[:, 2], t0_truths[:, 3], 'k:', linewidth=2, label="Vérité D2")
+    axs[0].plot(t0_priors[:, 2], t0_priors[:, 3], 'm--', alpha=0.7, label="EKF Baseline D2")
+    axs[0].plot(t0_knet[:, 2], t0_knet[:, 3], 'c-', linewidth=2, label="KalmanNet D2")
+
+    axs[0].set_title("Comparaison des Trajectoires (Test ID 0)")
+    axs[0].set_xlabel("Position X (m)")
+    axs[0].set_ylabel("Position Y (m)")
+    axs[0].legend()
+    axs[0].grid(True)
+    axs[0].axis('equal')
+
+    # Sous-graphe 2 : Erreur Moyenne au cours du temps (pour D1)
+    time_axis = np.arange(seq_len) * 0.01 # dt = 0.01
+    err_b_np = err_baseline_d1[0].cpu().numpy()
+    err_k_np = err_knet_d1[0].cpu().numpy()
+
+    axs[1].plot(time_axis, err_b_np, 'r--', label="Erreur EKF Baseline")
+    axs[1].plot(time_axis, err_k_np, 'b-', label="Erreur KalmanNet")
+    axs[1].set_title("Évolution de l'Erreur de Position (Drone 1)")
+    axs[1].set_xlabel("Temps (s)")
+    axs[1].set_ylabel("Erreur (mètres)")
+    axs[1].legend()
+    axs[1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig("test_comparison.png", dpi=300)
+    print("✅ Graphique sauvegardé sous 'test_comparison.png'")
+    plt.show()
+
+if __name__ == "__main__":
+    evaluate_and_plot()
+
+
+
+
 import torch
 import pandas as pd
 import numpy as np
