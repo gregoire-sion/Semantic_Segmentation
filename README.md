@@ -1,3 +1,221 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import numpy as np
+
+# ==========================================
+# 1. L'ARCHITECTURE INDÉPENDANTE (BOUCLE FERMÉE)
+# ==========================================
+class KalmanNet_Independent(nn.Module):
+    def __init__(self, feature_dim=17, obs_dim=5, state_pos_dim=4, hidden_dim=64):
+        super(KalmanNet_Independent, self).__init__()
+        self.state_pos_dim = state_pos_dim # On se concentre sur [x1, y1, x2, y2]
+        self.obs_dim = obs_dim
+        
+        # On utilise GRUCell pour traiter pas par pas (step-by-step)
+        self.gru_cell = nn.GRUCell(input_size=feature_dim, hidden_size=hidden_dim)
+        self.activation = nn.Tanh()
+        self.fc = nn.Linear(hidden_dim, state_pos_dim * obs_dim)
+
+    def forward(self, initial_state, sequence_features, raw_measurements, physical_displacements):
+        """
+        initial_state: Position de départ [batch_size, 4]
+        sequence_features: Flags et autres infos [batch_size, seq_len, feature_dim]
+        raw_measurements: La mesure brute (Z) du capteur [batch_size, seq_len, obs_dim]
+        physical_displacements: Le mouvement théorique (IMU) [batch_size, seq_len, 4]
+        """
+        batch_size, seq_len, _ = sequence_features.size()
+        hidden = torch.zeros(batch_size, self.gru_cell.hidden_size).to(sequence_features.device)
+        
+        x_est = initial_state
+        estimations = []
+
+        # La Boucle Temporelle Indépendante
+        for t in range(seq_len):
+            # 1. PRÉDICTION PHYSIQUE (Mon modèle cinématique)
+            # x_t|t-1 = x_t-1|t-1 + dx
+            x_pred = x_est + physical_displacements[:, t, :]
+            
+            # 2. CALCUL DE MA PROPRE INNOVATION
+            # Z - H*x_pred. (Ici on suppose que les 4 premières obs sont les GPS x1,y1,x2,y2)
+            y_gps_knet = raw_measurements[:, t, 0:4] - x_pred 
+            
+            # (Simplification: On met à jour la feature avec NOTRE innovation, pas celle de l'EKF)
+            current_feature = sequence_features[:, t, :].clone()
+            current_feature[:, 2:6] = y_gps_knet # Remplacement par l'innovation KNet
+            
+            # 3. LE RÉSEAU REMPLACE P, Q, R POUR TROUVER K
+            hidden = self.gru_cell(current_feature, hidden)
+            hidden_act = self.activation(hidden)
+            K_flat = self.fc(hidden_act)
+            K = K_flat.view(batch_size, self.state_pos_dim, self.obs_dim)
+            
+            # 4. CORRECTION FINALE DE MON ÉTAT
+            # x_t|t = x_pred + K * (Mesure - H*x_pred)
+            y_t_full = current_feature[:, 2:7].unsqueeze(-1) # Les 5 innovations (4 GPS + 1 UWB)
+            state_update = torch.bmm(K, y_t_full).squeeze(-1)
+            
+            x_est = x_pred + state_update
+            estimations.append(x_est)
+
+        return torch.stack(estimations, dim=1) # [batch_size, seq_len, 4]
+
+# ==========================================
+# 2. FONCTION D'ENTRAÎNEMENT
+# ==========================================
+def train():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🚀 Entraînement Indépendant sur : {device}")
+
+    # --- CHARGEMENT DES DONNÉES ---
+    df = pd.read_pickle("data/kalman_dataset_gpu_.pkl")
+    num_trajectories = df['traj_id'].nunique()
+    seq_len = df['time_step'].nunique()
+    
+    data_tensor = torch.tensor(df.drop(columns=['traj_id', 'time_step']).values, dtype=torch.float32).view(num_trajectories, seq_len, -1).to(device)
+    
+    features = data_tensor[:, :, 0:17]
+    priors_ekf = data_tensor[:, :, 17:21] 
+    truths = data_tensor[:, :, 21:25]
+    ekf_innovations = data_tensor[:, :, 2:7]
+    
+    # RECONSTRUCTION DES ENTRÉES BRUTES POUR L'INDÉPENDANCE
+    # Mesure brute Z = Prédiction EKF + Innovation EKF
+    raw_measurements = torch.zeros_like(ekf_innovations)
+    raw_measurements[:, :, 0:4] = priors_ekf + ekf_innovations[:, :, 0:4] 
+    raw_measurements[:, :, 4] = ekf_innovations[:, :, 4] # UWB (simplifié)
+    
+    # Déplacement physique (dx) : On utilise la différence des priors pour simuler l'intégration IMU
+    physical_displacements = torch.zeros_like(priors_ekf)
+    physical_displacements[:, 1:, :] = priors_ekf[:, 1:, :] - priors_ekf[:, :-1, :]
+
+    # --- INITIALISATION ---
+    model = KalmanNet_Independent().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.SmoothL1Loss() # La Huber Loss protège la mémoire du RNN
+
+    # --- BOUCLE D'ÉPOQUES ---
+    epochs = 100
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        
+        # Le KNet part de la vraie position initiale
+        initial_state = truths[:, 0, :] 
+        
+        # Inférence End-to-End
+        estimations = model(initial_state, features, raw_measurements, physical_displacements)
+        
+        # La Loss compare la trajectoire inventée par le KNet avec la Vérité Terrain
+        loss = criterion(estimations, truths)
+        
+        loss.backward()
+        optimizer.step()
+        
+        if epoch % 10 == 0:
+            print(f"Époque {epoch}/{epochs} | Loss (SmoothL1) : {loss.item():.6f}")
+
+    torch.save(model.state_dict(), "weights/kalmannet_independent.pth")
+    print("✅ Poids sauvegardés (Modèle Indépendant).")
+
+if __name__ == "__main__":
+    train()
+
+
+import torch
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# IMPORTANT : On importe la classe qu'on vient de définir dans le script d'entraînement
+from train_KalmanNet_Indep import KalmanNet_Independent
+
+def test_independent_models(model_path="weights/kalmannet_independent.pth", data_path="data/kalman_dataset_test.pkl"):
+    device = torch.device("cpu") # Test sur CPU suffisant
+    print(f"📊 Test Indépendant des Algorithmes de Navigation")
+
+    # --- 1. PRÉPARATION DES DONNÉES ---
+    df = pd.read_pickle(data_path)
+    num_trajectories = df['traj_id'].nunique()
+    seq_len = df['time_step'].nunique()
+    
+    data_tensor = torch.tensor(df.drop(columns=['traj_id', 'time_step']).values, dtype=torch.float32).view(num_trajectories, seq_len, -1)
+    
+    features = data_tensor[:, :, 0:17]
+    priors_ekf = data_tensor[:, :, 17:21]
+    truths = data_tensor[:, :, 21:25]
+    ekf_innovations = data_tensor[:, :, 2:7]
+    
+    # Reconstruction des mesures et déplacements (comme dans le train)
+    raw_measurements = torch.zeros_like(ekf_innovations)
+    raw_measurements[:, :, 0:4] = priors_ekf + ekf_innovations[:, :, 0:4]
+    raw_measurements[:, :, 4] = ekf_innovations[:, :, 4]
+    
+    physical_displacements = torch.zeros_like(priors_ekf)
+    physical_displacements[:, 1:, :] = priors_ekf[:, 1:, :] - priors_ekf[:, :-1, :]
+
+    # --- 2. TRAJECTOIRE DE L'EKF CLASSIQUE ---
+    # L'EKF est déjà calculé dans ton dataset. Sa position finale à chaque pas est : Prior + Correction
+    pos_update_ekf = ekf_innovations[:, :, 0:4] # Approximation de la correction stockée
+    ekf_estimations = priors_ekf + pos_update_ekf
+
+    # --- 3. TRAJECTOIRE DU KALMANNET INDÉPENDANT ---
+    model = KalmanNet_Independent()
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    initial_state = truths[:, 0, :] # On part du même point
+
+    with torch.no_grad():
+        knet_estimations = model(initial_state, features, raw_measurements, physical_displacements)
+
+    # --- 4. CALCUL DES MÉTRIQUES ---
+    err_ekf_d1 = torch.sqrt((ekf_estimations[:,:,0]-truths[:,:,0])**2 + (ekf_estimations[:,:,1]-truths[:,:,1])**2)
+    err_knet_d1 = torch.sqrt((knet_estimations[:,:,0]-truths[:,:,0])**2 + (knet_estimations[:,:,1]-truths[:,:,1])**2)
+    
+    rmse_ekf = torch.mean(err_ekf_d1).item()
+    rmse_knet = torch.mean(err_knet_d1).item()
+
+    print("\n" + "="*50)
+    print("🎯 RÉSULTATS DU MATCH (100% INDÉPENDANT)")
+    print("="*50)
+    print(f"RMSE Baseline (EKF) : {rmse_ekf:.4f} mètres")
+    print(f"RMSE KalmanNet      : {rmse_knet:.4f} mètres")
+    print(f"Amélioration        : {((rmse_ekf - rmse_knet) / rmse_ekf) * 100:.2f} %")
+    print("="*50)
+
+    # --- 5. GRAPHIQUE DE COMPARAISON ---
+    traj_idx = 0 # On affiche la première trajectoire
+    time_axis = np.arange(seq_len) * 0.01
+
+    plt.figure(figsize=(14, 8))
+    
+    # Plot Vérité
+    plt.plot(truths[traj_idx, :, 0].numpy(), truths[traj_idx, :, 1].numpy(), 'k-', linewidth=3, label="Vérité Terrain")
+    
+    # Plot EKF
+    plt.plot(ekf_estimations[traj_idx, :, 0].numpy(), ekf_estimations[traj_idx, :, 1].numpy(), 'r--', linewidth=2, label="EKF Classique (Autonome)")
+    
+    # Plot KalmanNet
+    plt.plot(knet_estimations[traj_idx, :, 0].numpy(), knet_estimations[traj_idx, :, 1].numpy(), 'b-', linewidth=2, label="KalmanNet (Autonome)")
+    
+    plt.title(f"Course Indépendante : EKF vs KalmanNet (Trajectoire #{traj_idx})", fontsize=16, fontweight='bold')
+    plt.xlabel("Position X (m)")
+    plt.ylabel("Position Y (m)")
+    plt.legend(loc="best")
+    plt.grid(True)
+    plt.axis('equal')
+    
+    plt.savefig("match_independant_ekf_vs_knet.png", dpi=300)
+    print("✅ Graphique sauvegardé sous 'match_independant_ekf_vs_knet.png'")
+    plt.show()
+
+if __name__ == "__main__":
+    test_independent_models()
+
+
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
