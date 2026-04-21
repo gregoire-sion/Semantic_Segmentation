@@ -1,3 +1,127 @@
+import pandas as pd
+import plotly.graph_objects as go
+import os
+
+def generate_interactive_plot(data_path="data/kalman_dataset_test.pkl", traj_id=0):
+    print(f"📂 Chargement des données depuis {data_path}...")
+    try:
+        df = pd.read_pickle(data_path)
+    except FileNotFoundError:
+        print(f"❌ Erreur : Le fichier {data_path} est introuvable.")
+        return
+
+    # 1. Filtrage sur la trajectoire choisie
+    df_traj = df[df['traj_id'] == traj_id].sort_values(by='time_step').reset_index(drop=True)
+    
+    # Création d'une colonne temps (en secondes) pour l'affichage au survol
+    df_traj['time_sec'] = df_traj['time_step'] * 0.01
+    hover_template = "Temps : %{customdata:.2f} s<br>X : %{x:.2f} m<br>Y : %{y:.2f} m"
+
+    print(f"🚁 Génération du graphique pour la trajectoire #{traj_id}...")
+    fig = go.Figure()
+
+    # ==========================================
+    # TRACÉS POUR LE DRONE 1
+    # ==========================================
+    # 1. Vérité Terrain D1
+    fig.add_trace(go.Scatter(
+        x=df_traj['true_x1'], y=df_traj['true_y1'],
+        mode='lines', name='Vérité Terrain (D1)',
+        line=dict(color='black', width=3),
+        customdata=df_traj['time_sec'],
+        hovertemplate=hover_template
+    ))
+
+    # 2. Estimation EKF D1
+    fig.add_trace(go.Scatter(
+        x=df_traj['prior_x1'], y=df_traj['prior_y1'],
+        mode='lines', name='EKF Baseline (D1)',
+        line=dict(color='red', width=2, dash='dash'),
+        customdata=df_traj['time_sec'],
+        hovertemplate=hover_template
+    ))
+
+    # 3. Mesures GPS D1
+    df_gps = df_traj[df_traj['has_gps'] == 1.0]
+    fig.add_trace(go.Scatter(
+        x=df_gps['prior_x1'] + df_gps['y_gps_x1'], 
+        y=df_gps['prior_y1'] + df_gps['y_gps_y1'],
+        mode='markers', name='Mesures GPS (D1)',
+        marker=dict(color='green', size=8, symbol='cross'),
+        customdata=df_gps['time_sec'],
+        hovertemplate="<b>Mesure GPS</b><br>" + hover_template
+    ))
+
+    # ==========================================
+    # TRACÉS POUR LE DRONE 2
+    # ==========================================
+    # 1. Vérité Terrain D2
+    fig.add_trace(go.Scatter(
+        x=df_traj['true_x2'], y=df_traj['true_y2'],
+        mode='lines', name='Vérité Terrain (D2)',
+        line=dict(color='gray', width=3),
+        customdata=df_traj['time_sec'],
+        hovertemplate=hover_template,
+        visible='legendonly' # Caché par défaut pour ne pas surcharger
+    ))
+
+    # 2. Estimation EKF D2
+    fig.add_trace(go.Scatter(
+        x=df_traj['prior_x2'], y=df_traj['prior_y2'],
+        mode='lines', name='EKF Baseline (D2)',
+        line=dict(color='orange', width=2, dash='dash'),
+        customdata=df_traj['time_sec'],
+        hovertemplate=hover_template,
+        visible='legendonly'
+    ))
+
+    # 3. Mesures GPS D2
+    fig.add_trace(go.Scatter(
+        x=df_gps['prior_x2'] + df_gps['y_gps_x2'], 
+        y=df_gps['prior_y2'] + df_gps['y_gps_y2'],
+        mode='markers', name='Mesures GPS (D2)',
+        marker=dict(color='purple', size=8, symbol='cross'),
+        customdata=df_gps['time_sec'],
+        hovertemplate="<b>Mesure GPS</b><br>" + hover_template,
+        visible='legendonly'
+    ))
+
+    # ==========================================
+    # MISE EN PAGE DU GRAPHIQUE
+    # ==========================================
+    fig.update_layout(
+        title=f"<b>Analyse du Dataset : Trajectoire #{traj_id}</b><br><sup>Comparaison de la vérité terrain, de l'EKF et des capteurs</sup>",
+        xaxis_title="Position X (mètres)",
+        yaxis_title="Position Y (mètres)",
+        yaxis=dict(scaleanchor="x", scaleratio=1), # Très important : 1m en X = 1m en Y à l'écran
+        template="plotly_white",
+        hovermode="closest",
+        legend=dict(
+            title="Cliquez sur un élément pour l'afficher/masquer :",
+            yanchor="top", y=0.99, 
+            xanchor="left", x=0.01,
+            bgcolor="rgba(255, 255, 255, 0.9)",
+            bordercolor="Black",
+            borderwidth=1
+        ),
+        margin=dict(l=20, r=20, t=60, b=20)
+    )
+
+    # ==========================================
+    # SAUVEGARDE ET AFFICHAGE
+    # ==========================================
+    output_filename = f"trajectoire_{traj_id}_interactive.html"
+    fig.write_html(output_filename)
+    print(f"✅ Fichier HTML généré avec succès : {output_filename}")
+    
+    # Ouvre automatiquement le graphique dans ton navigateur
+    fig.show()
+
+if __name__ == "__main__":
+    # Tu peux changer le numéro de la trajectoire ici (de 0 à 499)
+    generate_interactive_plot(traj_id=0)
+
+
 import torch
 import torch.nn as nn
 import numpy as np
