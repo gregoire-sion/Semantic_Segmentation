@@ -1,4 +1,122 @@
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import random
+
+def analyze_dataset_comprehensive(data_path="data/kalman_dataset_test.pkl", num_traj_to_plot=10):
+    print(f"📂 Audit du dataset : {data_path}")
+    
+    try:
+        df = pd.read_pickle(data_path)
+    except FileNotFoundError:
+        print(f"❌ Erreur : Fichier introuvable à l'emplacement {data_path}")
+        return
+
+    # ==========================================
+    # 1. STATISTIQUES GLOBALES (PRINTS)
+    # ==========================================
+    traj_ids = df['traj_id'].unique()
+    num_trajectories = len(traj_ids)
+    seq_len = df['time_step'].nunique()
+    
+    print("\n" + "="*40)
+    print("📊 CARACTÉRISTIQUES DU DATASET")
+    print("="*40)
+    print(f"Nombre de trajectoires : {num_trajectories}")
+    print(f"Pas de temps par traj  : {seq_len} (soit {seq_len * 0.01:.1f} secondes)")
+    print(f"Nombre total de lignes : {len(df)}")
+    
+    # Vérification des ratios de capteurs
+    gps_ratio = df['has_gps'].mean() * 100
+    uwb_ratio = df['has_uwb'].mean() * 100
+    print(f"Présence GPS moyenne   : {gps_ratio:.1f}% des pas de temps")
+    print(f"Présence UWB moyenne   : {uwb_ratio:.1f}% des pas de temps")
+    print("="*40 + "\n")
+
+    # ==========================================
+    # 2. GÉNÉRATION DU DASHBOARD (4 GRAPHIQUES)
+    # ==========================================
+    print(f"🎨 Génération des graphiques (Échantillon de {num_traj_to_plot} trajectoires)...")
+    sns.set_theme(style="whitegrid")
+    fig = plt.figure(figsize=(18, 12))
+    gs = fig.add_gridspec(2, 2)
+
+    # Sélection aléatoire de trajectoires pour ne pas surcharger l'affichage
+    sampled_traj_ids = random.sample(list(traj_ids), min(num_traj_to_plot, num_trajectories))
+    
+    # --- PLOT 1 : Le "Spaghetti Plot" (Diversité des trajectoires) ---
+    ax1 = fig.add_subplot(gs[0, 0])
+    colors = plt.cm.viridis(np.linspace(0, 1, num_traj_to_plot))
+    
+    for idx, t_id in enumerate(sampled_traj_ids):
+        df_t = df[df['traj_id'] == t_id].sort_values('time_step')
+        # On trace seulement le Drone 1 pour la clarté
+        ax1.plot(df_t['true_x1'], df_t['true_y1'], color=colors[idx], alpha=0.7, linewidth=1.5)
+        # Point de départ
+        ax1.scatter(df_t['true_x1'].iloc[0], df_t['true_y1'].iloc[0], color='green', s=30, zorder=5)
+        
+    ax1.set_title(f"Vue de dessus : {num_traj_to_plot} Trajectoires Aléatoires (Drone 1)", fontweight='bold')
+    ax1.set_xlabel("Position X (m)")
+    ax1.set_ylabel("Position Y (m)")
+    ax1.axis('equal')
+    # Ajout d'une fausse légende pour le point vert
+    ax1.scatter([], [], color='green', s=30, label='Départ')
+    ax1.legend()
+
+    # --- PLOT 2 : La Dynamique du Drone (Distribution de dx/dt) ---
+    # Cela permet de voir si le drone a des vitesses variées
+    ax2 = fig.add_subplot(gs[0, 1])
+    # On regarde dx_0 (déplacement en X) et dx_1 (déplacement en Y)
+    sns.kdeplot(data=df, x='dx_0', ax=ax2, fill=True, color='blue', label='Déplacement X (dx_0)', alpha=0.4)
+    sns.kdeplot(data=df, x='dx_1', ax=ax2, fill=True, color='red', label='Déplacement Y (dx_1)', alpha=0.4)
+    ax2.set_title("Profil Dynamique : Distribution des pas de déplacement (dx, dy)", fontweight='bold')
+    ax2.set_xlabel("Déplacement par pas de temps (m)")
+    ax2.set_ylabel("Densité")
+    ax2.set_xlim(-0.15, 0.15) # Zoom sur la zone d'intérêt
+    ax2.legend()
+
+    # --- PLOT 3 : La difficulté (Distribution du Bruit GPS) ---
+    # Innovation y_gps (mesure - prédiction)
+    ax3 = fig.add_subplot(gs[1, 0])
+    df_gps = df[df['has_gps'] == 1.0]
+    sns.histplot(df_gps['y_gps_x1'], bins=100, kde=True, ax=ax3, color='orange')
+    ax3.set_title("Niveau de Difficulté : Bruit des innovations GPS (Axe X)", fontweight='bold')
+    ax3.set_xlabel("Erreur d'innovation (mètres)")
+    ax3.set_ylabel("Nombre de mesures")
+    
+    # Ajout de lignes d'écart-type pour visualiser la dispersion
+    std_gps = df_gps['y_gps_x1'].std()
+    ax3.axvline(std_gps, color='black', linestyle='--', label=f'+1 Std Dev ({std_gps:.1f}m)')
+    ax3.axvline(-std_gps, color='black', linestyle='--')
+    ax3.legend()
+
+    # --- PLOT 4 : Les interactions (Distance UWB) ---
+    ax4 = fig.add_subplot(gs[1, 1])
+    for idx, t_id in enumerate(sampled_traj_ids):
+        df_t = df[df['traj_id'] == t_id].sort_values('time_step')
+        # On recalcule la distance réelle pour la tracer
+        dist = np.sqrt((df_t['true_x2'] - df_t['true_x1'])**2 + (df_t['true_y2'] - df_t['true_y1'])**2)
+        time_sec = df_t['time_step'] * 0.01
+        ax4.plot(time_sec, dist, color=colors[idx], alpha=0.6)
+
+    ax4.set_title(f"Évolution de la distance inter-drones (UWB) dans le temps", fontweight='bold')
+    ax4.set_xlabel("Temps (s)")
+    ax4.set_ylabel("Distance (mètres)")
+
+    # Finalisation
+    plt.tight_layout()
+    plt.savefig("dataset_explorer_dashboard.png", dpi=300)
+    print("✅ Dashboard sauvegardé sous 'dataset_explorer_dashboard.png'")
+    plt.show()
+
+if __name__ == "__main__":
+    # N'hésite pas à tester sur ton dataset d'entraînement aussi !
+    # analyze_dataset_comprehensive(data_path="data/kalman_dataset_gpu_.pkl", num_traj_to_plot=15)
+    analyze_dataset_comprehensive(data_path="data/kalman_dataset_test.pkl", num_traj_to_plot=10)
+
+
+import pandas as pd
 import plotly.graph_objects as go
 import os
 
