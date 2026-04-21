@@ -1,5 +1,103 @@
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import random
+
+def generate_dataset_audit_html(data_path="data/kalman_dataset_test.pkl", num_traj=15, output_file="audit_dataset.html"):
+    print(f"📂 Lecture du dataset : {data_path}...")
+    try:
+        df = pd.read_pickle(data_path)
+    except FileNotFoundError:
+        print("❌ Erreur : Fichier introuvable.")
+        return
+
+    # Préparation des données
+    traj_ids = list(df['traj_id'].unique())
+    sampled_ids = random.sample(traj_ids, min(num_traj, len(traj_ids)))
+    
+    # Création d'une figure avec 4 sous-graphiques (2x2)
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=(
+            "🛰️ Diversité des Trajectoires (2D)", 
+            "📈 Distribution des Innovations GPS (Bruit)",
+            "🔄 Dynamique : Déplacements dx/dy",
+            "📏 Évolution de la distance UWB"
+        ),
+        vertical_spacing=0.15,
+        horizontal_spacing=0.1
+    )
+
+    # --- 1. TRAJECTOIRES 2D (Top Left) ---
+    for t_id in sampled_ids:
+        df_t = df[df['traj_id'] == t_id].sort_values('time_step')
+        fig.add_trace(
+            go.Scatter(x=df_t['true_x1'], y=df_t['true_y1'], name=f"Traj {int(t_id)}",
+                       mode='lines', line=dict(width=1.5), opacity=0.7,
+                       hovertemplate="X: %{x:.2f}m<br>Y: %{y:.2f}m"),
+            row=1, col=1
+        )
+
+    # --- 2. INNOVATIONS GPS (Top Right) ---
+    df_gps = df[df['has_gps'] == 1.0]
+    fig.add_trace(
+        go.Histogram(x=df_gps['y_gps_x1'], nbinsx=100, name="Erreur GPS X", 
+                     marker_color='orange', opacity=0.7),
+        row=1, col=2
+    )
+    fig.add_trace(
+        go.Histogram(x=df_gps['y_gps_y1'], nbinsx=100, name="Erreur GPS Y", 
+                     marker_color='red', opacity=0.5),
+        row=1, col=2
+    )
+
+    # --- 3. DYNAMIQUE DX/DY (Bottom Left) ---
+    fig.add_trace(
+        go.Histogram(x=df['dx_0'], nbinsx=100, name="Vitesse X (dx)", 
+                     marker_color='blue', opacity=0.6),
+        row=2, col=1
+    )
+    fig.add_trace(
+        go.Histogram(x=df['dx_1'], nbinsx=100, name="Vitesse Y (dy)", 
+                     marker_color='cyan', opacity=0.4),
+        row=2, col=1
+    )
+
+    # --- 4. DISTANCE UWB (Bottom Right) ---
+    for t_id in sampled_ids:
+        df_t = df[df['traj_id'] == t_id].sort_values('time_step')
+        dist = np.sqrt((df_t['true_x2'] - df_t['true_x1'])**2 + (df_t['true_y2'] - df_t['true_y1'])**2)
+        time_sec = df_t['time_step'] * 0.01
+        fig.add_trace(
+            go.Scatter(x=time_sec, y=dist, mode='lines', name=f"Dist UWB {int(t_id)}",
+                       line=dict(width=1), opacity=0.5, showlegend=False),
+            row=2, col=2
+        )
+
+    # Mise en page (Layout)
+    fig.update_layout(
+        height=900,
+        title_text=f"🏢 Dashboard d'Audit du Dataset ({len(traj_ids)} trajectoires au total)",
+        template="plotly_white",
+        showlegend=True,
+        barmode='overlay'
+    )
+    
+    # Ajustement des axes pour le plot 2D
+    fig.update_yaxes(scaleanchor="x", scaleratio=1, row=1, col=1)
+
+    # Sauvegarde
+    fig.write_html(output_file)
+    print(f"✅ Dashboard d'audit généré : {output_file}")
+    fig.show()
+
+if __name__ == "__main__":
+    generate_dataset_audit_html()
+
+
+import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import random
