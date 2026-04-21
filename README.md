@@ -1,4 +1,117 @@
 import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+import random
+
+def generate_multi_trajectory_plot(data_path="data/kalman_dataset_test.pkl", num_traj_to_plot=5, specific_ids=None):
+    """
+    Génère un graphique interactif pour un nombre défini de trajectoires.
+    - num_traj_to_plot : Nombre de trajectoires à piocher au hasard.
+    - specific_ids : Liste d'IDs précis si tu veux en forcer certains (ex: [0, 42, 105]).
+    """
+    print(f"📂 Chargement des données depuis {data_path}...")
+    try:
+        df = pd.read_pickle(data_path)
+    except FileNotFoundError:
+        print(f"❌ Erreur : Le fichier {data_path} est introuvable.")
+        return
+
+    # Déterminer quelles trajectoires afficher
+    available_ids = list(df['traj_id'].unique())
+    
+    if specific_ids is not None:
+        ids_to_plot = [i for i in specific_ids if i in available_ids]
+    else:
+        ids_to_plot = random.sample(available_ids, min(num_traj_to_plot, len(available_ids)))
+
+    print(f"🚁 Génération du graphique pour les trajectoires : {ids_to_plot}...")
+    
+    fig = go.Figure()
+    
+    # Palette de couleurs généreuse de Plotly
+    colors = px.colors.qualitative.Alphabet + px.colors.qualitative.Plotly
+
+    for idx, t_id in enumerate(ids_to_plot):
+        df_traj = df[df['traj_id'] == t_id].sort_values(by='time_step').reset_index(drop=True)
+        df_traj['time_sec'] = df_traj['time_step'] * 0.01
+        
+        # On assigne une couleur unique à cette trajectoire
+        c = colors[idx % len(colors)]
+        group_name = f"Traj {int(t_id)}"
+        hover_template = f"<b>{group_name}</b><br>Temps : %{{customdata:.2f}} s<br>X : %{{x:.2f}} m<br>Y : %{{y:.2f}} m"
+
+        # --- 1. Vérité Terrain D1 ---
+        fig.add_trace(go.Scatter(
+            x=df_traj['true_x1'], y=df_traj['true_y1'],
+            mode='lines', name=f'{group_name} - Vérité (D1)',
+            line=dict(color=c, width=3),
+            customdata=df_traj['time_sec'],
+            hovertemplate=hover_template,
+            legendgroup=group_name # Lie les courbes ensemble dans la légende
+        ))
+
+        # --- 2. Estimation EKF D1 ---
+        fig.add_trace(go.Scatter(
+            x=df_traj['prior_x1'], y=df_traj['prior_y1'],
+            mode='lines', name=f'{group_name} - EKF (D1)',
+            line=dict(color=c, width=2, dash='dash'),
+            customdata=df_traj['time_sec'],
+            hovertemplate=hover_template,
+            legendgroup=group_name
+        ))
+
+        # --- 3. Mesures GPS D1 ---
+        df_gps = df_traj[df_traj['has_gps'] == 1.0]
+        fig.add_trace(go.Scatter(
+            x=df_gps['prior_x1'] + df_gps['y_gps_x1'], 
+            y=df_gps['prior_y1'] + df_gps['y_gps_y1'],
+            mode='markers', name=f'{group_name} - GPS (D1)',
+            marker=dict(color=c, size=6, symbol='x'),
+            customdata=df_gps['time_sec'],
+            hovertemplate="<b>Mesure GPS</b><br>" + hover_template,
+            legendgroup=group_name
+        ))
+
+        # --- (Optionnel) Drone 2 masqué par défaut ---
+        fig.add_trace(go.Scatter(
+            x=df_traj['true_x2'], y=df_traj['true_y2'],
+            mode='lines', name=f'{group_name} - Vérité (D2)',
+            line=dict(color=c, width=2, dash='dot'),
+            visible='legendonly',
+            legendgroup=group_name
+        ))
+
+    # Mise en page du graphique
+    fig.update_layout(
+        title=f"<b>Analyse Multi-Trajectoires ({len(ids_to_plot)} trajectoires affichées)</b>",
+        xaxis_title="Position X (mètres)",
+        yaxis_title="Position Y (mètres)",
+        yaxis=dict(scaleanchor="x", scaleratio=1), 
+        template="plotly_white",
+        hovermode="closest",
+        legend=dict(
+            title="Double-cliquez sur un nom pour isoler la trajectoire :",
+            itemsizing='constant',
+            groupclick="toggleitem" # Permet de manipuler le groupe facilement
+        ),
+        margin=dict(l=20, r=20, t=60, b=20)
+    )
+
+    # Exportation et Affichage
+    output_filename = "multi_trajectoires_interactive.html"
+    fig.write_html(output_filename)
+    print(f"✅ Fichier HTML généré avec succès : {output_filename}")
+    fig.show()
+
+if __name__ == "__main__":
+    # EXEMPLE 1 : Afficher 3 trajectoires prises au hasard
+    generate_multi_trajectory_plot(num_traj_to_plot=3)
+    
+    # EXEMPLE 2 : Décommenter la ligne ci-dessous pour afficher des IDs précis :
+    # generate_multi_trajectory_plot(specific_ids=[0, 15, 42])
+
+
+import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
