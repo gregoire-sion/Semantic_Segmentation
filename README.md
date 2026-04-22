@@ -3,6 +3,232 @@ import torch
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import os # Ajouté pour s'assurer que le dossier plot/ existe
+
+model_path = "../weights/train6/kalmannet_independent.pth"
+test_set_path = "../../dataset/test_set/kalman_dataset_test.pkl"
+
+# ==========================================
+# 1. LA CLASSE EKF CLASSIQUE (POUR COMPRENDRE)
+# ==========================================
+class EKF_Explicite:
+    def __init__(self, state_dim=4, obs_dim=4):
+        self.state_dim = state_dim
+        self.obs_dim = obs_dim
+        
+        # --- MATRICES DE BRUIT (À MODIFIER POUR TESTER) ---
+        # Q = Bruit de processus. Plus il est grand, moins on fait confiance aux commandes IMU
+        self.Q = torch.eye(state_dim) * 0.01 
+        
+        # R = Bruit de mesure. Plus il est grand, moins on fait confiance au GPS
+        self.R = torch.eye(obs_dim) * 0.5    
+        
+        # H = Matrice d'observation. Ici, on observe directement les 4 états (x1, y1, x2, y2) via le GPS
+        self.H = torch.eye(obs_dim, state_dim) 
+        self.I = torch.eye(state_dim)
+
+    def forward(self, initial_state, raw_measurements, physical_displacements):
+        batch_size, seq_len, _ = physical_displacements.size()
+        device = physical_displacements.device
+        
+        Q = self.Q.to(device)
+        R = self.R.to(device)
+        H = self.H.to(device)
+        I = self.I.to(device)
+        
+        x_est = initial_state
+        # P = Matrice de covariance de l'erreur (l'incertitude du filtre)
+        P_est = torch.eye(self.state_dim).unsqueeze(0).repeat(batch_size, 1, 1).to(device)
+        
+        estimations = []
+
+        for t in range(seq_len):
+            # ===============================================
+            # ÉTAPE 1 : PRÉDICTION (Physique & Commandes)
+            # ===============================================
+            u_t = physical_displacements[:, t, :] # La "commande" : Delta X, Delta Y...
+            
+            x_pred = x_est + u_t                  # On avance "à l'aveugle"
+            P_pred = P_est + Q.unsqueeze(0)       # L'incertitude augmente car on a bougé
+            
+            # ===============================================
+            # ÉTAPE 2 : MISE À JOUR (Mesures GPS)
+            # ===============================================
+            z_t = raw_measurements[:, t, 0:4]     # La "mesure" : Position GPS brute
+            
+            # Innovation : Erreur entre ce qu'on a mesuré et ce qu'on avait prédit
+            y_t = z_t - torch.matmul(x_pred, H.transpose(0, 1))
+            
+            # Calculs classiques de l'EKF pour trouver K
+            H_batch = H.unsqueeze(0).repeat(batch_size, 1, 1)
+            H_T_batch = H.transpose(0, 1).unsqueeze(0).repeat(batch_size, 1, 1)
+            
+            # S = H * P * H^T + R
+            S = torch.bmm(H_batch, torch.bmm(P_pred, H_T_batch)) + R.unsqueeze(0)
+            
+            # Gain K = P * H^T * S^-1
+            S_inv = torch.inverse(S)
+            K = torch.bmm(torch.bmm(P_pred, H_T_batch), S_inv)
+            
+            # Correction de l'état
+            x_est = x_pred + torch.bmm(K, y_t.unsqueeze(-1)).squeeze(-1)
+            
+            # Mise à jour de l'incertitude (Elle diminue grâce à la mesure)
+            P_est = torch.bmm(I.unsqueeze(0) - torch.bmm(K, H_batch), P_pred)
+            
+            estimations.append(x_est)
+
+        return torch.stack(estimations, dim=1)
+
+# ==========================================
+# 2. L'ARCHITECTURE KALMANNET (IA)
+# ==========================================
+class KalmanNet_Independent(nn.Module):
+    def __init__(self, feature_dim=17, obs_dim=5, state_pos_dim=4, hidden_dim=64):
+        super(KalmanNet_Independent, self).__init__()
+        self.state_pos_dim = state_pos_dim
+        self.hidden_dim = hidden_dim
+        self.obs_dim = obs_dim
+        
+        self.bn = nn.BatchNorm1d(feature_dim)
+        self.gru_cell = nn.GRUCell(input_size=feature_dim, hidden_size=hidden_dim)
+        self.activation = nn.Tanh()
+        self.fc = nn.Linear(hidden_dim, state_pos_dim * obs_dim)
+       
+        nn.init.normal_(self.fc.weight, mean=0.0, std=0.0001)
+        nn.init.constant_(self.fc.bias, 0.0)
+        
+    def forward(self, initial_state, sequence_features, raw_measurements, physical_displacements):
+        batch_size, seq_len, _ = sequence_features.size()
+        device = sequence_features.device
+
+        sequence_features = self.bn(sequence_features.transpose(1,2)).transpose(1,2)
+        
+        hidden = torch.zeros(batch_size, self.hidden_dim).to(device)
+        x_est = initial_state
+        estimations = []
+
+        for t in range(seq_len):
+            # 1. Prédiction physique
+            x_pred = x_est + physical_displacements[:, t, :]
+            
+            # 2. Innovation
+            y_gps_knet = raw_measurements[:, t, 0:4] - x_pred 
+            y_gps_knet = torch.clamp(y_gps_knet, min=-5.0, max=5.0) 
+            
+            current_feature = sequence_features[:, t, :].clone()
+            current_feature[:, 2:6] = y_gps_knet 
+            
+            # 3. Réseau pour K
+            hidden = self.gru_cell(current_feature, hidden)
+            K_flat = self.fc(self.activation(hidden))
+            K = K_flat.view(batch_size, self.state_pos_dim, self.obs_dim)
+            
+            # 4. Correction
+            y_t_full = current_feature[:, 2:7].unsqueeze(-1)
+            state_update = torch.bmm(K, y_t_full).squeeze(-1)
+            
+            x_est = x_pred + state_update
+            estimations.append(x_est)
+
+        return torch.stack(estimations, dim=1)
+
+# ==========================================
+# 3. SCRIPT DE TEST
+# ==========================================
+def test_independent_models(model_path, data_path):
+    device = torch.device("cpu") 
+    print(f"🔄 Test Indépendant : EKF Explicite vs KalmanNet")
+
+    # --- PRÉPARATION DES DONNÉES ---
+    df = pd.read_pickle(data_path)
+    df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+    
+    num_trajectories = df['traj_id'].nunique()
+    seq_len = df['time_step'].nunique()
+    
+    data_tensor = torch.tensor(df.drop(columns=['traj_id', 'time_step']).values, dtype=torch.float32).view(num_trajectories, seq_len, -1)
+    
+    features = data_tensor[:, :, 0:17]
+    priors_ekf = data_tensor[:, :, 17:21]
+    truths = data_tensor[:, :, 21:25]
+    ekf_innovations = data_tensor[:, :, 2:7]
+    
+    # RECONSTRUCTION : Mesures brutes et commandes IMU
+    raw_measurements = torch.zeros_like(ekf_innovations)
+    raw_measurements[:, :, 0:4] = priors_ekf + ekf_innovations[:, :, 0:4]
+    raw_measurements[:, :, 4] = ekf_innovations[:, :, 4]
+    
+    physical_displacements = torch.zeros_like(priors_ekf)
+    physical_displacements[:, 1:, :] = priors_ekf[:, 1:, :] - priors_ekf[:, :-1, :]
+    
+    initial_state = truths[:, 0, :]
+
+    # --- TRAJECTOIRE DE L'EKF EXPLICITE (Maths) ---
+    print("🧮 Exécution de l'EKF Explicite...")
+    my_ekf = EKF_Explicite()
+    ekf_estimations = my_ekf.forward(initial_state, raw_measurements, physical_displacements)
+
+    # --- TRAJECTOIRE DU KALMANNET (IA) ---
+    print("🧠 Exécution du KalmanNet...")
+    model = KalmanNet_Independent()
+    
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=device))
+    else:
+        print(f"⚠️ Attention : Fichier de poids {model_path} introuvable. Le réseau n'est pas entraîné !")
+        
+    model.eval()
+    with torch.no_grad():
+        knet_estimations = model(initial_state, features, raw_measurements, physical_displacements)
+
+    # --- CALCUL DES MÉTRIQUES ---
+    err_ekf_d1 = torch.sqrt((ekf_estimations[:,:,0]-truths[:,:,0])**2 + (ekf_estimations[:,:,1]-truths[:,:,1])**2)
+    err_knet_d1 = torch.sqrt((knet_estimations[:,:,0]-truths[:,:,0])**2 + (knet_estimations[:,:,1]-truths[:,:,1])**2)
+    
+    rmse_ekf = torch.mean(err_ekf_d1).item()
+    rmse_knet = torch.mean(err_knet_d1).item()
+
+    print("\n" + "="*50)
+    print("🏆 RÉSULTATS DU MATCH")
+    print("="*50)
+    print(f"RMSE EKF Explicite : {rmse_ekf:.4f} mètres")
+    print(f"RMSE KalmanNet     : {rmse_knet:.4f} mètres")
+    print(f"Différence         : {((rmse_ekf - rmse_knet) / rmse_ekf) * 100:.2f} %")
+    print("="*50)
+
+    # --- GRAPHIQUE DE COMPARAISON ---
+    if not os.path.exists("plot"):
+        os.makedirs("plot")
+
+    traj_idx = 0 
+    plt.figure(figsize=(14, 8))
+    
+    plt.plot(truths[traj_idx, :, 0].numpy(), truths[traj_idx, :, 1].numpy(), 'k-', linewidth=3, label="Vérité Terrain")
+    plt.plot(ekf_estimations[traj_idx, :, 0].numpy(), ekf_estimations[traj_idx, :, 1].numpy(), 'r--', linewidth=2, label="Mon EKF Explicite")
+    plt.plot(knet_estimations[traj_idx, :, 0].numpy(), knet_estimations[traj_idx, :, 1].numpy(), 'b-', linewidth=2, label="KalmanNet")
+    
+    # Points GPS en arrière-plan pour comprendre le bruit
+    plt.scatter(raw_measurements[traj_idx, :, 0].numpy(), raw_measurements[traj_idx, :, 1].numpy(), color='green', marker='x', s=10, alpha=0.3, label="Mesures GPS Brutes")
+    
+    plt.title(f"Comparaison de Navigation (Trajectoire #{traj_idx})", fontsize=16, fontweight='bold')
+    plt.xlabel("Position X (m)")
+    plt.ylabel("Position Y (m)")
+    plt.legend(loc="best")
+    plt.grid(True)
+    plt.axis('equal')
+    
+    plt.savefig("plot/match_independant_ekf_vs_knet.png", dpi=300)
+    print("📈 Graphique sauvegardé sous 'plot/match_independant_ekf_vs_knet.png'")
+    plt.show()
+
+if __name__ == "__main__":
+    test_independent_models(model_path, test_set_path)
+import torch.nn as nn
+import torch
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 import seaborn as sns
 model_path = "../weights/train6/kalmannet_independent.pth"
 test_set_path = "../../dataset/test_set/kalman_dataset_test.pkl"
