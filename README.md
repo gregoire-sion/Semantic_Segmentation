@@ -1,6 +1,183 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset, random_split
+from tqdm import tqdm
+import pandas as pd
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. L'ARCHITECTURE INDÉPENDANTE
+# ==========================================
+class KalmanNet_Independent(nn.Module):
+    def __init__(self, feature_dim=17, obs_dim=5, state_pos_dim=4, hidden_dim=64):
+        super(KalmanNet_Independent, self).__init__()
+        self.state_pos_dim = state_pos_dim
+        self.hidden_dim = hidden_dim
+        self.obs_dim = obs_dim
+        
+        self.bn = nn.BatchNorm1d(feature_dim)
+        self.gru_cell = nn.GRUCell(input_size=feature_dim, hidden_size=hidden_dim)
+        self.activation = nn.Tanh()
+        self.fc = nn.Linear(hidden_dim, state_pos_dim * obs_dim)
+
+        # Initialisation stable
+        nn.init.normal_(self.fc.weight, mean=0.0, std=0.0001)
+        nn.init.constant_(self.fc.bias, 0.0)
+
+    def forward(self, initial_state, sequence_features, raw_measurements, physical_displacements):
+        batch_size, seq_len, _ = sequence_features.size()
+        device = sequence_features.device
+        
+        # Normalisation
+        sequence_features = self.bn(sequence_features.transpose(1, 2)).transpose(1, 2)
+        
+        hidden = torch.zeros(batch_size, self.hidden_dim).to(device)
+        x_est = initial_state
+        estimations = []
+
+        # On peut limiter la séquence à 400 pour accélérer l'entraînement
+        max_steps = min(seq_len, 400) 
+
+        for t in range(max_steps):
+            x_pred = x_est + physical_displacements[:, t, :]
+            y_gps_knet = raw_measurements[:, t, 0:4] - x_pred 
+            
+            # Sécurité anti-explosion (clamping)
+            y_gps_knet = torch.clamp(y_gps_knet, min=-5.0, max=5.0)
+            
+            current_feature = sequence_features[:, t, :].clone()
+            current_feature[:, 2:6] = y_gps_knet 
+            
+            hidden = self.gru_cell(current_feature, hidden)
+            K_flat = self.fc(self.activation(hidden))
+            K = K_flat.view(batch_size, self.state_pos_dim, self.obs_dim)
+            
+            y_t_full = current_feature[:, 2:7].unsqueeze(-1)
+            state_update = torch.bmm(K, y_t_full).squeeze(-1)
+            
+            x_est = x_pred + state_update
+            estimations.append(x_est)
+
+        return torch.stack(estimations, dim=1)
+
+# ==========================================
+# 2. FONCTION DE TRACÉ
+# ==========================================
+def save_loss_plot(history):
+    plt.figure(figsize=(10, 6))
+    plt.plot(history['train_loss'], label='Train Loss', color='blue', linewidth=2)
+    plt.plot(history['val_loss'], label='Val Loss', color='red', linestyle='--', linewidth=2)
+    plt.title("Convergence du KalmanNet Indépendant", fontsize=14)
+    plt.xlabel("Époque")
+    plt.ylabel("Loss (SmoothL1)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig("weights/loss_curve.png")
+    print("📊 Graphique sauvegardé : weights/loss_curve.png")
+
+# ==========================================
+# 3. ENTRAÎNEMENT
+# ==========================================
+def train():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🚀 Training on: {device}")
+
+    # Chargement
+    df = pd.read_pickle("data/kalman_dataset_gpu_.pkl")
+    num_trajectories = df['traj_id'].nunique()
+    seq_len = df['time_step'].nunique()
+    
+    data_tensor = torch.tensor(df.drop(columns=['traj_id', 'time_step']).values, dtype=torch.float32).view(num_trajectories, seq_len, -1)
+    
+    # Préparation des tenseurs
+    features = data_tensor[:, :, 0:17]
+    priors_ekf = data_tensor[:, :, 17:21]
+    truths = data_tensor[:, :, 21:25]
+    ekf_innovations = data_tensor[:, :, 2:7]
+    
+    raw_measurements = torch.zeros_like(ekf_innovations)
+    raw_measurements[:, :, 0:4] = priors_ekf + ekf_innovations[:, :, 0:4]
+    raw_measurements[:, :, 4] = ekf_innovations[:, :, 4]
+    
+    physical_displacements = torch.zeros_like(priors_ekf)
+    physical_displacements[:, 1:, :] = priors_ekf[:, 1:, :] - priors_ekf[:, :-1, :]
+    
+    initial_states = truths[:, 0, :]
+
+    # --- SPLIT TRAIN/VAL (80% / 20%) ---
+    full_dataset = TensorDataset(initial_states, features, raw_measurements, physical_displacements, truths)
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_set, val_set = random_split(full_dataset, [train_size, val_size])
+
+    # Utilise ton batch_size de 128 ici
+    train_loader = DataLoader(train_set, batch_size=128, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=128, shuffle=False)
+
+    model = KalmanNet_Independent().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.0001)
+    criterion = nn.SmoothL1Loss()
+
+    history = {'epoch': [], 'train_loss': [], 'val_loss': []}
+    epochs = 100
+    if not os.path.exists("weights"): os.makedirs("weights")
+
+    for epoch in range(epochs):
+        # --- PHASE ENTRAÎNEMENT ---
+        model.train()
+        train_loss_accum = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
+        for b_init, b_feat, b_raw, b_phys, b_truth in pbar:
+            b_init, b_feat, b_raw, b_phys, b_truth = b_init.to(device), b_feat.to(device), b_raw.to(device), b_phys.to(device), b_truth.to(device)
+            
+            optimizer.zero_grad()
+            preds = model(b_init, b_feat, b_raw, b_phys)
+            # On compare sur la longueur de la prédiction (ex: 400 pas)
+            loss = criterion(preds, b_truth[:, :preds.size(1), :])
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_loss_accum += loss.item()
+            pbar.set_postfix({'loss': f"{loss.item():.5f}"})
+
+        avg_train_loss = train_loss_accum / len(train_loader)
+
+        # --- PHASE VALIDATION ---
+        model.eval()
+        val_loss_accum = 0
+        with torch.no_grad():
+            for b_init, b_feat, b_raw, b_phys, b_truth in val_loader:
+                b_init, b_feat, b_raw, b_phys, b_truth = b_init.to(device), b_feat.to(device), b_raw.to(device), b_phys.to(device), b_truth.to(device)
+                preds = model(b_init, b_feat, b_raw, b_phys)
+                loss = criterion(preds, b_truth[:, :preds.size(1), :])
+                val_loss_accum += loss.item()
+
+        avg_val_loss = val_loss_accum / len(val_loader)
+        
+        # Enregistrement
+        history['epoch'].append(epoch + 1)
+        history['train_loss'].append(avg_train_loss)
+        history['val_loss'].append(avg_val_loss)
+        
+        print(f"✅ Epoch {epoch+1}: Train={avg_train_loss:.6f} | Val={avg_val_loss:.6f}")
+
+        # Sauvegarde du CSV à chaque époque (sécurité si tu arrêtes avant la fin)
+        pd.DataFrame(history).to_csv("weights/training_history.csv", index=False)
+
+    torch.save(model.state_dict(), "weights/kalmannet_independent.pth")
+    save_loss_plot(history)
+    print("🏁 Entraînement terminé.")
+
+if __name__ == "__main__":
+    train()
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm  # Pour la barre de progression
 import pandas as pd
