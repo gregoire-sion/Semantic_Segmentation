@@ -1,6 +1,167 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm  # Pour la barre de progression
+import pandas as pd
+import numpy as np
+import os
+
+train_dir = "train6"
+dataset_path = "../dataset/train_set/kalman_dataset_train.pkl"
+# ==========================================
+# 1. L'ARCHITECTURE INDÉPENDANTE (BOUCLE FERMÉE)
+# ==========================================
+class KalmanNet_Independent(nn.Module):
+    def __init__(self, feature_dim=17, obs_dim=5, state_pos_dim=4, hidden_dim=64):
+        super(KalmanNet_Independent, self).__init__()
+        self.state_pos_dim = state_pos_dim
+        self.hidden_dim = hidden_dim
+        self.obs_dim = obs_dim
+        
+        self.bn = nn.BatchNorm1d(feature_dim)
+
+        self.gru_cell = nn.GRUCell(input_size=feature_dim, hidden_size=hidden_dim)
+        self.activation = nn.Tanh()
+        self.fc = nn.Linear(hidden_dim, state_pos_dim * obs_dim)
+       
+        nn.init.normal_(self.fc.weight,mean=0.0,std=0.0001)
+        nn.init.constant_(self.fc.bias,0.0)
+        
+    def forward(self, initial_state, sequence_features, raw_measurements, physical_displacements):
+        batch_size, seq_len, _ = sequence_features.size()
+        device = sequence_features.device
+
+        sequence_features = self.bn(sequence_features.transpose(1,2)).transpose(1,2)
+        
+        hidden = torch.zeros(batch_size, self.hidden_dim).to(device)
+        x_est = initial_state
+        estimations = []
+
+        for t in range(seq_len):
+            # 1. Prédiction physique (Indépendante)
+            x_pred = x_est + physical_displacements[:, t, :]
+            
+            # 2. Calcul de l'innovation interne
+            y_gps_knet = raw_measurements[:, t, 0:4] - x_pred 
+            
+            y_gps_knet = torch.clamp(y_gps_knet, min=-5.0, max=5.0) #on bride à + ou -5m
+            current_feature = sequence_features[:, t, :].clone()
+            current_feature[:, 2:6] = y_gps_knet 
+            
+            # 3. Réseau de neurones pour K
+            hidden = self.gru_cell(current_feature, hidden)
+            K_flat = self.fc(self.activation(hidden))
+            K = K_flat.view(batch_size, self.state_pos_dim, self.obs_dim)
+            
+            # 4. Correction
+            y_t_full = current_feature[:, 2:7].unsqueeze(-1)
+            state_update = torch.bmm(K, y_t_full).squeeze(-1)
+            
+            x_est = x_pred + state_update
+            estimations.append(x_est)
+
+        return torch.stack(estimations, dim=1)
+
+# ==========================================
+# 2. FONCTION D'ENTRAÎNEMENT
+# ==========================================
+def train():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f" Initialisation de l'entraînement sur : {device}")
+
+    # Nettoyage préventif
+    torch.cuda.empty_cache()
+
+    # --- Chargement des données ---
+    if not os.path.exists(dataset_path):
+        print(" Erreur : Dataset introuvable.")
+        return
+    
+    df = pd.read_pickle(dataset_path)
+    df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+    num_trajectories = df['traj_id'].nunique()
+    seq_len = df['time_step'].nunique()
+    
+    
+
+    print(f" Chargement de {num_trajectories} trajectoires...")
+    data_tensor = torch.tensor(df.drop(columns=['traj_id', 'time_step']).values, dtype=torch.float32).view(num_trajectories, seq_len, -1)
+    
+    features = data_tensor[:, :, 0:17]
+    priors_ekf = data_tensor[:, :, 17:21]
+    truths = data_tensor[:, :, 21:25]
+    ekf_innovations = data_tensor[:, :, 2:7]
+    
+    # Reconstruction physique
+    raw_measurements = torch.zeros_like(ekf_innovations)
+    raw_measurements[:, :, 0:4] = priors_ekf + ekf_innovations[:, :, 0:4]
+    raw_measurements[:, :, 4] = ekf_innovations[:, :, 4]
+    
+    physical_displacements = torch.zeros_like(priors_ekf)
+    physical_displacements[:, 1:, :] = priors_ekf[:, 1:, :] - priors_ekf[:, :-1, :]
+    
+    initial_states = truths[:, 0, :]
+
+    # --- Création du DataLoader ---
+    # On réduit le batch_size à 4 pour garantir la stabilité sur GPU
+    dataset = TensorDataset(initial_states, features, raw_measurements, physical_displacements, truths)
+    loader = DataLoader(dataset, batch_size=256, shuffle=True)
+
+    # --- Setup Modèle ---
+    model = KalmanNet_Independent().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.0001)
+    criterion = nn.SmoothL1Loss()
+
+    epochs = 100
+    if not os.path.exists("weights"): os.makedirs("weights")
+
+    print(" Début de l'entraînement...")
+    
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        
+        # Barre de progression
+        progress_bar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}", unit="batch")
+        
+        for b_init, b_feat, b_raw, b_phys, b_truth in progress_bar:
+            b_init = b_init.to(device)
+            b_feat = b_feat.to(device)
+            b_raw = b_raw.to(device)
+            b_phys = b_phys.to(device)
+            b_truth = b_truth.to(device)
+            
+            optimizer.zero_grad()
+            
+            # Inférence (Boucle temporelle interne)
+            estimations = model(b_init, b_feat, b_raw, b_phys)
+            
+            loss = criterion(estimations, b_truth)
+            loss.backward()
+            
+            # Clip gradients pour éviter les instabilités du GRU
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            total_loss += loss.item()
+            progress_bar.set_postfix(loss=f"{loss.item():.5f}")
+
+        avg_loss = total_loss / len(loader)
+        print(f" Epoch {epoch+1} terminée | Loss Moyenne: {avg_loss:.6f}")
+
+    # Sauvegarde finale
+    torch.save(model.state_dict(), f"weights/{train_dir}/kalmannet_independent.pth")
+    print(f" Poids sauvegardés : weights/{train_dir}/kalmannet_independent.pth")
+
+if __name__ == "__main__":
+    train()
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
 import pandas as pd
