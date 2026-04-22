@@ -1,3 +1,148 @@
+import torch.nn as nn
+import torch
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+model_path = "../weights/train6/kalmannet_independent.pth"
+test_set_path = "../../dataset/test_set/kalman_dataset_test.pkl"
+
+# IMPORTANT : On importe la classe qu'on vient de définir dans le script d'entraînement
+class KalmanNet_Independent(nn.Module):
+    def __init__(self, feature_dim=17, obs_dim=5, state_pos_dim=4, hidden_dim=64):
+        super(KalmanNet_Independent, self).__init__()
+        self.state_pos_dim = state_pos_dim
+        self.hidden_dim = hidden_dim
+        self.obs_dim = obs_dim
+        
+        self.bn = nn.BatchNorm1d(feature_dim)
+
+        self.gru_cell = nn.GRUCell(input_size=feature_dim, hidden_size=hidden_dim)
+        self.activation = nn.Tanh()
+        self.fc = nn.Linear(hidden_dim, state_pos_dim * obs_dim)
+       
+        nn.init.normal_(self.fc.weight,mean=0.0,std=0.0001)
+        nn.init.constant_(self.fc.bias,0.0)
+        
+    def forward(self, initial_state, sequence_features, raw_measurements, physical_displacements):
+        batch_size, seq_len, _ = sequence_features.size()
+        device = sequence_features.device
+
+        sequence_features = self.bn(sequence_features.transpose(1,2)).transpose(1,2)
+        
+        hidden = torch.zeros(batch_size, self.hidden_dim).to(device)
+        x_est = initial_state
+        estimations = []
+
+        for t in range(seq_len):
+            # 1. Prédiction physique (Indépendante)
+            x_pred = x_est + physical_displacements[:, t, :]
+            
+            # 2. Calcul de l'innovation interne
+            y_gps_knet = raw_measurements[:, t, 0:4] - x_pred 
+            
+            y_gps_knet = torch.clamp(y_gps_knet, min=-5.0, max=5.0) #on bride à + ou -5m
+            current_feature = sequence_features[:, t, :].clone()
+            current_feature[:, 2:6] = y_gps_knet 
+            
+            # 3. Réseau de neurones pour K
+            hidden = self.gru_cell(current_feature, hidden)
+            K_flat = self.fc(self.activation(hidden))
+            K = K_flat.view(batch_size, self.state_pos_dim, self.obs_dim)
+            
+            # 4. Correction
+            y_t_full = current_feature[:, 2:7].unsqueeze(-1)
+            state_update = torch.bmm(K, y_t_full).squeeze(-1)
+            
+            x_est = x_pred + state_update
+            estimations.append(x_est)
+
+        return torch.stack(estimations, dim=1)
+
+def test_independent_models(model_path, data_path):
+    device = torch.device("cpu") # Test sur CPU suffisant
+    print(f" Test Indépendant des Algorithmes de Navigation")
+
+    # --- 1. PRÉPARATION DES DONNÉES ---
+    df = pd.read_pickle(data_path)
+    num_trajectories = df['traj_id'].nunique()
+    seq_len = df['time_step'].nunique()
+    
+    data_tensor = torch.tensor(df.drop(columns=['traj_id', 'time_step']).values, dtype=torch.float32).view(num_trajectories, seq_len, -1)
+    
+    features = data_tensor[:, :, 0:17]
+    priors_ekf = data_tensor[:, :, 17:21]
+    truths = data_tensor[:, :, 21:25]
+    ekf_innovations = data_tensor[:, :, 2:7]
+    
+    # Reconstruction des mesures et déplacements (comme dans le train)
+    raw_measurements = torch.zeros_like(ekf_innovations)
+    raw_measurements[:, :, 0:4] = priors_ekf + ekf_innovations[:, :, 0:4]
+    raw_measurements[:, :, 4] = ekf_innovations[:, :, 4]
+    
+    physical_displacements = torch.zeros_like(priors_ekf)
+    physical_displacements[:, 1:, :] = priors_ekf[:, 1:, :] - priors_ekf[:, :-1, :]
+
+    # --- 2. TRAJECTOIRE DE L'EKF CLASSIQUE ---
+    # L'EKF est déjà calculé dans ton dataset. Sa position finale à chaque pas est : Prior + Correction
+    pos_update_ekf = ekf_innovations[:, :, 0:4] # Approximation de la correction stockée
+    ekf_estimations = priors_ekf + pos_update_ekf
+
+    # --- 3. TRAJECTOIRE DU KALMANNET INDÉPENDANT ---
+    model = KalmanNet_Independent()
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    initial_state = truths[:, 0, :] # On part du même point
+
+    with torch.no_grad():
+        knet_estimations = model(initial_state, features, raw_measurements, physical_displacements)
+
+    # --- 4. CALCUL DES MÉTRIQUES ---
+    err_ekf_d1 = torch.sqrt((ekf_estimations[:,:,0]-truths[:,:,0])**2 + (ekf_estimations[:,:,1]-truths[:,:,1])**2)
+    err_knet_d1 = torch.sqrt((knet_estimations[:,:,0]-truths[:,:,0])**2 + (knet_estimations[:,:,1]-truths[:,:,1])**2)
+    
+    rmse_ekf = torch.mean(err_ekf_d1).item()
+    rmse_knet = torch.mean(err_knet_d1).item()
+
+    print("\n" + "="*50)
+    print(" RÉSULTATS DU MATCH (100% INDÉPENDANT)")
+    print("="*50)
+    print(f"RMSE Baseline (EKF) : {rmse_ekf:.4f} mètres")
+    print(f"RMSE KalmanNet      : {rmse_knet:.4f} mètres")
+    print(f"Amélioration        : {((rmse_ekf - rmse_knet) / rmse_ekf) * 100:.2f} %")
+    print("="*50)
+
+    # --- 5. GRAPHIQUE DE COMPARAISON ---
+    traj_idx = 0 # On affiche la première trajectoire
+    time_axis = np.arange(seq_len) * 0.01
+
+    plt.figure(figsize=(14, 8))
+    
+    # Plot Vérité
+    plt.plot(truths[traj_idx, :, 0].numpy(), truths[traj_idx, :, 1].numpy(), 'k-', linewidth=3, label="Vérité Terrain")
+    
+    # Plot EKF
+    plt.plot(ekf_estimations[traj_idx, :, 0].numpy(), ekf_estimations[traj_idx, :, 1].numpy(), 'r--', linewidth=2, label="EKF Classique (Autonome)")
+    
+    # Plot KalmanNet
+    plt.plot(knet_estimations[traj_idx, :, 0].numpy(), knet_estimations[traj_idx, :, 1].numpy(), 'b-', linewidth=2, label="KalmanNet (Autonome)")
+    
+    plt.title(f"Course Indépendante : EKF vs KalmanNet (Trajectoire #{traj_idx})", fontsize=16, fontweight='bold')
+    plt.xlabel("Position X (m)")
+    plt.ylabel("Position Y (m)")
+    plt.legend(loc="best")
+    plt.grid(True)
+    plt.axis('equal')
+    
+    plt.savefig("plot/match_independant_ekf_vs_knet.png", dpi=300)
+    print(" Graphique sauvegardé sous 'plot/match_independant_ekf_vs_knet.png'")
+    plt.show()
+
+if __name__ == "__main__":
+    test_independent_models(model_path, test_set_path)
+Est ce que tu peux me retourner ce code complet mais modifié pour avoir une classe ekf que je peux modifier par la suite pour mieux comprendre quelles sont les mesures et les commandes. 
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
