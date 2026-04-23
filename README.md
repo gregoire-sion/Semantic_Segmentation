@@ -6,6 +6,19 @@ Traceback (most recent call last):
     return forward_call(*input, **kwargs)
   File "/home/gsionsua/Work_bis/KalmanNet/src/models/ekf.py", line 67, in forward
     FP_pred = torch.bmm(F, P_est)
+RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu! (when checking argument for argument mat2 in method wrapper_bmm)
+
+
+
+
+(Environnement) scvmpr10.fr.mbda.priv:/home/gsionsua/Work_bis/KalmanNet/src/models $python test_ekf.py 
+Traceback (most recent call last):
+  File "/home/gsionsua/Work_bis/KalmanNet/src/models/test_ekf.py", line 86, in <module>
+    estimations = ekf(initial_state, dataset)
+  File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1130, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/home/gsionsua/Work_bis/KalmanNet/src/models/ekf.py", line 67, in forward
+    FP_pred = torch.bmm(F, P_est)
 RuntimeError: Expected all tensors to be on the same device, but f
 
 import torch
