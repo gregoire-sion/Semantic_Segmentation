@@ -1,3 +1,53 @@
+# --- 5. AFFICHAGE DES RÉSULTATS AVEC COULOIR DE CONFIANCE ---
+
+# 1. On récupère d'abord toutes les variables (sur le CPU pour Matplotlib)
+# [Batch 0, Toute la séquence, Feature]
+x_true = dataset[0, :, 0].cpu().numpy()
+x_est = estimations[0, :, 0].cpu().numpy()
+gps_x = dataset[0, ::dt_gps, 11].cpu().numpy()
+
+# 2. EXTRACTION ET CALCUL DE L'INCERTITUDE SUR X
+# Ton tenseur covariances est [Batch, Seq_len, 5, 5]
+# La variance de X est sur la diagonale à l'indice [0,0] de la matrice 5x5
+# On prend l'indice [0, :, 0, 0] : Batch 0, Toute la séquence, Ligne 0, Col 0
+var_x = covariances[0, :, 0, 0].cpu().numpy()
+
+# L'écart-type (sigma) est la racine carrée de la variance
+std_x = np.sqrt(var_x)
+
+# Calcul des enveloppes d'incertitude à 3-sigma (représente 99.7% de probabilité)
+upper_x = x_est + 3 * std_x
+lower_x = x_est - 3 * std_x
+
+# 3. TRACÉ DU GRAPHIQUE
+t_steps = np.arange(seq_len) * dt # Axe de temps en secondes
+
+plt.figure(figsize=(14, 7))
+
+# a. La vérité terrain (ligne pointillée noire)
+plt.plot(t_steps, x_true, 'k--', label="Vérité Terrain", alpha=0.7)
+
+# b. Ton estimation EKF (ligne bleue)
+plt.plot(t_steps, x_est, 'b', label="Estimation EKF", linewidth=2)
+
+# c. LE COULOIR DE CONFIANCE (Zone bleue transparente)
+# C'est ici que la magie opère !
+plt.fill_between(t_steps, lower_x, upper_x, color='blue', alpha=0.15, label="Incertitude $3\sigma$ (EKF)")
+
+# d. Les points GPS (croix rouges)
+# Rappel : un point tous les dt_gps
+plt.scatter(t_steps[::dt_gps], gps_x, c='r', marker='x', s=50, label="Mesures GPS", zorder=5)
+
+plt.title("Position X avec Enveloppe d'Incertitude à $\pm 3\sigma$")
+plt.xlabel("Temps (secondes)")
+plt.ylabel("Position X (m)")
+plt.legend()
+plt.grid(True, linestyle='-', alpha=0.5)
+
+plt.tight_layout()
+plt.show()
+
+
 # --- 5. AFFICHAGE DES RÉSULTATS (X et Y en fonction du temps) ---
 
 # 1. On extrait d'abord toutes les variables (sur le CPU pour Matplotlib)
