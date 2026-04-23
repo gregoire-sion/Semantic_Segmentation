@@ -1,3 +1,39 @@
+# --- 5. AFFICHAGE DES RÉSULTATS (X et Y en fonction du temps) ---
+
+# Création d'un axe de temps (en secondes)
+t_steps = np.arange(seq_len) * dt
+
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+# ---- GRAPHIQUE 1 : X en fonction du temps ----
+ax1.plot(t_steps, x_true, label="Vrai X (Vérité)", color='black', linestyle='--')
+ax1.plot(t_steps, x_est, label="X estimé (EKF)", color='blue', linewidth=2)
+# Les points GPS n'existent que tous les dt_gps
+ax1.scatter(t_steps[::dt_gps], gps_x, label="GPS X (Bruité)", color='red', marker='x', zorder=5)
+
+ax1.set_ylabel("Position X (m)")
+ax1.set_title("Évolution de la coordonnée X dans le temps")
+ax1.legend()
+ax1.grid(True)
+
+# ---- GRAPHIQUE 2 : Y en fonction du temps ----
+ax2.plot(t_steps, y_true, label="Vrai Y (Vérité)", color='black', linestyle='--')
+ax2.plot(t_steps, y_est, label="Y estimé (EKF)", color='blue', linewidth=2)
+ax2.scatter(t_steps[::dt_gps], gps_y, label="GPS Y (Bruité)", color='red', marker='x', zorder=5)
+
+ax2.set_ylabel("Position Y (m)")
+ax2.set_xlabel("Temps (secondes)")
+ax2.set_title("Évolution de la coordonnée Y dans le temps")
+ax2.legend()
+ax2.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+
+
+
+
 (Environnement) scvmpr10.fr.mbda.priv:/home/gsionsua/Work_bis/KalmanNet/src/models $python test_ekf.py 
 Traceback (most recent call last):
   File "/home/gsionsua/Work_bis/KalmanNet/src/models/test_ekf.py", line 86, in <module>
