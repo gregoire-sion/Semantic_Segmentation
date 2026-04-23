@@ -1,4 +1,64 @@
-# --- 5. AFFICHAGE DES RÉSULTATS (X et Y en fonction du temps) ---
+# --- 5. AFFICHAGE DES RÉSULTATS AVEC COULOIRS DE COVARIANCE ---
+
+# 1. Extraction des variables
+x_true = dataset[0, :, 0].cpu().numpy()
+y_true = dataset[0, :, 2].cpu().numpy()
+
+x_est = estimations[0, :, 0].cpu().numpy()
+y_est = estimations[0, :, 2].cpu().numpy()
+
+# Extraction des variances (diagonale de la matrice P)
+# var_x est à l'indice [0,0], var_y est à l'indice [2,2]
+var_x = covariances[0, :, 0, 0].cpu().numpy()
+var_y = covariances[0, :, 2, 2].cpu().numpy()
+
+# Calcul des écarts-types (sigma)
+std_x = np.sqrt(var_x)
+std_y = np.sqrt(var_y)
+
+gps_x = dataset[0, ::dt_gps, 11].cpu().numpy()
+gps_y = dataset[0, ::dt_gps, 12].cpu().numpy()
+
+# 2. Création de l'axe de temps
+t_steps = np.arange(seq_len) * dt
+
+# 3. Tracé des graphiques
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+
+# ---- GRAPHIQUE 1 : X en fonction du temps ----
+ax1.plot(t_steps, x_true, label="Vrai X (Vérité)", color='black', linestyle='--', alpha=0.6)
+ax1.plot(t_steps, x_est, label="X estimé (EKF)", color='blue', linewidth=2)
+
+# Ajout du couloir de confiance 3-sigma pour X
+ax1.fill_between(t_steps, x_est - 3*std_x, x_est + 3*std_x, color='blue', alpha=0.2, label="Incertitude $3\sigma$")
+
+ax1.scatter(t_steps[::dt_gps], gps_x, label="GPS X (Bruité)", color='red', marker='x', zorder=5)
+ax1.set_ylabel("Position X (m)")
+ax1.set_title("Évolution de X avec couloir de confiance")
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+# ---- GRAPHIQUE 2 : Y en fonction du temps ----
+ax2.plot(t_steps, y_true, label="Vrai Y (Vérité)", color='black', linestyle='--', alpha=0.6)
+ax2.plot(t_steps, y_est, label="Y estimé (EKF)", color='darkorange', linewidth=2)
+
+# Ajout du couloir de confiance 3-sigma pour Y
+ax2.fill_between(t_steps, y_est - 3*std_y, y_est + 3*std_y, color='darkorange', alpha=0.2, label="Incertitude $3\sigma$")
+
+ax2.scatter(t_steps[::dt_gps], gps_y, label="GPS Y (Bruité)", color='red', marker='x', zorder=5)
+ax2.set_ylabel("Position Y (m)")
+ax2.set_xlabel("Temps (secondes)")
+ax2.set_title("Évolution de Y avec couloir de confiance")
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+ 
+ 
+ 
+ --- 5. AFFICHAGE DES RÉSULTATS (X et Y en fonction du temps) ---
 
 # 1. On extrait d'abord toutes les variables (sur le CPU pour Matplotlib)
 x_true = dataset[0, :, 0].cpu().numpy()
