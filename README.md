@@ -6,6 +6,100 @@ from base_filter import BaseFilter
 class EKF(BaseFilter):
     "Filtre de Kalman Etendu classique"
 
+    def __init__(self, state_dim=5, obs_dim=2, q_noise=0.1, r_noise=0.1):
+        super().__init__(state_dim, obs_dim)
+        self.q_noise = q_noise
+        self.r_noise = r_noise
+        H = torch.zeros((obs_dim,state_dim))
+        H[0,0] = 1.0
+        H[1,2] = 1.0
+
+        self.register_buffer('Q', torch.eye(state_dim)*q_noise)
+        self.register_buffer('R', torch.eye(obs_dim)*r_noise)
+        self.register_buffer('H', H)
+        self.register_buffer('I', torch.eye(state_dim))
+
+    def forward(self, inital_state, dataset, imu_measure, gps_mask):
+        
+        #-------------------
+        #---INITALIATION----
+        #-------------------
+        x_pred = inital_state # [Batch_size, state_dim] x, vx, y, vy, theta
+        dt = dataset[0,0,8]
+        dt_gps = dataset[0,0,9]
+        dt_imu = dataset[0,0,10]
+        
+        x_true = dataset[:,:,0:3] # les vraies valeurs (le true)
+        ax = dataset[:,0,5] # x,vx,y,vy,ax,ay,omega
+        ay = dataset[:,0,6]
+        omega = dataset[:,0,7]
+
+        batch_size, seq_len, _ = dataset.size()
+
+        F = torch.eye(self.state_dim,device=self.device).unsqueeze(0).repeat(batch_size,1,1)
+        P_pred = torch.eye(self.state_dim,device=self.device).unsqueeze(0).repeat(batch_size,1,1) * 0.1
+        
+        estimations = [x_pred]
+
+        for t in range (seq_len):
+
+            if t % dt_imu == 0 :
+                ax = ax[:,t,0]
+                ay = ay[:,t,1]
+                omega = omega[:,t,2]
+
+            #--------------------
+            #ETAPE DE PROPAGATION
+            #--------------------
+            theta_old = x_est[:,4]
+            x_pred[:,0] = x_est[:,0] + x_est[:,1]*dt
+            x_pred[:,1] = x_est[:,1] + (ax*torch.cos(theta_old) - ay*torch.sin(theta_old))*dt
+            x_pred[:,2] = x_est[:,2] + x_est[:,3]*dt
+            x_pred[:,3] = x_est[:,3] + (ax*torch.sin(theta_old) + ay*torch.cos(theta_old))*dt
+            x_pred[:,4] = x_est[::4] + omega*dt
+            
+            theta_new = x_pred[:,4]
+            F[:,0,1] = dt
+            F[:,1,4] = -(ax*torch.sin(theta_new) + ay*torch.cos(theta_new))*dt    
+            F[:,2,3] = dt
+            F[:,3,4] = (ax*torch.cos(theta_new) - ay*torch.sin(theta_new))*dt
+
+            P_pred = torch.bmm(F, torch.bmm(P_est, F.transpose(1,2))) + self.Q.unsqueeze(0)
+            #--------------------
+            #ETAPE DE MISE A JOUR
+            #--------------------
+            if t % dt_gps == 0 : 
+                y = dataset[:,t,11:13] - torch.matmul(x_pred,self.H.t())
+                S = torch.matmul(self.H, torch.matmul(P_pred, self.H.t())) + self.R.unsqueeze(0)
+                K = torch.bmm(torch.matmul(P_pred, self.H.t()), torch.inverse(S))
+                x_est = x_pred + torch.bmm(K, y.unsqueeze(2)).squeeze(2)
+                P_est = torch.bmm(self.I.unsqueeze(0) - torch.matmul(K,self.H), P_pred)
+            
+            else :
+                x_est = x_pred
+                P_est = P_pred
+
+            estimations.append(x_est.clone())
+
+        estimations = torch.stack(estimations, dim=1)
+        return estimations
+
+    
+            
+    
+
+            
+
+
+
+import torch
+import torch.nn as nn
+import numpy as np
+from base_filter import BaseFilter
+
+class EKF(BaseFilter):
+    "Filtre de Kalman Etendu classique"
+
     def __init__(self, state_dim=5, obs_dim=4, q_noise=0.1, r_noise=0.1):
         super().__init__(state_dim, obs_dim)
         self.q_noise = q_noise
