@@ -1,3 +1,48 @@
+# --- 5. AFFICHAGE DES RÉSULTATS (X et Y en fonction du temps) ---
+
+# 1. On extrait d'abord toutes les variables (sur le CPU pour Matplotlib)
+x_true = dataset[0, :, 0].cpu().numpy()
+y_true = dataset[0, :, 2].cpu().numpy()
+
+x_est = estimations[0, :, 0].cpu().numpy()
+y_est = estimations[0, :, 2].cpu().numpy()
+
+var_x = covariances[0, :, 0, 0].cpu().numpy()
+
+gps_x = dataset[0, ::dt_gps, 11].cpu().numpy()
+gps_y = dataset[0, ::dt_gps, 12].cpu().numpy()
+
+# 2. Création d'un axe de temps (en secondes)
+t_steps = np.arange(seq_len) * dt
+
+# 3. Tracé des graphiques
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+# ---- GRAPHIQUE 1 : X en fonction du temps ----
+ax1.plot(t_steps, x_true, label="Vrai X (Vérité)", color='black', linestyle='--')
+ax1.plot(t_steps, x_est, label="X estimé (EKF)", color='blue', linewidth=2)
+ax1.scatter(t_steps[::dt_gps], gps_x, label="GPS X (Bruité)", color='red', marker='x', zorder=5)
+
+ax1.set_ylabel("Position X (m)")
+ax1.set_title("Évolution de la coordonnée X dans le temps")
+ax1.legend()
+ax1.grid(True)
+
+# ---- GRAPHIQUE 2 : Y en fonction du temps ----
+ax2.plot(t_steps, y_true, label="Vrai Y (Vérité)", color='black', linestyle='--')
+ax2.plot(t_steps, y_est, label="Y estimé (EKF)", color='blue', linewidth=2)
+ax2.scatter(t_steps[::dt_gps], gps_y, label="GPS Y (Bruité)", color='red', marker='x', zorder=5)
+
+ax2.set_ylabel("Position Y (m)")
+ax2.set_xlabel("Temps (secondes)")
+ax2.set_title("Évolution de la coordonnée Y dans le temps")
+ax2.legend()
+ax2.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+
 # --- 5. AFFICHAGE DES RÉSULTATS AVEC COULOIR DE CONFIANCE ---
 
 # 1. On récupère d'abord toutes les variables (sur le CPU pour Matplotlib)
