@@ -1,3 +1,32 @@
+# --- 6. AFFICHAGE DE L'ANGLE THETA ---
+
+# 1. Extraction des données pour l'angle (indice 4 dans le vecteur d'état)
+theta_true = dataset[0, :, 4].cpu().numpy()
+theta_est = estimations[0, :, 4].cpu().numpy()
+
+# Extraction de la variance de l'angle (indice [4,4] dans la matrice P)
+var_theta = covariances[0, :, 4, 4].cpu().numpy()
+std_theta = np.sqrt(var_theta)
+
+plt.figure(figsize=(12, 5))
+
+# Tracé de la vérité et de l'estimation
+plt.plot(t_steps, theta_true, 'k--', label="Vrai $\theta$ (Vérité)", alpha=0.7)
+plt.plot(t_steps, theta_est, 'g', label="$\theta$ estimé (EKF)", linewidth=2)
+
+# Couloir de confiance à 3-sigma pour l'angle
+plt.fill_between(t_steps, theta_est - 3*std_theta, theta_est + 3*std_theta, 
+                 color='green', alpha=0.2, label="Incertitude $3\sigma$ sur $\theta$")
+
+plt.title("Évolution de l'angle $\theta$ (Cap du drone)")
+plt.xlabel("Temps (secondes)")
+plt.ylabel("Angle (rad)")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
+
+
+
 # --- 5. AFFICHAGE DES RÉSULTATS AVEC COULOIRS DE COVARIANCE ---
 
 # 1. Extraction des variables
