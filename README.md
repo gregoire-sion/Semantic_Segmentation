@@ -1,3 +1,90 @@
+import torch
+import torch.nn as nn
+import numpy as np
+from base_filter import BaseFilter
+
+class EKF(BaseFilter):
+    "Filtre de Kalman Etendu classique"
+
+    def __init__(self, state_dim=4, obs_dim=4, q_noise=0.1, r_noise=0.1):
+        super().__init__(state_dim, obs_dim)
+        self.q_noise = q_noise
+        self.r_noise = r_noise
+        H = torch.zeros((obs_dim,state_dim))
+        H[0,0] = 1.0
+        H[1,2] = 1.0
+
+        self.register_buffer('Q', torch.eye(state_dim)*q_noise)
+        self.register_buffer('R', torch.eye(obs_dim)*r_noise)
+        self.register_buffer('H', H)
+        self.reguister_buffer('I', torch.eye(state_dim))
+
+    def forward(self, inital_state, dataset, imu_measure, gps_mask):
+        
+        #-------------------
+        #---INITALIATION----
+        #-------------------
+        x_pred = inital_state # x, vx, y, vy, theta
+        dt = dataset[0,0,8]
+        dt_gps = dataset[0,0,9]
+        dt_imu = dataset[0,0,10]
+        
+        x_true = dataset[:,:,0:3] # les vraies valeurs (le true)
+        ax = dataset[:,0,5] # x,vx,y,vy,ax,ay,omega
+        ay = dataset[:,0,6]
+        omega = dataset[:,0,7]
+
+        batch_size, seq_len, _ = dataset.size()
+
+        F = torch.eye(state_dim,device=self.device).unsqueeze(0).repeat(batch_size,1,1)
+        P_est = torch.eye(state_dim,device=self.device).unsqueeze(0).repeat(batch_size,1,1) * 0.1
+        
+        estimations = []
+
+        for t in range (seq_len):
+
+            if t % dt_imu == 0 :
+                ax = ax[:,t,0]
+                ay = ay[:,t,1]
+                omega = omega[:,t,2]
+
+            #--------------------
+            #ETAPE DE PROPAGATION
+            #--------------------
+            theta_old = x_pred[:,t-1:5]
+            x_pred[:,t,0] = x_pred[:,t-1,0] + x_pred[:,t,1]*dt
+            x_pred[:,t,1] = x_pred[:,t-1,1] + (ax*np.cos(thetheta_oldta) - ay*np.sin(theta_old))*dt
+            x_pred[:,t,3] = x_pred[:,t-1,3] + x_pred[:,t,4]*dt
+            x_pred[:,t,4] = x_pred[:,t-1,4] + (ax*np.sin(theta_old) + ay*np.cos(theta_old))*dt
+            x_pred[:,t:5] = x_pred[:,t-1:5] + omega*dt
+            
+            theta_new = x_pred[:,t,5]
+            F[:,0,1] = dt
+            F[:,1,4] = -(ax*np.sin(theta_new) + ay*p.cos(theta_new))*dt    
+            F[:,2,3] = dt
+            F[;,3,4] = (ax*np.cos(theta_new) - ay*np.sin(theta_new))*dt
+
+            P_pred = torch.bmm(F, torch.bmm(P_est, F.transpose(1,2))) + self.Q.unsqueeze(0)
+            #--------------------
+            #ETAPE DE MISE A JOUR
+            #--------------------
+            if t % dt_gps == 0 : 
+                y = dataset[:,t,11:12] - torch.matmul(x_pred,self.H.t())
+                S = torch.bmm(self.H, torch.bmm(P_pred, self.H.transpose(1,2))) + self.R.unsqueeze(0)
+                K = torch.bmm(P_pred, torch.bmm(self.H.t(), torch.inverse(S)))
+                x_est = x_pred + torch.matmul(y,K)
+                P_est = torch.bmm((self.I.unsqueeze(0) - torch.matmul(K,self.H), P_pred))
+            
+            else :
+                x_est = x_pred
+
+            estimations.append(x_est.clone())
+
+        estimations = torch.stack(estimations, dim=1)
+    return estimations
+
+    
+
 import torch.nn as nn
 import torch
 import pandas as pd
