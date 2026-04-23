@@ -1,4 +1,117 @@
 import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- 1. PARAMÈTRES DU TEST ---
+batch_size = 1
+seq_len = 300     # 300 pas de temps
+dt = 0.1          # 10 Hz (0.1 seconde par pas)
+dt_gps = 10       # Un GPS tous les 10 pas (1 fois par seconde)
+dt_imu = 1        # Une mesure IMU à chaque pas
+
+# --- 2. PHYSIQUE DU DRONE (Cercle constant) ---
+v_forward = 5.0   # Vitesse constante (5 m/s)
+omega_z = 0.2     # Vitesse de rotation constante (0.2 rad/s)
+radius = v_forward / omega_z # Rayon du cercle (25 m)
+
+# Bruits de simulation (pour rendre le test réaliste)
+bruit_imu = 0.1
+bruit_gps = 2.0
+
+# --- 3. CRÉATION DU TENSEUR DATASET ---
+# Format: [Batch, Seq, 13] selon tes indices
+dataset = torch.zeros((batch_size, seq_len, 13))
+
+# On remplit les constantes de temps (Indices 8, 9, 10)
+dataset[:, :, 8] = dt
+dataset[:, :, 9] = dt_gps
+dataset[:, :, 10] = dt_imu
+
+# Variables d'état temporaires
+x, y, theta = 0.0, 0.0, 0.0
+
+for t in range(seq_len):
+    # a. Calcul de la vraie trajectoire (Ground Truth)
+    theta += omega_z * dt
+    vx_global = v_forward * np.cos(theta)
+    vy_global = v_forward * np.sin(theta)
+    x += vx_global * dt
+    y += vy_global * dt
+    
+    # On sauvegarde les "Vraies valeurs" (Indices 0 à 2 selon ton code)
+    dataset[:, t, 0] = x
+    dataset[:, t, 1] = vx_global
+    dataset[:, t, 2] = y
+    
+    # b. Simulation des capteurs IMU (Indices 5, 6, 7) + Bruit
+    # En local, le drone avance tout droit à vitesse constante (ax = 0)
+    # L'accélération latérale (centripète) est v * omega
+    ax_local = 0.0 + np.random.randn() * bruit_imu
+    ay_local = (v_forward * omega_z) + np.random.randn() * bruit_imu
+    omega_mesure = omega_z + np.random.randn() * bruit_imu
+    
+    dataset[:, t, 5] = ax_local
+    dataset[:, t, 6] = ay_local
+    dataset[:, t, 7] = omega_mesure
+    
+    # c. Simulation du GPS (Indices 11, 12) + Bruit
+    # On ne génère le GPS que si c'est le bon moment
+    if t % dt_gps == 0:
+        gps_x = x + np.random.randn() * bruit_gps
+        gps_y = y + np.random.randn() * bruit_gps
+        dataset[:, t, 11] = gps_x
+        dataset[:, t, 12] = gps_y
+    else:
+        # Si pas de GPS, on met des zéros (ton code ignore la valeur de toute façon)
+        dataset[:, t, 11] = 0.0
+        dataset[:, t, 12] = 0.0
+
+# L'état initial pour le filtre (px, vx, py, vy, theta)
+# On lui donne la position (0,0) mais on le laisse deviner la vitesse
+initial_state = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0]])
+
+# On n'utilise pas de gps_mask dans ta version actuelle du code, 
+# donc on passe un tenseur vide ou un masque simple
+gps_mask = torch.ones((batch_size, seq_len)) 
+
+
+# --- 4. EXÉCUTION DE L'EKF ---
+# On instancie ton filtre
+ekf = EKF(state_dim=5, obs_dim=2, q_noise=0.5, r_noise=2.0)
+
+# On lance le forward (pas besoin de calculer les gradients pour le test)
+with torch.no_grad():
+    estimations = ekf(initial_state, dataset, None, gps_mask)
+
+# --- 5. AFFICHAGE DES RÉSULTATS ---
+# On extrait les données du batch 0 pour l'affichage
+x_true = dataset[0, :, 0].numpy()
+y_true = dataset[0, :, 2].numpy()
+
+x_est = estimations[0, :, 0].numpy()
+y_est = estimations[0, :, 2].numpy()
+
+# On récupère les points GPS (uniquement ceux qui ne sont pas à 0)
+# dt_gps est à 10, donc on prend 1 point sur 10
+gps_x = dataset[0, ::dt_gps, 11].numpy()
+gps_y = dataset[0, ::dt_gps, 12].numpy()
+
+plt.figure(figsize=(10, 10))
+plt.plot(x_true, y_true, label="Trajectoire Réelle (Vérité)", color='black', linestyle='--')
+plt.plot(x_est, y_est, label="Estimation EKF", color='blue', linewidth=2)
+plt.scatter(gps_x, gps_y, label="Mesures GPS (Bruitées)", color='red', marker='x')
+
+plt.title("Test de l'EKF sur trajectoire circulaire")
+plt.xlabel("Position X (m)")
+plt.ylabel("Position Y (m)")
+plt.legend()
+plt.grid(True)
+plt.axis('equal') # Pour que le cercle soit bien rond
+plt.show()
+
+
+
+import torch
 import torch.nn as nn
 import numpy as np
 from base_filter import BaseFilter
