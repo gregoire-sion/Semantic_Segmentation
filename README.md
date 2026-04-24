@@ -1,3 +1,67 @@
+# trainer.py
+class Trainer:
+    def __init__(self, model, config):
+        self.model = model
+        self.config = config
+        self.device = config.device
+        self.optimizer = optim.Adam(self.model.parameters(), lr=config.lr)
+        self.criterion = nn.MSELoss()
+
+    def train(self, train_loader, val_loader=None): # Signature simplifiée !
+        train_loss_history = []
+        val_loss_history = []
+        pbar = tqdm(range(self.config.epochs), desc="KalmanNet Training")
+
+        for epoch in pbar:
+            # --- PHASE TRAIN ---
+            self.model.train()
+            total_train_loss = 0
+            
+            # Le DataLoader nous donne des lots (batchs)
+            for batch_init, batch_data in train_loader:
+                batch_init = batch_init.to(self.device)
+                batch_data = batch_data.to(self.device)
+                
+                self.optimizer.zero_grad()
+                
+                # Forward : on passe l'init et la data du batch
+                estimations = self.model(batch_init, batch_data)
+                
+                # Calcul de la perte sur la position (colonnes 0 et 2 de batch_data)
+                y_true = batch_data[:, :, [0, 2]]
+                loss = torch.sqrt(self.criterion(estimations[:, :, [0, 2]], y_true))
+                
+                loss.backward()
+                self.optimizer.step()
+                total_train_loss += loss.item()
+
+            avg_train_loss = total_train_loss / len(train_loader)
+            train_loss_history.append(avg_train_loss)
+
+            # --- PHASE VAL ---
+            avg_val_loss = 0
+            if val_loader:
+                self.model.eval()
+                total_val_loss = 0
+                with torch.no_grad():
+                    for batch_init, batch_data in val_loader:
+                        batch_init = batch_init.to(self.device)
+                        batch_data = batch_data.to(self.device)
+                        
+                        estimations = self.model(batch_init, batch_data)
+                        y_true = batch_data[:, :, [0, 2]]
+                        val_loss = torch.sqrt(self.criterion(estimations[:, :, [0, 2]], y_true))
+                        total_val_loss += val_loss.item()
+                
+                avg_val_loss = total_val_loss / len(val_loader)
+                val_loss_history.append(avg_val_loss)
+
+            pbar.set_postfix({'Train': f'{avg_train_loss:.4f}', 'Val': f'{avg_val_loss:.4f}'})
+
+        return train_loss_history, val_loss_history
+
+
+
 # --- 6. AFFICHAGE DE L'ANGLE THETA ---
 
 # 1. Extraction des données pour l'angle (indice 4 dans le vecteur d'état)
