@@ -6,8 +6,12 @@ Traceback (most recent call last):
     main()
   File "/home/gsionsua/Work_bis/KalmanNet/main.py", line 12, in main
     run_training(cfg)
-  File "/home/gsionsua/Work_bis/KalmanNet/train.py", line 9, in run_training
-    train_set = TrajectoryDataset(cfg.n_train,cfg) #qu'est ce que le 700 ici ? 
-  File "/home/gsionsua/Work_bis/KalmanNet/src/dataset.py", line 13, in __init__
-    self.data = torch.zeros((num_trajectories, self.seq_len, 13)).to(dtype=torch.float32) # Pourquoi 13 est codé en dur
-TypeError: zeros(): argument 'size' (position 1) must be tuple of ints, not tuple
+  File "/home/gsionsua/Work_bis/KalmanNet/train.py", line 10, in run_training
+    train_loader = DataLoader(train_set, batch_size=int(cfg.batch_size), shuffle=True)
+  File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 353, in __init__
+    sampler = RandomSampler(dataset, generator=generator)  # type: ignore[arg-type]
+  File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/torch/utils/data/sampler.py", line 106, in __init__
+    if not isinstance(self.num_samples, int) or self.num_samples <= 0:
+  File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/torch/utils/data/sampler.py", line 114, in num_samples
+    return len(self.data_source)
+TypeError: 'float' object cannot be interpreted as an integer
