@@ -1,3 +1,27 @@
+# On pioche un seul batch dans le DataLoader
+batch_init, batch_data = next(iter(test_loader))
+
+# On extrait la vérité terrain du 1er batch, pour le 1er drone, sur toute la séquence
+# Shape attendue : (Seq_len, 9)
+vrai_etat = batch_data[0, :, 0, 0:9]
+
+print("\n=== DIAGNOSTIC DE LA VÉRITÉ TERRAIN (Ground Truth) ===")
+noms_variables = [
+    "Position X", "Position Y", "Position Z",
+    "Vitesse X", "Vitesse Y", "Vitesse Z",
+    "Angle Phi", "Angle Theta", "Angle Psi"
+]
+
+for i in range(9):
+    col_data = vrai_etat[:, i]
+    moyenne = col_data.mean().item()
+    minimum = col_data.min().item()
+    maximum = col_data.max().item()
+    
+    # On affiche les statistiques pour chaque variable
+    print(f"{noms_variables[i]:<15} | Moyenne: {moyenne:>8.4f} | Min: {minimum:>8.4f} | Max: {maximum:>8.4f}")
+
+print("======================================================\n")
 import torch
 from torch.utils.data import DataLoader
 from src.dataset import TrajectoryDataset
