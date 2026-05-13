@@ -1,66 +1,34 @@
-import matplotlib.pyplot as plt 
-import numpy as np
-from src.config import Config as config
+import torch
+from torch.utils.data import DataLoader
+from src.dataset import TrajectoryDataset
+from src.models.kalmannet import KalmanNet
+from plots import plot_trajectory
 
-def plot_trajectory(vrai_etat, pred_etat, mesures_gps, trajectory_id=1):
-    """
-    Trace l'évolution des 9 variables d'état dans le temps sur une seule image.
-    Attend des tableaux (numpy) de forme (seq_len, 9) pour les états et (seq_len, 3) pour le GPS.
-    """
-    # Création d'une grille de 3 lignes x 3 colonnes
-    fig, axes = plt.subplots(3, 3, figsize=(16, 10))
-    fig.suptitle(f"Évaluation des Variables d'État - Trajectoire n°{trajectory_id}", fontsize=16, fontweight='bold')
+def run_testing(config):
 
-    noms_variables = [
-        "Position X (m)", "Position Y (m)", "Position Z (m)",
-        "Vitesse X (m/s)", "Vitesse Y (m/s)", "Vitesse Z (m/s)",
-        "Angle Phi - Roulis (rad)", "Angle Theta - Tangage (rad)", "Angle Psi - Lacet (rad)"
-    ]
+    test_set = TrajectoryDataset(config.n_test, "test", config=config)
+    test_loader = DataLoader(test_set, batch_size=config.batch_size, shuffle=False)
 
-    # Création d'un axe temporel (de 0 à seq_len)
-    t = range(len(vrai_etat))
+    model = KalmanNet(config).to(config.device)
+    model.load_state_dict(torch.load(config.model_path, map_location=config.device))
+    model.eval()
 
-    for i in range(9):
-        row = i // 3
-        col = i % 3
-        ax = axes[row, col]
+    with torch.no_grad():
+        for i, (batch_init, batch_data) in enumerate(test_loader) : 
+            if i>=3: break
 
-        # 1. Trace la vérité terrain (Vert)
-        ax.plot(t, vrai_etat[:, i], 'g-', label='Vérité terrain', linewidth=2)
+            batch_init = batch_init.to(config.device)
+            batch_data = batch_data.to(config.device)
 
-        # 2. Trace les prédictions KalmanNet (Bleu pointillé)
-        ax.plot(t, pred_etat[:, i], 'b--', label='KalmanNet', linewidth=1.5)
+            predictions = model(batch_init, batch_data)
 
-        # 3. Trace les mesures GPS (Rouge) SEULEMENT pour les positions (indices 0, 1, 2)
-        if mesures_gps is not None and i < 3:
-            ax.scatter(t, mesures_gps[:, i], c='red', s=15, alpha=0.4, label='Mesures GPS')
+            vrai_x = batch_data[0, :,0].cpu().numpy()
+            vrai_y = batch_data[0, :,2].cpu().numpy()
+            gps_x = batch_data[0, :,11].cpu().numpy()
+            gps_y = batch_data[0, :,12].cpu().numpy()
+            pred_x = predictions[0, :,0].cpu().numpy()
+            pred_y = predictions[0, :,2].cpu().numpy()
 
-        # Mise en forme du sous-graphique
-        ax.set_title(noms_variables[i])
-        ax.grid(True, alpha=0.3)
-        ax.set_xlabel("Pas de temps")
-        
-        # On met la légende uniquement sur le premier graphique pour ne pas surcharger l'image
-        if i == 0:
-            ax.legend()
-
-    # Ajuste l'espacement pour que les titres ne se chevauchent pas
-    plt.tight_layout()
-    plt.subplots_adjust(top=0.9) 
-    plt.show()
-
-def plot_training_loss(epoch, train_losses, val_losses):
-    """
-    Trace l'évolution de la loss pendant l'entraînement
-    """
-    plt.figure(figsize=(10,5))
-    plt.plot(epoch, train_losses, label="Train Loss")
-    if val_losses:
-        plt.plot(epoch, val_losses, label="Val Loss", color='orange')
-
-    plt.title("Courbe d'apprentissage du KalmanNet")
-    plt.xlabel("Epochs")
-    plt.ylabel(f"Erreur Loss : {config.name_loss}")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.show()
+            plot_trajectory(vrai_x, vrai_y, gps_x, gps_y, pred_x, pred_y, trajectory_id=i+1)
+    
+    print("Evaluation terminée")
