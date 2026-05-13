@@ -1,239 +1,63 @@
-import torch 
-import torch.nn as nn 
-from .base_filter import BaseFilter 
-from ..config import Config as config
-
-def batch_rotation_matrix(angles_norm, scale_angle=torch.pi):
-    #Dénormalisation dans un premier temps
-    angles = angles_norm *scale_angle
-    phi = angles[..., 0]
-    theta = angles[..., 1]
-    psi = angles[..., 2]
-
-    c_phi, s_phi = torch.cos(phi), torch.sin(phi)
-    c_theta, s_theta = torch.cos(theta), torch.sin(theta)
-    c_psi, s_psi = torch.cos(psi), torch.sin(psi)
-
-    R = torch.zeros((*phi.shape, 3, 3), device=phi.device)
-
-    R[..., 0, 0] = c_theta * c_psi
-    R[..., 0, 1] = s_phi * s_theta * c_psi - c_phi * s_psi
-    R[..., 0, 2] = c_phi * s_theta * c_psi + s_phi * s_psi
-
-    R[..., 1, 0] = c_theta * s_psi
-    R[..., 1, 1] = s_phi * s_theta * s_psi + c_phi * c_psi
-    R[..., 1, 2] = c_phi * s_theta * s_psi - s_phi * c_psi
-
-    R[..., 2, 0] = -s_theta
-    R[..., 2, 1] = s_phi * c_theta
-    R[..., 2, 2] =c_phi* c_theta
-    
-    return R
-
-
-class KalmanNet(BaseFilter):
-    "KalmanNet"
-
-    def __init__(self, config):
-        super().__init__(state_dim=config.state_dim, obs_dim=config.obs_dim, device=config.device)
-        self.config = config
-        self.state_dim = config.state_dim
-        self.obs_dim = config.obs_dim
-        self.device = config.device
-        self.n_drones = config.n_drones
-        self.hidden_dim = config.hidden_dim
-        
-        input_dim = 9 + (self.n_drones - 1)
-
-        H = torch.zeros((self.obs_dim,self.state_dim))
-        H[0,0] = 1.0
-        H[1,2] = 1.0
-
-        self.register_buffer('H', H)
-        self.register_buffer('I', torch.eye(self.state_dim))
-
-        self.rnn = nn.GRU(
-            input_size=self.obs_dim, 
-            hidden_size=self.hidden_dim, 
-            num_layers=2, 
-            dropout=0.0,
-            batch_first=True
-            )
-
-        self.fc = nn.Linear(
-            self.hidden_dim, 
-            self.state_dim * self.obs_dim
-            )
-
-        self.apply(self.init_weights)
-
-        if config.IS_NORMALISATION :
-            self.ratio_v_x = config.scale_vel / config.scale_pos
-            self.ratio_a_v = config.scale_acc / config.scale_vel
-            self.ratio_g_a = config.scale_gyro / torch.pi
-        else :
-            self.ratio_v_x = 1.0
-            self.ratio_a_v = 1.0
-            self.ratio_g_a = 1.0
-    
-    def forward(self, batch_init, batch_data):
-        current_batch_size = batch_data.shape[0]
-        n_drones = self.n_drones
-        seq_len = batch_data.shape[1]
-
-        # x_est shape: (Batch, N_drones, 9)
-        # Index: 0:3 (Pos), 3:6 (Vel), 6:9 (Angles)
-        x_est = batch_init.clone()
-        h_rnn = None # État caché du GRU 
-
-        estimations = []
-        
-        dt = self.config.dt
-        dt_imu = self.config.dt_imu
-        dt_gps = self.config.dt_gps
-
-        # Dimensions pour le redimensionnement du RNN
-        state_dim = config.state_dim
-        obs_dim = config.obs_dim
-
-        for t in range(seq_len):
-
-            # ---------------------------------------------------------
-            # 1. LECTURE DE L'IMU (Si la fréquence le permet)
-            # ---------------------------------------------------------
-            if t % dt_imu == 0: 
-                # On lit les données pour tous les drones d'un coup
-                # Index basé sur notre Dataset : 9:12 (Accel), 12:15 (Gyro)
-                a_body = batch_data[:, t, :, 9:12]
-                gyro = batch_data[:, t, :, 12:15]
-
-            # ---------------------------------------------------------
-            # 2. ÉTAPE DE PROPAGATION (Physique 3D)
-            # ---------------------------------------------------------
-            pos_est = x_est[:, :, 0:3]
-            vel_est = x_est[:, :, 3:6]
-            angles_est = x_est[:, :, 6:9]
-
-            # A. Intégration des angles
-            angles_pred = angles_est + gyro * dt * self.ratio_g_a
-
-            # B. Projection de l'accélération (Drone -> Monde)
-            R = batch_rotation_matrix(angles_pred) # Shape: (B, N, 3, 3)
-            
-            a_body_real = a_body * self.config.scale_acc
-            a_body_real = a_body_real.unsqueeze(-1)
-            
-            a_earth_real = torch.matmul(R, a_body_real).squeeze(-1)
-            a_earth_real[..., 2] -= 9.81 # Retrait de la gravité sur l'axe Z
-            
-            a_earth_norm = a_earth_real / self.config.scale_acc
-
-            # C. Intégration de la cinématique
-            vel_pred = vel_est + a_earth_norm * dt * self.ratio_a_v
-            pos_pred = pos_est + vel_pred * dt * self.ratio_v_x
-
-            angles_pred = torch.clamp(angles_pred, min=-10.0, max=10.0)
-            vel_pred = torch.clamp(vel_pred, min=-50.0, max=50.0)
-            pos_pred = torch.clamp(pos_pred, min=-5000.0, max=5000.0)
-
-            # Recomposition du vecteur d'état prédit
-            x_pred = torch.cat([pos_pred, vel_pred, angles_pred], dim=-1)
-        
-            # ---------------------------------------------------------
-            # 3. ÉTAPE DU CALCUL DU GAIN & CORRECTION
-            # ---------------------------------------------------------
-            if t % dt_gps == 0: 
-                # --- A. Calcul de l'innovation GPS (y_gps) ---
-                gps_mesure = batch_data[:, t, :, 15:18]
-                y_gps = gps_mesure - pos_pred
-
-                temps_t = batch_data[:, t, :, 18]
-
-                # --- B. Calcul de l'innovation de Distance (y_dist) ---
-                dist_mesure = batch_data[:, t, :, 19:] # Toutes les distances mesurées
-                dist_preds = []
-                
-                # On calcule la distance prédite entre chaque paire de drones
-                for d in range(n_drones):
-                    d_neighbors_dist = []
-                    for autre_d in range(n_drones):
-                        if d != autre_d:
-                            # Distance Euclidienne L2
-                            diff = pos_pred[:, d, :] - pos_pred[:, autre_d, :]
-                            dist = torch.norm(diff + 1e-8, dim=-1)
-                            d_neighbors_dist.append(dist)
-
-                    dist_preds.append(torch.stack(d_neighbors_dist, dim=1))
-                
-                y_dist_pred = torch.stack(dist_preds, dim=1) # Shape: (Batch, N, N-1)
-                y_dist = dist_mesure - y_dist_pred
-
-                # --- C. Le vecteur d'innovation global (y) ---
-                y = torch.cat([y_gps, y_dist], dim=-1) # Shape: (Batch, N, obs_dim)
-
-                y = torch.clamp(y, min=-50.0, max=50.0)
-                # --- D. Le RNN choisit le gain de Kalman ---
-                # On "aplatit" Batch et Drones pour traiter tout le monde en parallèle
-                y_flat = y.view(current_batch_size * self.n_drones, self.obs_dim)
-                x_pred_flat = x_pred.view(current_batch_size * self.n_drones, self.state_dim)
-
-                out, h_rnn = self.rnn(y_flat.unsqueeze(1), h_rnn)
-                k_flat = self.fc(out.squeeze(1)) # self.fc doit avoir une sortie de taille (state_dim * obs_dim)
-                
-                # On remet le gain sous forme de Matrice (Batch*N, State_dim, Obs_dim)
-                K = k_flat.view(current_batch_size * n_drones, state_dim, obs_dim)
-                K = torch.sigmoid(K) # ou torch.tanh si tu veux autoriser des gains négatifs
-
-                # --- E. Mise à jour (Correction de l'état) ---
-                correction = torch.bmm(K, y_flat.unsqueeze(-1)).squeeze(-1)
-                x_est_flat = x_pred_flat + correction
-
-                x_est_flat = torch.clamp(x_est_flat, min=-5000.0, max=5000.0)
-                
-                # On redonne sa forme 3D à l'état
-                x_est = x_est_flat.view(current_batch_size, self.n_drones, self.state_dim)
-
-            else: 
-                x_est = x_pred
-
-            
-            # # --- Sécurité Anti-Explosion ---
-            # if x_est.abs().max() > 10000: 
-            #     print(f" EXPLOSION DÉTECTÉE au pas de temps t={t} !")
-            #     print(f" - Valeur max de x_est : {x_est.abs().max().item():.2e}")
-            #     break
-
-            if torch.isnan(x_est).any():
-                print(f"Le premier Nan est apparu au telos t = {t}")
-
-                if torch.isnan(pos_pred).any : print("Coupable pos pred (physique/viresse)")
-                if torch.isnan(angles_pred).any(): print("Coupable angles_pred (IMU Rotation)")
-                if t%dt_gps==0 and torch.isnan(K).any(): print("Coupable matrice K (Reseau de neurones / sigmoid)")
-                raise ValueError("Arrer d'urgence pour Nan")
-
-                max_val = x_est.abs().max().item()
-                if max_val > 10000:
-                    print(f"Attention valeurs gigantestques detectées a t = {t} ( Max: {max_val:.2e})")
-
-            estimations.append(x_est.clone())
-
-
-        # On retourne l'historique complet des états
-        return torch.stack(estimations, dim=1)
-
-
-
-    def init_weights(self, m) : 
-        if isinstance(m, nn.Linear) :
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            if m.bias is not None : 
-                nn.init.constant_(m.bias, 0)
-        
-        elif isinstance(m, nn.GRU) or isinstance(m, nn.LSTM) :
-            for name, param in m.named_parameters() :
-                if 'weigth_ih' in name : 
-                    nn.init.xavier_uniform_(param)
-                elif 'weight_hh' in name : 
-                    nn.init.orthogonal_(param)
-                elif 'bias' in name : 
-                    nn.init.constant_(param, 0)
+(Environnement) scvmpr10.fr.mbda.priv:/home/gsionsua/Work_bis/KalmanNet $python main.py 
+-----MODE TRAINING-----
+Préparation des données...
+   Préparation du train...
+Génération d'un essaim à 3 drones
+   Nombre de trajectoires générées : 128.0 
+   Normalisation en cours...
+   Préparation du val...
+Génération d'un essaim à 3 drones
+   Nombre de trajectoires générées : 15.999999999999993 
+   Normalisation en cours...
+Initialisation du réseau...
+Lancement de l'entrainement
+KalmanNet Training:   0%|                                                                                                   | 0/100 [00:04<?, ?it/s, Train=556317.1406, Val=535.3053, Seq_len=10.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 535.305298
+KalmanNet Training:   1%|▉                                                                                          | 1/100 [00:08<07:16,  4.41s/it, Train=182617.6328, Val=220.9633, Seq_len=15.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 220.963272
+KalmanNet Training:   2%|█▊                                                                                           | 2/100 [00:12<06:59,  4.29s/it, Train=22198.6475, Val=66.8504, Seq_len=20.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 66.850449
+KalmanNet Training:   3%|██▊                                                                                           | 3/100 [00:17<06:53,  4.27s/it, Train=3735.4314, Val=64.2525, Seq_len=25.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 64.252495
+KalmanNet Training:   4%|███▊                                                                                          | 4/100 [00:21<06:45,  4.23s/it, Train=2995.4177, Val=48.0039, Seq_len=30.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 48.003925
+KalmanNet Training:   5%|████▋                                                                                         | 5/100 [00:25<06:39,  4.20s/it, Train=2121.3497, Val=47.4272, Seq_len=35.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 47.427246
+KalmanNet Training:   7%|██████▌                                                                                       | 7/100 [00:33<06:26,  4.16s/it, Train=2260.2670, Val=46.4164, Seq_len=45.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 46.416439
+KalmanNet Training:   8%|███████▌                                                                                      | 8/100 [00:37<06:23,  4.17s/it, Train=2009.5944, Val=45.4313, Seq_len=50.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 45.431309
+KalmanNet Training:   9%|████████▍                                                                                     | 9/100 [00:41<06:17,  4.14s/it, Train=2035.9338, Val=44.4724, Seq_len=55.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 44.472408
+KalmanNet Training:  10%|█████████▎                                                                                   | 10/100 [00:45<06:10,  4.11s/it, Train=1881.8932, Val=43.5178, Seq_len=60.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 43.517811
+KalmanNet Training:  11%|██████████▏                                                                                  | 11/100 [00:49<06:02,  4.08s/it, Train=1767.6544, Val=42.9232, Seq_len=65.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 42.923187
+KalmanNet Training:  12%|███████████▏                                                                                 | 12/100 [00:53<05:57,  4.06s/it, Train=1748.6350, Val=42.0121, Seq_len=70.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 42.012131
+KalmanNet Training:  13%|████████████                                                                                 | 13/100 [00:57<05:53,  4.06s/it, Train=1602.2351, Val=41.3381, Seq_len=75.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 41.338127
+KalmanNet Training:  14%|█████████████                                                                                | 14/100 [01:02<05:50,  4.07s/it, Train=1481.7182, Val=40.9482, Seq_len=80.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 40.948196
+KalmanNet Training:  15%|█████████████▉                                                                               | 15/100 [01:06<05:47,  4.09s/it, Train=1482.3925, Val=40.4826, Seq_len=85.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 40.482601
+KalmanNet Training:  16%|██████████████▉                                                                              | 16/100 [01:10<05:44,  4.10s/it, Train=1444.1239, Val=40.0217, Seq_len=90.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 40.021667
+KalmanNet Training:  17%|███████████████▊                                                                             | 17/100 [01:15<05:42,  4.13s/it, Train=1441.6381, Val=39.2359, Seq_len=95.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 39.235901
+KalmanNet Training:  18%|████████████████▌                                                                           | 18/100 [01:20<06:08,  4.49s/it, Train=1392.0195, Val=37.9064, Seq_len=100.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 37.906403
+KalmanNet Training:  19%|█████████████████▍                                                                          | 19/100 [01:26<06:22,  4.72s/it, Train=1304.5397, Val=37.6574, Seq_len=105.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 37.657391
+KalmanNet Training:  20%|██████████████████▍                                                                         | 20/100 [01:30<06:33,  4.91s/it, Train=1304.3640, Val=37.1240, Seq_len=110.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 37.124001
+KalmanNet Training:  21%|███████████████████▎                                                                        | 21/100 [01:35<06:21,  4.83s/it, Train=1260.2015, Val=36.1738, Seq_len=115.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 36.173798
+KalmanNet Training:  22%|████████████████████▏                                                                       | 22/100 [01:39<06:02,  4.65s/it, Train=1194.0485, Val=35.9429, Seq_len=120.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 35.942940
+KalmanNet Training:  23%|█████████████████████▏                                                                      | 23/100 [01:43<05:49,  4.54s/it, Train=1200.1619, Val=35.9235, Seq_len=125.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 35.923462
+KalmanNet Training:  24%|██████████████████████                                                                      | 24/100 [01:48<05:39,  4.47s/it, Train=1144.2838, Val=35.2199, Seq_len=130.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 35.219940
+KalmanNet Training:  31%|████████████████████████████▌                                                               | 31/100 [02:18<05:00,  4.36s/it, Train=1132.5138, Val=34.9741, Seq_len=165.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 34.974106
+KalmanNet Training:  33%|██████████████████████████████▎                                                             | 33/100 [02:26<04:45,  4.27s/it, Train=1093.2589, Val=34.8490, Seq_len=175.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 34.849010
+KalmanNet Training:  34%|███████████████████████████████▎                                                            | 34/100 [02:30<04:39,  4.24s/it, Train=1102.7882, Val=34.5989, Seq_len=180.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 34.598946
+KalmanNet Training:  35%|████████████████████████████████▏                                                           | 35/100 [02:34<04:32,  4.18s/it, Train=1056.1620, Val=34.0630, Seq_len=185.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 34.062969
+KalmanNet Training:  36%|█████████████████████████████████                                                           | 36/100 [02:39<04:29,  4.20s/it, Train=1034.5939, Val=33.8078, Seq_len=190.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 33.807800
+KalmanNet Training:  37%|██████████████████████████████████                                                          | 37/100 [02:43<04:27,  4.24s/it, Train=1010.5580, Val=33.7559, Seq_len=195.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 33.755863
+KalmanNet Training:  38%|██████████████████████████████████▉                                                         | 38/100 [02:47<04:24,  4.26s/it, Train=1035.2415, Val=33.5972, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 33.597229
+KalmanNet Training:  39%|███████████████████████████████████▉                                                        | 39/100 [02:51<04:19,  4.25s/it, Train=1000.2569, Val=33.4491, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 33.449112
+KalmanNet Training:  40%|████████████████████████████████████▊                                                       | 40/100 [02:56<04:15,  4.25s/it, Train=1004.5213, Val=33.3112, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 33.311165
+KalmanNet Training:  41%|█████████████████████████████████████▋                                                      | 41/100 [03:00<04:15,  4.34s/it, Train=1033.9987, Val=33.0910, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 33.091007
+KalmanNet Training:  42%|███████████████████████████████████████                                                      | 42/100 [03:05<04:15,  4.40s/it, Train=969.0196, Val=32.9404, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 32.940395
+KalmanNet Training:  43%|███████████████████████████████████████▉                                                     | 43/100 [03:09<04:07,  4.34s/it, Train=979.8072, Val=32.6938, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 32.693752
+KalmanNet Training:  44%|████████████████████████████████████████▉                                                    | 44/100 [03:13<04:01,  4.32s/it, Train=949.2344, Val=32.4490, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 32.448990
+KalmanNet Training:  45%|█████████████████████████████████████████▊                                                   | 45/100 [03:17<03:53,  4.24s/it, Train=947.3877, Val=32.1545, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 32.154465
+KalmanNet Training:  46%|██████████████████████████████████████████▊                                                  | 46/100 [03:22<03:49,  4.25s/it, Train=964.7720, Val=31.8026, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 31.802620
+KalmanNet Training:  47%|███████████████████████████████████████████▋                                                 | 47/100 [03:26<03:47,  4.28s/it, Train=886.0256, Val=31.4016, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 31.401623
+KalmanNet Training:  48%|████████████████████████████████████████████▋                                                | 48/100 [03:30<03:45,  4.34s/it, Train=878.0273, Val=31.0546, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 31.054581
+KalmanNet Training:  49%|█████████████████████████████████████████████▌                                               | 49/100 [03:35<03:39,  4.31s/it, Train=886.4557, Val=30.8183, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 30.818306
+KalmanNet Training:  50%|██████████████████████████████████████████████▌                                              | 50/100 [03:39<03:34,  4.29s/it, Train=881.3448, Val=30.6074, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 30.607405
+KalmanNet Training:  51%|███████████████████████████████████████████████▍                                             | 51/100 [03:43<03:29,  4.28s/it, Train=882.5758, Val=30.2400, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 30.239986
+KalmanNet Training:  52%|████████████████████████████████████████████████▎                                            | 52/100 [03:47<03:24,  4.27s/it, Train=841.4572, Val=29.7891, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 29.789083
+KalmanNet Training:  53%|█████████████████████████████████████████████████▎                                           | 53/100 [03:51<03:21,  4.28s/it, Train=816.7830, Val=29.5070, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 29.506996
+KalmanNet Training:  54%|██████████████████████████████████████████████████▏                                          | 54/100 [03:56<03:15,  4.24s/it, Train=794.6781, Val=29.1680, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 29.168018
+KalmanNet Training:  55%|███████████████████████████████████████████████████▏                                         | 55/100 [04:00<03:10,  4.24s/it, Train=800.9107, Val=28.9406, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 28.940628
+KalmanNet Training:  56%|████████████████████████████████████████████████████                                         | 56/100 [04:04<03:08,  4.29s/it, Train=772.5733, Val=28.8483, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 28.848293
+KalmanNet Training:  57%|█████████████████████████████████████████████████████                                        | 57/100 [04:09<03:04,  4.28s/it, Train=747.6825, Val=28.7531, Seq_len=200.0000]Nouveau meilleur Model - Sauvegarde en Cours... - Val Loss : 28.753071
