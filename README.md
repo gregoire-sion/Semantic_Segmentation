@@ -1,3 +1,6 @@
+
+
+
 Bonjour,
 
 Je ne sais pas comment l’écrire mais je sais que je dois le dire. Je préfère donc le faire de la façon la plus ouverte et me concentrer sur des faits.
