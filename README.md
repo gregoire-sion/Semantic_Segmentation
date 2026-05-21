@@ -1,3 +1,64 @@
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 1. Conversion des historiques
+temps_np = np.array(temps)[:traj_kalman.shape[0]]
+P_hist_np = np.array(P_historique)[:traj_kalman.shape[0]]
+
+# 2. Liste des noms pour que tes 18 graphiques soient lisibles
+noms_etats = [
+    "X Drone 1", "Y Drone 1", "Vx Drone 1", "Vy Drone 1",
+    "X Drone 2 (Dérive)", "Y Drone 2 (Dérive)", "Vx Drone 2", "Vy Drone 2",
+    "X Drone 3", "Y Drone 3", "Vx Drone 3", "Vy Drone 3",
+    "Biais Pos X", "Biais Pos Y",
+    "Biais Vit X", "Biais Vit Y",
+    "Biais Acc X", "Biais Acc Y"
+]
+
+# 3. Création de la figure géante (6 lignes, 3 colonnes)
+fig, axs = plt.subplots(6, 3, figsize=(18, 20), sharex=True)
+axs = axs.flatten() # Transforme la grille 2D en une simple liste 1D pour la boucle
+
+# 4. Boucle sur les 18 variables d'état
+for i in range(18):
+    # Extraction de l'état estimé par l'EKF
+    etat_estime = traj_kalman[:, 0, i] 
+    
+    # Extraction de la variance (diagonale de P) et calcul de l'écart-type (sigma)
+    variance = P_hist_np[:, i, i]
+    sigma = np.sqrt(variance)
+    
+    # Calcul des bornes du couloir de confiance à 99.7% (+/- 3 sigma)
+    borne_haute = etat_estime + 3 * sigma
+    borne_basse = etat_estime - 3 * sigma
+    
+    # Tracé de la variable d'état (ligne pleine)
+    axs[i].plot(temps_np, etat_estime, color='blue', label='Estimation EKF')
+    
+    # Tracé du couloir de covariance (zone ombrée)
+    axs[i].fill_between(temps_np, borne_basse, borne_haute, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
+    
+    # Esthétique du graphique
+    axs[i].set_title(noms_etats[i], fontsize=10, fontweight='bold')
+    axs[i].grid(True, linestyle=':', alpha=0.7)
+    
+    # (Optionnel) Si tu as stocké la vérité terrain dans une matrice "traj_vraie", 
+    # tu peux la rajouter ici pour voir si elle reste bien dans le couloir !
+    # axs[i].plot(temps_np, traj_vraie[:, i], color='black', linestyle='--', label='Vérité')
+
+# 5. Ajustements finaux
+# Ajout du label X uniquement sur les graphiques de la dernière ligne
+for ax in axs[-3:]:
+    ax.set_xlabel("Temps (s)")
+
+# Ajout d'une seule légende globale pour ne pas surcharger les petits graphiques
+handles, labels = axs[0].get_legend_handles_labels()
+fig.legend(handles, labels, loc='upper center', ncol=3, fontsize=12)
+
+plt.tight_layout()
+plt.subplots_adjust(top=0.92) # Laisse de la place pour la légende globale
+fig.suptitle("Analyse des Covariances de l'Error-State EKF (18 dimensions)", fontsize=16, fontweight='bold')
+plt.show()
 
 
 
