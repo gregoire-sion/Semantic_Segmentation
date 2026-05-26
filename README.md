@@ -1,3 +1,103 @@
+import matplotlib.pyplot as plt
+import numpy as np
+
+# --- (Ton extraction initiale des variables reste identique) ---
+
+# Fonction utilitaire pour générer la figure d'un drone spécifique
+def tracer_figure_drone(id_drone, indices_ekf, etats_vrais, mesures_xy=None):
+    fig, axs = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+    fig.suptitle(f"Analyse EKF - Drone {id_drone}", fontsize=14, fontweight='bold')
+    axs = axs.flatten()
+    
+    # Les 4 sous-états pour un drone
+    labels_locaux = ["Position X", "Position Y", "Vitesse Vx", "Vitesse Vy"]
+    
+    for idx, (idx_ekf, etat_vrai, label) in enumerate(zip(indices_ekf, etats_vrais, labels_locaux)):
+        ax = axs[idx]
+        
+        # Récupération EKF et Covariance
+        etat_estime = traj_kalman[:, 0, idx_ekf]
+        sigma = np.sqrt(P_hist_np[:, idx_ekf, idx_ekf])
+        
+        # Tracés EKF et Couloir 3-sigma
+        ax.plot(Temps_np, etat_estime, color='blue', label='Estimation EKF')
+        ax.fill_between(Temps_np, etat_estime - 3*sigma, etat_estime + 3*sigma, 
+                        color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
+        
+        # Tracé de la vérité terrain
+        ax.plot(Temps_np, etat_vrai, color='black', linestyle='--', label='Vérité')
+        
+        # Ajout des mesures capteurs (uniquement pour X et Y, soit idx < 2)
+        if mesures_xy is not None and idx < 2:
+            ax.scatter(temps_capteur_np, mesures_xy[idx], color="red", marker="x", linewidths=0.5, label='Mesure')
+            
+        # Esthétique
+        ax.set_title(f"{label} ({noms_etats[idx_ekf]})", fontsize=10)
+        ax.grid(True, linestyle=':', alpha=0.7)
+        if idx >= 2: # Ligne du bas
+            ax.set_xlabel("Temps (s)")
+            
+    # Légende unique pour la figure
+    handles, labels = axs[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='upper center', ncol=4, bbox_to_anchor=(0.5, 0.95))
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.85) # Laisse de la place au titre et à la légende
+
+# ---------------------------------------------------------
+# 1. TRACÉ DRONE 1
+# Indices : X=0, Y=3, Vx=6, Vy=9
+# ---------------------------------------------------------
+tracer_figure_drone(1, [0, 3, 6, 9], 
+                    [x_vrai_1, y_vrai_1, vx_vrai_1, vy_vrai_1], 
+                    mesures_xy=[x1_mesure, y1_mesure])
+
+# ---------------------------------------------------------
+# 2. TRACÉ DRONE 2
+# Indices : X=1, Y=4, Vx=7, Vy=10
+# ---------------------------------------------------------
+tracer_figure_drone(2, [1, 4, 7, 10], 
+                    [x_vrai_2, y_vrai_2, vx_vrai_2, vy_vrai_2], 
+                    mesures_xy=[x2_mesure, y2_mesure])
+
+# ---------------------------------------------------------
+# 3. TRACÉ DRONE 3
+# Indices : X=2, Y=5, Vx=8, Vy=11
+# ---------------------------------------------------------
+tracer_figure_drone(3, [2, 5, 8, 11], 
+                    [x_vrai_3, y_vrai_3, vx_vrai_3, vy_vrai_3], 
+                    mesures_xy=None) # Pas de mesures extraites pour le drone 3
+
+# ---------------------------------------------------------
+# 4. TRACÉ DES BIAIS (États 12 à 17)
+# ---------------------------------------------------------
+fig_biais, axs_biais = plt.subplots(3, 2, figsize=(12, 10), sharex=True)
+fig_biais.suptitle("Analyse EKF - États globaux (Biais)", fontsize=14, fontweight='bold')
+axs_biais = axs_biais.flatten()
+
+for idx, idx_ekf in enumerate(range(12, 18)):
+    ax = axs_biais[idx]
+    etat_estime = traj_kalman[:, 0, idx_ekf]
+    sigma = np.sqrt(P_hist_np[:, idx_ekf, idx_ekf])
+    
+    ax.plot(Temps_np, etat_estime, color='blue', label='Estimation EKF')
+    ax.fill_between(Temps_np, etat_estime - 3*sigma, etat_estime + 3*sigma, 
+                    color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
+    
+    ax.set_title(noms_etats[idx_ekf], fontsize=10)
+    ax.grid(True, linestyle=':', alpha=0.7)
+    if idx >= 4:
+        ax.set_xlabel("Temps (s)")
+
+handles_b, labels_b = axs_biais[0].get_legend_handles_labels()
+fig_biais.legend(handles_b, labels_b, loc='upper center', ncol=2, bbox_to_anchor=(0.5, 0.95))
+plt.tight_layout()
+plt.subplots_adjust(top=0.88)
+
+plt.show()
+
+
+
+
 temps_np = np.array(temps)[:traj.shape[0]]
 temps_capteur_np = np.array(temps_capteur)[:traj.shape[0]]
 P_hist_np = np.array(P_historique)[:traj.shape[0]]
