@@ -37,11 +37,11 @@ if variance_capteur :
     sigma_dist_23 = 0.1
     sigma_dist_13 = 0.1
     #----Variances pour R ----
-    sigma_R_gps_1 = 0.5
-    sigma_R_acc_2 = 0.1
-    sigma_R_dist_12 = 0.1
-    sigma_R_dist_23 = 0.1
-    sigma_R_dist_13 = 0.1
+    sigma_R_gps_1 = 5
+    sigma_R_acc_2 = 1
+    sigma_R_dist_12 = 1
+    sigma_R_dist_23 = 1
+    sigma_R_dist_13 = 1
 #-------------Variance du modele--------------
 variance_modele = True
 if variance_modele : 
@@ -71,33 +71,33 @@ if variance_modele :
     sigma_ay_3 = 5e-2
     sigma_bx_3 = 1e-6
     sigma_by_3 = 1e-6
-    #----Variances 1e-6 ----
-    sigma_Q_x_1 = 1e-2
-    sigma_Q_y_1 = 1e-2
-    sigma_Q_vx_1 = 1e-2
-    sigma_Q_vy_1 = 1e-2
-    sigma_Q_ax_1 = 5e-1
-    sigma_Q_ay_1 = 5e-1
-    sigma_Q_bx_1 = 1e-3
-    sigma_Q_by_1 = 1e-3
+    #----Variances Q ----
+    sigma_Q_x_1 = 1e-4
+    sigma_Q_y_1 = 1e-4
+    sigma_Q_vx_1 = 1e-4
+    sigma_Q_vy_1 = 1e-4
+    sigma_Q_ax_1 = 5e-3
+    sigma_Q_ay_1 = 5e-3
+    sigma_Q_bx_1 = 1e-5
+    sigma_Q_by_1 = 1e-5
 
-    sigma_Q_x_2 = 1e-2
-    sigma_Q_y_2 = 1e-2
-    sigma_Q_vx_2 = 1e-2
-    sigma_Q_vy_2 = 1e-2
-    sigma_Q_ax_2 = 5e-1
-    sigma_Q_ay_2 = 5e-1
-    sigma_Q_bx_2 = 1e-3
-    sigma_Q_by_2 = 1e-3
+    sigma_Q_x_2 = 1e-4
+    sigma_Q_y_2 = 1e-4
+    sigma_Q_vx_2 = 1e-4
+    sigma_Q_vy_2 = 1e-4
+    sigma_Q_ax_2 = 5e-3
+    sigma_Q_ay_2 = 5e-3
+    sigma_Q_bx_2 = 1e-5
+    sigma_Q_by_2 = 1e-5
 
-    sigma_Q_x_3 = 1e-2
-    sigma_Q_y_3 = 1e-2
-    sigma_Q_vx_3 = 1e-2
-    sigma_Q_vy_3 = 1e-2
-    sigma_Q_ax_3 = 5e-1
-    sigma_Q_ay_3 = 5e-1
-    sigma_Q_bx_3 = 1e-3
-    sigma_Q_by_3 = 1e-3
+    sigma_Q_x_3 = 1e-4
+    sigma_Q_y_3 = 1e-4
+    sigma_Q_vx_3 = 1e-4
+    sigma_Q_vy_3 = 1e-4
+    sigma_Q_ax_3 = 5e-3
+    sigma_Q_ay_3 = 5e-3
+    sigma_Q_bx_3 = 1e-5
+    sigma_Q_by_3 = 1e-5
 
 #---------Variance de l'init de kalman--------
 variance_init_kalman = True
@@ -547,14 +547,21 @@ x_kalman_pos_2 = traj_kalman[:step, 8:10]
 x_vrai_pos_3 = traj_vrai[:step, 16:18]
 x_kalman_pos_3 = traj_kalman[:step, 16:18]
 
+print(x_vrai_pos_1.shape)
 mse_D1 = np.square(np.subtract(x_vrai_pos_1,x_kalman_pos_1)).mean()
+mse_D1_final = np.square(np.subtract(x_vrai_pos_1[step-1],x_kalman_pos_1[step-1])).mean()
 mse_D2 = np.square(np.subtract(x_vrai_pos_2,x_kalman_pos_2)).mean()
+mse_D2_final = np.square(np.subtract(x_vrai_pos_2[step-1],x_kalman_pos_2[step-1])).mean()
 mse_D3 = np.square(np.subtract(x_vrai_pos_3,x_kalman_pos_3)).mean()
+mse_D3_final = np.square(np.subtract(x_vrai_pos_3[step-1],x_kalman_pos_3[step-1])).mean()
 #mse_tot = np.square(np.subtract(x_vrai_pos,x_kalman_pos)).mean()
 
 print(f"MSE D1 : {mse_D1}")
+print(f"MSE D1 finale : {mse_D1_final}")
 print(f"MSE D2 : {mse_D2}")
+print(f"MSE D2 finale : {mse_D2_final}")
 print(f"MSE D3 : {mse_D3}")
+print(f"MSE D3 finale : {mse_D3_final}")
 #print(f"MSE totale : {mse_tot}")
 
 plot_drones = True
