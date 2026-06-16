@@ -35,7 +35,7 @@ X_vrai_capteur_imu = np.zeros((int(t_max/dt_imu)+1, n_variable_etat * n_drone))
 variance_capteur = True
 if variance_capteur : 
     sigma_gps_1 = 0.5
-    sigma_acc_2 = 0.1
+    sigma_acc_2 = 0.01
     sigma_dist_12 = 0.5
     sigma_dist_23 = 0.5
     sigma_dist_13 = 0.5
@@ -240,8 +240,8 @@ Q_kalman[4, 4] = sigma_Q_ax_1*sigma_Q_ax_1 #ax1
 Q_kalman[5, 5] = sigma_Q_ay_1*sigma_Q_ay_1 #ay1
 Q_kalman[6, 6] = sigma_Q_bx_1*sigma_Q_bx_1 #bx1
 Q_kalman[7, 7] = sigma_Q_by_1*sigma_Q_by_1 #by1
-Q_kalman[8, 8] = sigma_Q_x_2*sigma_Q_x_2*10 #x2
-Q_kalman[9, 9] = sigma_Q_y_2*sigma_Q_y_2*10 #y2
+Q_kalman[8, 8] = sigma_Q_x_2*sigma_Q_x_2 #x2
+Q_kalman[9, 9] = sigma_Q_y_2*sigma_Q_y_2 #y2
 Q_kalman[10, 10] = sigma_Q_vx_2*sigma_Q_vx_2 #vx2
 Q_kalman[11, 11] = sigma_Q_vy_2*sigma_Q_vy_2 #vy2
 Q_kalman[12, 12] = sigma_Q_ax_2*sigma_Q_ax_2 #ax2
@@ -349,8 +349,6 @@ step_capteur_imu = 0
 traj_kalman[0] = X_est.copy()
 traj_vrai[0] = X_vrai.copy()
 
-
-
 compenser_biais = True
 
 if not compenser_biais:
@@ -410,6 +408,7 @@ while t<t_max :
     #----Correction de Kalman----
 
     if step % int(dt_imu / dt) ==0 :
+
         temps_capteur_imu.append(t)
         X_capteur_0 = X_vrai[12] + X_vrai[14] + np.random.normal(0, sigma_acc_2)
         X_capteur_1 = X_vrai[13] + X_vrai[15] + np.random.normal(0, sigma_acc_2)
@@ -533,7 +532,7 @@ while t<t_max :
 
 temps_np = np.array(temps)[:step]
 temps_capteur_np = np.array(temps_capteur)[:step_capteur]
-temps_capteur_imu_np = np.array(temps_capteur_imu)[:step_capteur]
+temps_capteur_imu_np = np.array(temps_capteur_imu)[:step_capteur_imu]
 P_hist_np = np.array(P_historique)[:step]
 
 x_vrai_1 = traj_vrai[:step, 0]
