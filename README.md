@@ -7,6 +7,7 @@ from scipy.linalg import block_diag
 t_max = 16
 dt = 0.1
 dt_capteur = 0.5
+dt_imu = 0.1
 n_drone = 3
 n_variable_etat = 8
 n_mesures = 7
@@ -21,8 +22,9 @@ temps_capteur = []
 traj_vrai = np.zeros((int(t_max/dt)+1, n_variable_etat * n_drone))
 traj_kalman = np.zeros((int(t_max/dt)+1, n_variable_etat * n_drone))
 mesures_capteur = np.zeros((int(t_max/dt_capteur)+1, n_mesures)) # à voir comment je vais m'organiser
+mesures_capteur_imu = np.zeros((int(t_max/dt_imu)+1, 2))
 X_vrai_capteur = np.zeros((int(t_max/dt_capteur)+1, n_variable_etat * n_drone))
-MSE_hist = np.zeros((int(t_max/dt)+1, n_variable_etat * n_drone))
+X_vrai_capteur_imu = np.zeros((int(t_max/dt_imu)+1, n_variable_etat * n_drone))
 
 ##############################################
 #------------Gestion des variances-------------
@@ -263,6 +265,11 @@ R_kalman = np.array([
     [0, 0, 0, 0, 0, sigma_R_dist_23*sigma_R_dist_23, 0], #d23
     [0, 0, 0, 0, 0, 0, sigma_R_dist_13*sigma_R_dist_13]]) #d13
 
+R_kalman_imu = np.array([
+    [sigma_R_acc_2*sigma_R_acc_2, 0],
+    [0, sigma_R_acc_2*sigma_R_acc_2]
+])
+
 F_kalman_1 = np.array([
     [1, 0, dt, 0, 0.5*dt*dt, 0, 0, 0],
     [0, 1, 0, dt, 0, 0.5*dt*dt, 0, 0],
@@ -338,6 +345,7 @@ phi_y = 0
 t = 0
 step = 0
 step_capteur = 0
+step_capteur_imu = 0 
 
 traj_kalman[0] = X_est.copy()
 traj_vrai[0] = X_vrai.copy()
@@ -401,6 +409,47 @@ while t<t_max :
     P_pred = F_kalman @ P_est @ F_kalman.T + Q_kalman
 
     #----Correction de Kalman----
+
+    if step % int(dt_imu / dt) ==0 :
+        
+        X_capteur_0 = X_vrai[12] + X_vrai[14] + np.random.normal(0, sigma_acc_2)
+        X_capteur_1 = X_vrai[13] + X_vrai[15] + np.random.normal(0, sigma_acc_2)
+        X_capteur = np.array([X_capteur_0, X_capteur_1])
+        mesure_kalman_imu = X_capteur.copy()
+
+        H_kalman_1 = np.array([
+            [0,0,0,0,0,0,0,0],
+            [0,0,0,0,0,0,0,0]
+        ])
+
+        H_kalman_2 = np.array([
+            [0,0,0,0,1,0,1,0],
+            [0,0,0,0,0,1,0,1]
+        ])
+
+        H_kalman_3 = np.array([
+            [0,0,0,0,0,0,0,0],
+            [0,0,0,0,0,0,0,0]
+        ])
+
+        H_kalman = np.concatenate((H_kalman_1, H_kalman_2, H_kalman_3), axis=1)
+
+        h_X_pred = np.array([X_pred[13] + X_pred[15]])
+        innov = mesure_kalman_imu - h_X_pred
+        S = H_kalman @ P_pred @ H_kalman.T + R_kalman_imu
+        S_inv = inv(S)
+        K = P_pred @ H_kalman.T @ S_inv
+        X_est = X_pred + K @ innov
+        P_est = (I_kalman - K @ H_kalman) @ P_pred
+        mesures_capteur_imu[step_capteur_imu] = mesure_kalman_imu
+        X_vrai_capteur_imu[step_capteur_imu] = X_vrai
+
+        step_capteur_imu+=1
+
+        if step % int(dt_capteur / dt) ==0 :
+            X_pred = X_est
+            P_pred = P_est
+
     if step % int(dt_capteur / dt) ==0 :
         temps_capteur.append(t)
 
@@ -415,13 +464,13 @@ while t<t_max :
         #----Propagation capteur----
         X_capteur_0 = X_vrai[0] + np.random.normal(0, sigma_gps_1)
         X_capteur_1 = X_vrai[1] + np.random.normal(0, sigma_gps_1)
-        X_capteur_2 = X_vrai[12] + X_vrai[14] + np.random.normal(0, sigma_acc_2)
-        X_capteur_3 = X_vrai[13] + X_vrai[15] + np.random.normal(0, sigma_acc_2)
-        X_capteur_4 = d12_vrai + np.random.normal(0, sigma_dist_12)
-        X_capteur_5 = d23_vrai + np.random.normal(0, sigma_dist_23)
-        X_capteur_6 = d13_vrai + np.random.normal(0, sigma_dist_13)
+        # X_capteur_2 = X_vrai[12] + X_vrai[14] + np.random.normal(0, sigma_acc_2)
+        # X_capteur_3 = X_vrai[13] + X_vrai[15] + np.random.normal(0, sigma_acc_2)
+        X_capteur_2 = d12_vrai + np.random.normal(0, sigma_dist_12)
+        X_capteur_3 = d23_vrai + np.random.normal(0, sigma_dist_23)
+        X_capteur_4 = d13_vrai + np.random.normal(0, sigma_dist_13)
 
-        X_capteur = np.array([X_capteur_0, X_capteur_1, X_capteur_2, X_capteur_3, X_capteur_4, X_capteur_5, X_capteur_6])
+        X_capteur = np.array([X_capteur_0, X_capteur_1, X_capteur_2, X_capteur_3, X_capteur_4])
         mesure_kalman = X_capteur.copy()
 
         h40 = (X_pred[0] - X_pred[8]) / d12_pred
@@ -434,8 +483,6 @@ while t<t_max :
         H_kalman_1 = np.array([
             [1, 0, 0, 0, 0, 0, 0, 0],
             [0, 1, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0],
             [h40, h41, 0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 0, 0],
             [h60, h61, 0, 0, 0, 0, 0, 0]])
@@ -443,8 +490,6 @@ while t<t_max :
         H_kalman_2 = np.array([
             [0, 0, 0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 1, 0, 1, 0],
-            [0, 0, 0, 0, 0, 1, 0, 1],
             [-h40, -h41, 0, 0, 0, 0, 0, 0],
             [h58, h59, 0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 0, 0]])
@@ -453,18 +498,12 @@ while t<t_max :
             [0, 0, 0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0],
             [-h58, -h59, 0, 0, 0, 0, 0, 0],
             [-h60, -h61, 0, 0, 0, 0, 0, 0]])
 
         H_kalman = np.concatenate((H_kalman_1, H_kalman_2, H_kalman_3), axis=1)
-
-        # if t<5.0:
-        #     H_kalman[5,:] = 0.0
-        #     H_kalman[6,:] = 0.0
         
-        h_X_pred = np.array([X_pred[0], X_pred[1], X_pred[12] + X_pred[14], X_pred[13] + X_pred[15], d12_pred, d23_pred, d13_pred])
+        h_X_pred = np.array([X_pred[0], X_pred[1], d12_pred, d23_pred, d13_pred])
         innov = mesure_kalman - h_X_pred
         S = H_kalman @ P_pred @ H_kalman.T + R_kalman
         S_inv = inv(S)
@@ -527,8 +566,8 @@ by_vrai_3 = traj_vrai[:step, 23]
 x_capteur_1 = mesures_capteur[:step_capteur, 0]
 y_capteur_1 = mesures_capteur[:step_capteur, 1]
 
-ax_capteur_2 = mesures_capteur[:step_capteur, 2]
-ay_capteur_2 = mesures_capteur[:step_capteur, 3]
+ax_capteur_2 = mesures_capteur_imu[:step_capteur_imu, 2]
+ay_capteur_2 = mesures_capteur_imu[:step_capteur_imu, 3]
 
 d12_capteur_2 = mesures_capteur[:step_capteur, 4]
 d23_capteur_2 = mesures_capteur[:step_capteur, 5]
@@ -562,8 +601,9 @@ by_kalman_3 = traj_kalman[:step, 23]
 
 x_vrai_capteur_x_1 = X_vrai_capteur[:step_capteur, 0]
 x_vrai_capteur_y_1 = X_vrai_capteur[:step_capteur, 1]
-x_vrai_capteur_ax_2 = X_vrai_capteur[:step_capteur, 12]
-x_vrai_capteur_ay_2 = X_vrai_capteur[:step_capteur, 13]
+
+x_vrai_capteur_ax_2 = X_vrai_capteur_imu[:step_capteur_imu, 12]
+x_vrai_capteur_ay_2 = X_vrai_capteur_imu[:step_capteur_imu, 13]
 
 x_vrai_pos_1 = traj_vrai[:step, 0:2]
 x_kalman_pos_1 = traj_kalman[:step, 0:2]
@@ -778,17 +818,6 @@ if plot_drones :
     fig.legend(handles, labels, loc='upper center', ncol=4, bbox_to_anchor=(0.5, 0.95))
 
 ###################################################################################################################
-
-plot_mse = False
-if plot_mse:
-    plt.figure(figsize=(8,6))
-    plt.plot(temps_np, MSE_hist, color='black')
-    plt.xlabel("temps (s)")
-    plt.ylabel("MSE")
-
-    plt.title("MSE")
-    plt.legend()
-    plt.grid(True)
 
 plot_traj = True
 if plot_traj : 
