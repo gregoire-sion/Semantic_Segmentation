@@ -37,11 +37,11 @@ if variance_capteur :
     sigma_dist_23 = 0.1
     sigma_dist_13 = 0.1
     #----Variances pour R ----
-    sigma_R_gps_1 = 5e-2
-    sigma_R_acc_2 = 1e-2
-    sigma_R_dist_12 = 1e-2
-    sigma_R_dist_23 = 1e-2
-    sigma_R_dist_13 = 1e-2
+    sigma_R_gps_1 = 5e-1
+    sigma_R_acc_2 = 1e-1
+    sigma_R_dist_12 = 1e-1
+    sigma_R_dist_23 = 1e-1
+    sigma_R_dist_13 = 1e-1
 #-------------Variance du modele--------------
 variance_modele = True
 if variance_modele : 
@@ -76,40 +76,40 @@ if variance_modele :
     sigma_Q_y_1 = 1e-3
     sigma_Q_vx_1 = 1e-3
     sigma_Q_vy_1 = 1e-3
-    sigma_Q_ax_1 = 5e-3
-    sigma_Q_ay_1 = 5e-3
-    sigma_Q_bx_1 = 1e-3
-    sigma_Q_by_1 = 1e-3
+    sigma_Q_ax_1 = 5e-1
+    sigma_Q_ay_1 = 5e-1
+    sigma_Q_bx_1 = 1e-5
+    sigma_Q_by_1 = 1e-5
 
     sigma_Q_x_2 = 1e-3
     sigma_Q_y_2 = 1e-3
     sigma_Q_vx_2 = 1e-3
     sigma_Q_vy_2 = 1e-3
-    sigma_Q_ax_2 = 5e-3
-    sigma_Q_ay_2 = 5e-3
-    sigma_Q_bx_2 = 1e-3
-    sigma_Q_by_2 = 1e-3
+    sigma_Q_ax_2 = 5e-1
+    sigma_Q_ay_2 = 5e-1
+    sigma_Q_bx_2 = 1e-5
+    sigma_Q_by_2 = 1e-5
 
     sigma_Q_x_3 = 1e-3
     sigma_Q_y_3 = 1e-3
     sigma_Q_vx_3 = 1e-3
     sigma_Q_vy_3 = 1e-3
-    sigma_Q_ax_3 = 5e-3
-    sigma_Q_ay_3 = 5e-3
-    sigma_Q_bx_3 = 1e-3
-    sigma_Q_by_3 = 1e-3
+    sigma_Q_ax_3 = 5e-1
+    sigma_Q_ay_3 = 5e-1
+    sigma_Q_bx_3 = 1e-5
+    sigma_Q_by_3 = 1e-5
 
 #---------Variance de l'init de kalman--------
 variance_init_kalman = True
 if variance_init_kalman:
     sigma_x_init = 2.0
-    sigma_v_init = 1e-2
-    sigma_a_init = 1e-2
+    sigma_v_init = 5e-1
+    sigma_a_init = 5e-1
     sigma_b_init = 1.0
     #----Variances pour P0 ----
     sigma_P_x_init = 2.0
-    sigma_P_v_init = 3e-1
-    sigma_P_a_init = 1e-2
+    sigma_P_v_init = 5e-1
+    sigma_P_a_init = 7e-1
     sigma_P_b_init = 1.0
 ################################
 #------------Vrai---------------
@@ -342,7 +342,9 @@ step_capteur = 0
 traj_kalman[0] = X_est.copy()
 traj_vrai[0] = X_vrai.copy()
 
-compenser_biais = True
+
+
+compenser_biais = False
 
 if not compenser_biais:
     # 1. On force l'estimation initiale des biais à 0
@@ -368,7 +370,7 @@ while t<t_max :
         u_vrai = np.array([1.0, 0.0 ,1.0, 0.0 ,1.0, 0.0])
         erreur_commande = np.random.normal(0, 0.1, size=6)
         erreur_commande[0:2]=[0,0]
-        u_kalman = u_vrai.copy() + np.random.normal(0, 2.0, size=6)
+        u_kalman = u_vrai.copy() + erreur_commande
 
     if step<(2*(t_max/dt)/3) and step>((t_max/dt)/3):
 
@@ -381,14 +383,14 @@ while t<t_max :
         u_vrai = np.array([Ax1*np.cos(phi_x), Ay1*np.sin(phi_y), Ax2*np.cos(phi_x), Ay2*np.sin(phi_y), Ax3*np.cos(phi_x), Ay3*np.sin(phi_y)])
         erreur_commande = np.random.normal(0, 0.1, size=6)
         erreur_commande[0:2]=[0,0]
-        u_kalman = u_vrai.copy() + np.random.normal(0, 2.0, size=6)
+        u_kalman = u_vrai.copy() + erreur_commande
 
     if step>(2*(t_max/dt)/3):
         
         u_vrai = np.array([1.0, 0.0,1.0, 0.0 ,1.0, 0.0])
         erreur_commande = np.random.normal(0, 0.1, size=6)
         erreur_commande[0:2]=[0,0]
-        u_kalman = u_vrai.copy() + np.random.normal(0, 2.0, size=6)
+        u_kalman = u_vrai.copy() + erreur_commande
 
     #----Propagation du vrai----
     w_vrai = np.array([np.random.normal(0, sigma_x_1), np.random.normal(0, sigma_y_1), np.random.normal(0, sigma_vx_1), np.random.normal(0, sigma_vy_1), np.random.normal(0, sigma_ax_1), np.random.normal(0, sigma_ay_1), np.random.normal(0, sigma_bx_1), np.random.normal(0, sigma_by_1), np.random.normal(0, sigma_x_2), np.random.normal(0, sigma_y_2), np.random.normal(0, sigma_vx_2), np.random.normal(0, sigma_vy_2), np.random.normal(0, sigma_ax_2), np.random.normal(0, sigma_ay_2), np.random.normal(0, sigma_bx_2), np.random.normal(0, sigma_by_2), np.random.normal(0, sigma_x_3), np.random.normal(0, sigma_y_3), np.random.normal(0, sigma_vx_3), np.random.normal(0, sigma_vy_3), np.random.normal(0, sigma_ax_3), np.random.normal(0, sigma_ay_3), np.random.normal(0, sigma_bx_3), np.random.normal(0, sigma_by_3) ])
