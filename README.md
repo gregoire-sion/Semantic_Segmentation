@@ -102,12 +102,12 @@ if variance_modele :
 #---------Variance de l'init de kalman--------
 variance_init_kalman = True
 if variance_init_kalman:
-    sigma_x_init = 2.0
+    sigma_x_init = 1.0
     sigma_v_init = 5e-1
     sigma_a_init = 5e-1
     sigma_b_init = 1.0
     #----Variances pour P0 ----
-    sigma_P_x_init = 2.0
+    sigma_P_x_init = 1.0
     sigma_P_v_init = 5e-1
     sigma_P_a_init = 5e-1
     sigma_P_b_init = 1.0
@@ -392,6 +392,11 @@ while t<t_max :
         erreur_commande[0:2]=[0,0]
         u_kalman = u_vrai.copy() + erreur_commande
 
+    acc_x_mesure = X_vrai[12] + X_vrai[14]
+    acc_y_mesure = X_vrai[13] + X_vrai[15]
+    u_kalman[2] = acc_x_mesure
+    u_kalman[3] = acc_y_mesure
+
     #----Propagation du vrai----
     w_vrai = np.array([np.random.normal(0, sigma_x_1), np.random.normal(0, sigma_y_1), np.random.normal(0, sigma_vx_1), np.random.normal(0, sigma_vy_1), np.random.normal(0, sigma_ax_1), np.random.normal(0, sigma_ay_1), np.random.normal(0, sigma_bx_1), np.random.normal(0, sigma_by_1), np.random.normal(0, sigma_x_2), np.random.normal(0, sigma_y_2), np.random.normal(0, sigma_vx_2), np.random.normal(0, sigma_vy_2), np.random.normal(0, sigma_ax_2), np.random.normal(0, sigma_ay_2), np.random.normal(0, sigma_bx_2), np.random.normal(0, sigma_by_2), np.random.normal(0, sigma_x_3), np.random.normal(0, sigma_y_3), np.random.normal(0, sigma_vx_3), np.random.normal(0, sigma_vy_3), np.random.normal(0, sigma_ax_3), np.random.normal(0, sigma_ay_3), np.random.normal(0, sigma_bx_3), np.random.normal(0, sigma_by_3) ])
     X_vrai = F_vrai @ X_vrai + B_vrai @ u_vrai + w_vrai
@@ -443,8 +448,8 @@ while t<t_max :
         H_kalman_2 = np.array([
             [0, 0, 0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 1, 0, 1, 0],
-            [0, 0, 0, 0, 0, 1, 0, 1],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
             [-h40, -h41, 0, 0, 0, 0, 0, 0],
             [h58, h59, 0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 0, 0]])
@@ -460,7 +465,7 @@ while t<t_max :
 
         H_kalman = np.concatenate((H_kalman_1, H_kalman_2, H_kalman_3), axis=1)
 
-        if t<5.0:
+        if t>8.0:
             H_kalman[5,:] = 0.0
             H_kalman[6,:] = 0.0
         
