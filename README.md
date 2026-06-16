@@ -10,10 +10,11 @@ dt_capteur = 0.5
 dt_imu = 0.1
 n_drone = 3
 n_variable_etat = 8
-n_mesures = 7
+n_mesures = 5
 
 temps = [0]
 temps_capteur = []
+temps_capteur_imu = []
 
 ##############################################
 #----------Gestion des sauvegardes------------
@@ -257,13 +258,11 @@ Q_kalman[22, 22] = sigma_Q_bx_3*sigma_Q_bx_3 #bx3
 Q_kalman[23, 23] = sigma_Q_by_3*sigma_Q_by_3 #by3
 
 R_kalman = np.array([
-    [sigma_R_gps_1*sigma_R_gps_1, 0, 0, 0, 0, 0, 0], #x1
-    [0, sigma_R_gps_1*sigma_R_gps_1, 0, 0, 0, 0, 0], #y1
-    [0, 0, sigma_R_acc_2*sigma_R_acc_2, 0, 0, 0, 0], #ax2
-    [0, 0, 0, sigma_R_acc_2*sigma_R_acc_2, 0, 0, 0], #ay2
-    [0, 0, 0, 0, sigma_R_dist_12*sigma_R_dist_12, 0, 0], #d12
-    [0, 0, 0, 0, 0, sigma_R_dist_23*sigma_R_dist_23, 0], #d23
-    [0, 0, 0, 0, 0, 0, sigma_R_dist_13*sigma_R_dist_13]]) #d13
+    [sigma_R_gps_1*sigma_R_gps_1, 0, 0, 0, 0], #x1
+    [0, sigma_R_gps_1*sigma_R_gps_1, 0, 0, 0], #y1
+    [0, 0, sigma_R_dist_12*sigma_R_dist_12, 0, 0], #d12
+    [0, 0, 0, sigma_R_dist_23*sigma_R_dist_23, 0], #d23
+    [0, 0, 0, 0, sigma_R_dist_13*sigma_R_dist_13]]) #d13
 
 R_kalman_imu = np.array([
     [sigma_R_acc_2*sigma_R_acc_2, 0],
@@ -411,7 +410,7 @@ while t<t_max :
     #----Correction de Kalman----
 
     if step % int(dt_imu / dt) ==0 :
-        
+        temps_capteur_imu.append(t)
         X_capteur_0 = X_vrai[12] + X_vrai[14] + np.random.normal(0, sigma_acc_2)
         X_capteur_1 = X_vrai[13] + X_vrai[15] + np.random.normal(0, sigma_acc_2)
         X_capteur = np.array([X_capteur_0, X_capteur_1])
@@ -434,7 +433,7 @@ while t<t_max :
 
         H_kalman = np.concatenate((H_kalman_1, H_kalman_2, H_kalman_3), axis=1)
 
-        h_X_pred = np.array([X_pred[13] + X_pred[15]])
+        h_X_pred = np.array([X_pred[12] + X_pred[14], X_pred[13] + X_pred[15]])
         innov = mesure_kalman_imu - h_X_pred
         S = H_kalman @ P_pred @ H_kalman.T + R_kalman_imu
         S_inv = inv(S)
@@ -534,6 +533,7 @@ while t<t_max :
 
 temps_np = np.array(temps)[:step]
 temps_capteur_np = np.array(temps_capteur)[:step_capteur]
+temps_capteur_imu_np = np.array(temps_capteur_imu)[:step_capteur]
 P_hist_np = np.array(P_historique)[:step]
 
 x_vrai_1 = traj_vrai[:step, 0]
@@ -566,11 +566,11 @@ by_vrai_3 = traj_vrai[:step, 23]
 x_capteur_1 = mesures_capteur[:step_capteur, 0]
 y_capteur_1 = mesures_capteur[:step_capteur, 1]
 
-ax_capteur_2 = mesures_capteur_imu[:step_capteur_imu, 2]
-ay_capteur_2 = mesures_capteur_imu[:step_capteur_imu, 3]
+ax_capteur_2 = mesures_capteur_imu[:step_capteur_imu, 0]
+ay_capteur_2 = mesures_capteur_imu[:step_capteur_imu, 1]
 
-d12_capteur_2 = mesures_capteur[:step_capteur, 4]
-d23_capteur_2 = mesures_capteur[:step_capteur, 5]
+d12_capteur_2 = mesures_capteur[:step_capteur, 2]
+d23_capteur_2 = mesures_capteur[:step_capteur, 3]
 
 x_kalman_1 = traj_kalman[:step, 0]
 y_kalman_1 = traj_kalman[:step, 1]
@@ -604,6 +604,7 @@ x_vrai_capteur_y_1 = X_vrai_capteur[:step_capteur, 1]
 
 x_vrai_capteur_ax_2 = X_vrai_capteur_imu[:step_capteur_imu, 12]
 x_vrai_capteur_ay_2 = X_vrai_capteur_imu[:step_capteur_imu, 13]
+
 
 x_vrai_pos_1 = traj_vrai[:step, 0:2]
 x_kalman_pos_1 = traj_kalman[:step, 0:2]
@@ -727,16 +728,21 @@ if plot_drones :
     axs[3].set_title("vy_vrai - vy_pred", fontsize=10)
     axs[3].grid(True, linestyle=':', alpha=0.7)
 
+
+    print(f"Temps capreur imu : {temps_capteur_imu_np.shape}")
+    print(f"ax capteur imu : {x_vrai_capteur_ax_2.shape}")
+    print(f"ax vrai imu : {ax_capteur_2.shape}")
+
     sigma = np.sqrt(P_hist_np[:, 12, 12])
     axs[4].plot(temps_np, ax_kalman_2 - ax_vrai_2, color='green', label='Estimation EKF')
-    axs[4].scatter(temps_capteur_np, ax_capteur_2 - x_vrai_capteur_ax_2, color="red", marker="x", label='Mesures Drone 2', linewidths=0.5)
+    axs[4].scatter(temps_capteur_imu_np, ax_capteur_2 - x_vrai_capteur_ax_2, color="red", marker="x", label='Mesures Drone 2', linewidths=0.5)
     axs[4].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
     axs[4].set_title("ax_vrai - ax_pred", fontsize=10)
     axs[4].grid(True, linestyle=':', alpha=0.7)
 
     sigma = np.sqrt(P_hist_np[:, 13, 13])
     axs[5].plot(temps_np, ay_kalman_2 - ay_vrai_2, color='green', label='Estimation EKF')
-    axs[5].scatter(temps_capteur_np, ay_capteur_2 - x_vrai_capteur_ay_2, color="red", marker="x", label='Mesures Drone 2', linewidths=0.5)
+    axs[5].scatter(temps_capteur_imu_np, ay_capteur_2 - x_vrai_capteur_ay_2, color="red", marker="x", label='Mesures Drone 2', linewidths=0.5)
     axs[5].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
     axs[5].set_title("ay_vrai - ay_pred", fontsize=10)
     axs[5].grid(True, linestyle=':', alpha=0.7)
