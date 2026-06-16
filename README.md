@@ -83,8 +83,8 @@ if variance_modele :
 
     sigma_Q_x_2 = 1e-3
     sigma_Q_y_2 = 1e-3
-    sigma_Q_vx_2 = 1e-3
-    sigma_Q_vy_2 = 1e-3
+    sigma_Q_vx_2 = 1e-1
+    sigma_Q_vy_2 = 1e-1
     sigma_Q_ax_2 = 5e-1
     sigma_Q_ay_2 = 5e-1
     sigma_Q_bx_2 = 1e-5
@@ -460,6 +460,10 @@ while t<t_max :
 
         H_kalman = np.concatenate((H_kalman_1, H_kalman_2, H_kalman_3), axis=1)
 
+        if t>6.0 and t<12.0:
+            H_kalman[4,:] = 0.0
+            H_kalman[5,:] = 0.0
+            H_kalman[6,:] = 0.0
         
         h_X_pred = np.array([X_pred[0], X_pred[1], X_pred[12] + X_pred[14], X_pred[13] + X_pred[15], d12_pred, d23_pred, d13_pred])
         innov = mesure_kalman - h_X_pred
