@@ -33,15 +33,15 @@ variance_capteur = True
 if variance_capteur : 
     sigma_gps_1 = 0.5
     sigma_acc_2 = 0.1
-    sigma_dist_12 = 0.1
-    sigma_dist_23 = 0.1
-    sigma_dist_13 = 0.1
+    sigma_dist_12 = 0.5
+    sigma_dist_23 = 0.5
+    sigma_dist_13 = 0.5
     #----Variances pour R ----
     sigma_R_gps_1 = 5e-1
     sigma_R_acc_2 = 1e-1
-    sigma_R_dist_12 = 1e-1
-    sigma_R_dist_23 = 1e-1
-    sigma_R_dist_13 = 1e-1
+    sigma_R_dist_12 = 5e-1
+    sigma_R_dist_23 = 5e-1
+    sigma_R_dist_13 = 5e-1
 #-------------Variance du modele--------------
 variance_modele = True
 if variance_modele : 
@@ -85,8 +85,8 @@ if variance_modele :
     sigma_Q_y_2 = 1e-3
     sigma_Q_vx_2 = 1e-1
     sigma_Q_vy_2 = 1e-1
-    sigma_Q_ax_2 = 5e-1
-    sigma_Q_ay_2 = 5e-1
+    sigma_Q_ax_2 = 1e-2
+    sigma_Q_ay_2 = 1e-2
     sigma_Q_bx_2 = 1e-5
     sigma_Q_by_2 = 1e-5
 
@@ -109,7 +109,7 @@ if variance_init_kalman:
     #----Variances pour P0 ----
     sigma_P_x_init = 2.0
     sigma_P_v_init = 5e-1
-    sigma_P_a_init = 7e-1
+    sigma_P_a_init = 5e-1
     sigma_P_b_init = 1.0
 ################################
 #------------Vrai---------------
@@ -250,7 +250,7 @@ Q_kalman[17, 17] = sigma_Q_y_3*sigma_Q_y_3 #y3
 Q_kalman[18, 18] = sigma_Q_vx_3*sigma_Q_vx_3 #vx3
 Q_kalman[19, 19] = sigma_Q_vy_3*sigma_Q_vy_3 #vy3
 Q_kalman[20, 20] = sigma_Q_ax_3*sigma_Q_ax_3 #ax3
-Q_kalman[21, 21] = sigma_ay_3*sigma_ay_3 #ay3
+Q_kalman[21, 21] = sigma_Q_ay_3*sigma_Q_ay_3 #ay3
 Q_kalman[22, 22] = sigma_Q_bx_3*sigma_Q_bx_3 #bx3
 Q_kalman[23, 23] = sigma_Q_by_3*sigma_Q_by_3 #by3
 
@@ -279,8 +279,8 @@ F_kalman_2 = np.array([
     [0, 1, 0, dt, 0, 0.5*dt*dt, 0, 0],
     [0, 0, 1, 0, dt, 0, 0, 0],
     [0, 0, 0, 1, 0, dt, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 1, 0, 0, 0],
+    [0, 0, 0, 0, 0, 1, 0, 0],
     [0, 0, 0, 0, 0, 0, 1, 0],
     [0, 0, 0, 0, 0, 0, 0, 1],
     ])
@@ -311,8 +311,8 @@ B_kalman_2 = np.array([[0, 0, 0, 0, 0, 0],
                [0, 0, 0, 0, 0, 0],
                [0, 0, 0, 0, 0, 0],
                [0, 0, 0, 0, 0, 0],
-               [0, 0, 1, 0, 0, 0],
-               [0, 0, 0, 1, 0, 0],
+               [0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0],
                [0, 0, 0, 0, 0, 0],
                [0, 0, 0, 0, 0, 0],])
 
@@ -344,7 +344,7 @@ traj_vrai[0] = X_vrai.copy()
 
 
 
-compenser_biais = False
+compenser_biais = True
 
 if not compenser_biais:
     # 1. On force l'estimation initiale des biais à 0
@@ -460,8 +460,7 @@ while t<t_max :
 
         H_kalman = np.concatenate((H_kalman_1, H_kalman_2, H_kalman_3), axis=1)
 
-        if t>6.0 and t<12.0:
-            H_kalman[4,:] = 0.0
+        if t<5.0:
             H_kalman[5,:] = 0.0
             H_kalman[6,:] = 0.0
         
@@ -620,7 +619,7 @@ if plot_drones :
     sigma = np.sqrt(P_hist_np[:, 2, 2])
     axs[2].plot(temps_np, vx_kalman_1 - vx_vrai_1, color='green', label='Estimation EKF')
     axs[2].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[2].set_title("vx_vrai - vy_pred", fontsize=10)
+    axs[2].set_title("vx_vrai - vx_pred", fontsize=10)
     axs[2].grid(True, linestyle=':', alpha=0.7)
 
     sigma = np.sqrt(P_hist_np[:, 3, 3])
@@ -649,7 +648,7 @@ if plot_drones :
     axs[6].set_xlabel("Temps (s)")
 
     sigma = np.sqrt(P_hist_np[:, 7, 7])
-    axs[7].plot(temps_np, bx_kalman_1 - bx_vrai_1, color='green', label='Estimation EKF')
+    axs[7].plot(temps_np, by_kalman_1 - by_vrai_1, color='green', label='Estimation EKF')
     axs[7].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
     axs[7].set_title("by_vrai - by_pred", fontsize=10)
     axs[7].grid(True, linestyle=':', alpha=0.7)
@@ -710,7 +709,7 @@ if plot_drones :
     axs[6].set_xlabel("Temps (s)")
 
     sigma = np.sqrt(P_hist_np[:, 15, 15])
-    axs[7].plot(temps_np, bx_kalman_2 - bx_vrai_2, color='green', label='Estimation EKF')
+    axs[7].plot(temps_np, by_kalman_2 - by_vrai_2, color='green', label='Estimation EKF')
     axs[7].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
     axs[7].set_title("by_vrai - by_pred", fontsize=10)
     axs[7].grid(True, linestyle=':', alpha=0.7)
@@ -769,7 +768,7 @@ if plot_drones :
     axs[6].set_xlabel("Temps (s)")
 
     sigma = np.sqrt(P_hist_np[:, 23, 23])
-    axs[7].plot(temps_np, bx_kalman_3 - bx_vrai_3, color='green', label='Estimation EKF')
+    axs[7].plot(temps_np, by_kalman_3 - by_vrai_3, color='green', label='Estimation EKF')
     axs[7].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
     axs[7].set_title("by_vrai - by_pred", fontsize=10)
     axs[7].grid(True, linestyle=':', alpha=0.7)
