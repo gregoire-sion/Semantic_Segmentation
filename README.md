@@ -1,848 +1,325 @@
+"""
+============================================================================
+ EKF — Localisation coopérative de 3 drones
+============================================================================
+ État par drone (8 variables) : [x, y, vx, vy, ax, ay, bx, by]
+   - position, vitesse, accélération, biais d'accéléromètre
+ État global : 24 = 3 x 8
+
+ Capteurs :
+   - GPS sur le drone 1               -> (x1, y1)        toutes les dt_capteur
+   - Distances inter-drones            -> d12, d23, d13   toutes les dt_capteur
+   - IMU (accéléromètre) sur drone 2   -> (ax2+bx2, ay2+by2) toutes les dt_imu
+
+ Le filtre connaît la commande des drones 1 et 3 (coopératifs), mais PAS
+ celle du drone 2 : son accélération est estimée via l'IMU + un modèle
+ de marche aléatoire (d'où la ligne "accélération constante" dans F_kalman_2).
+============================================================================
+"""
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.spatial import distance 
 from numpy.linalg import inv
 from scipy.linalg import block_diag
 
-t_max = 16
-dt = 0.1
-dt_capteur = 0.5
-dt_imu = 0.1
-n_drone = 3
-n_variable_etat = 8
-n_mesures = 5
-
-temps = [0]
-temps_capteur = []
-temps_capteur_imu = []
-
-##############################################
-#----------Gestion des sauvegardes------------
-##############################################
-
-traj_vrai = np.zeros((int(t_max/dt)+1, n_variable_etat * n_drone))
-traj_kalman = np.zeros((int(t_max/dt)+1, n_variable_etat * n_drone))
-mesures_capteur = np.zeros((int(t_max/dt_capteur)+1, n_mesures)) # à voir comment je vais m'organiser
-mesures_capteur_imu = np.zeros((int(t_max/dt_imu)+1, 2))
-X_vrai_capteur = np.zeros((int(t_max/dt_capteur)+1, n_variable_etat * n_drone))
-X_vrai_capteur_imu = np.zeros((int(t_max/dt_imu)+1, n_variable_etat * n_drone))
-
-##############################################
-#------------Gestion des variances-------------
-##############################################
-
-#----------Variance des mesures capteur-------
-variance_capteur = True
-if variance_capteur : 
-    sigma_gps_1 = 0.5
-    sigma_acc_2 = 0.01
-    sigma_dist_12 = 0.5
-    sigma_dist_23 = 0.5
-    sigma_dist_13 = 0.5
-    #----Variances pour R ----
-    sigma_R_gps_1 = 5e-1
-    sigma_R_acc_2 = 1e-1
-    sigma_R_dist_12 = 5e-1
-    sigma_R_dist_23 = 5e-1
-    sigma_R_dist_13 = 5e-1
-#-------------Variance du modele--------------
-variance_modele = True
-if variance_modele : 
-    sigma_x_1 = 1e-6
-    sigma_y_1 = 1e-6
-    sigma_vx_1 = 1e-6
-    sigma_vy_1 = 1e-6
-    sigma_ax_1 = 5e-2
-    sigma_ay_1 = 5e-2
-    sigma_bx_1 = 1e-6
-    sigma_by_1 = 1e-6
-
-    sigma_x_2 = 1e-6
-    sigma_y_2 = 1e-6
-    sigma_vx_2 = 1e-6
-    sigma_vy_2 = 1e-6
-    sigma_ax_2 = 5e-2
-    sigma_ay_2 = 5e-2
-    sigma_bx_2 = 1e-6
-    sigma_by_2 = 1e-6
-
-    sigma_x_3 = 1e-6
-    sigma_y_3 = 1e-6
-    sigma_vx_3 = 1e-6
-    sigma_vy_3 = 1e-6
-    sigma_ax_3 = 5e-2
-    sigma_ay_3 = 5e-2
-    sigma_bx_3 = 1e-6
-    sigma_by_3 = 1e-6
-    #----Variances Q ----
-    sigma_Q_x_1 = 1e-3
-    sigma_Q_y_1 = 1e-3
-    sigma_Q_vx_1 = 1e-3
-    sigma_Q_vy_1 = 1e-3
-    sigma_Q_ax_1 = 5e-1
-    sigma_Q_ay_1 = 5e-1
-    sigma_Q_bx_1 = 1e-5
-    sigma_Q_by_1 = 1e-5
-
-    sigma_Q_x_2 = 1e-3
-    sigma_Q_y_2 = 1e-3
-    sigma_Q_vx_2 = 1e-1
-    sigma_Q_vy_2 = 1e-1
-    sigma_Q_ax_2 = 1e-2
-    sigma_Q_ay_2 = 1e-2
-    sigma_Q_bx_2 = 1e-5
-    sigma_Q_by_2 = 1e-5
-
-    sigma_Q_x_3 = 1e-3
-    sigma_Q_y_3 = 1e-3
-    sigma_Q_vx_3 = 1e-3
-    sigma_Q_vy_3 = 1e-3
-    sigma_Q_ax_3 = 5e-1
-    sigma_Q_ay_3 = 5e-1
-    sigma_Q_bx_3 = 1e-5
-    sigma_Q_by_3 = 1e-5
-
-#---------Variance de l'init de kalman--------
-variance_init_kalman = True
-if variance_init_kalman:
-    sigma_x_init = 2.0
-    sigma_v_init = 5e-1
-    sigma_a_init = 5e-1
-    sigma_b_init = 1.0
-    #----Variances pour P0 ----
-    sigma_P_x_init = 2.0
-    sigma_P_v_init = 5e-1
-    sigma_P_a_init = 5e-1
-    sigma_P_b_init = 1.0
-################################
-#------------Vrai---------------
-################################
-
-X_vrai_1 = np.array([0, 10, 1.0, 0.0, 0, 0, 0, 0])
-X_vrai_2 = np.array([10, 0, 1.0, 0.0, 0, 0, 0.5, -0.2])
-X_vrai_3 = np.array([0, -10, 1.0, 0.0, 0, 0, 0, 0])
-
-X_vrai = np.concatenate((X_vrai_1, X_vrai_2, X_vrai_3))
-
-B1 = np.array([[0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [1, 0, 0, 0, 0, 0],
-               [0, 1, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],])
-
-B2 = np.array([[0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 1, 0, 0, 0],
-               [0, 0, 0, 1, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],])
-
-B3 = np.array([[0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 1, 0],
-               [0, 0, 0, 0, 0, 1],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],])
-
-B_vrai = np.concatenate((B1, B2, B3), axis=0)
-
-F_vrai_1 = np.array([
-    [1, 0, dt, 0, 0.5*dt*dt, 0, 0, 0],
-    [0, 1, 0, dt, 0, 0.5*dt*dt, 0, 0],
-    [0, 0, 1, 0, dt, 0, 0, 0],
-    [0, 0, 0, 1, 0, dt, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 1, 0],
-    [0, 0, 0, 0, 0, 0, 0, 1]])
-
-F_vrai_2 = np.array([
-    [1, 0, dt, 0, 0.5*dt*dt, 0, 0, 0],
-    [0, 1, 0, dt, 0, 0.5*dt*dt, 0, 0],
-    [0, 0, 1, 0, dt, 0, 0, 0],
-    [0, 0, 0, 1, 0, dt, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 1, 0],
-    [0, 0, 0, 0, 0, 0, 0, 1]])
-
-F_vrai_3 = np.array([
-    [1, 0, dt, 0, 0.5*dt*dt, 0, 0, 0],
-    [0, 1, 0, dt, 0, 0.5*dt*dt, 0, 0],
-    [0, 0, 1, 0, dt, 0, 0, 0],
-    [0, 0, 0, 1, 0, dt, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 1, 0],
-    [0, 0, 0, 0, 0, 0, 0, 1]])
-
-F_vrai = block_diag(F_vrai_1, F_vrai_2, F_vrai_3)
-
-################################
-#-------------Kalman------------
-################################
-
-erreur_init = np.array([np.random.normal(0, sigma_x_init), np.random.normal(0, sigma_x_init), np.random.normal(0, sigma_v_init), np.random.normal(0, sigma_v_init), np.random.normal(0, sigma_a_init), np.random.normal(0, sigma_a_init), np.random.normal(0, sigma_b_init), np.random.normal(0, sigma_b_init), np.random.normal(0, sigma_x_init), np.random.normal(0, sigma_x_init), np.random.normal(0, sigma_v_init), np.random.normal(0, sigma_v_init), np.random.normal(0, sigma_a_init), np.random.normal(0, sigma_a_init), np.random.normal(0, sigma_b_init), np.random.normal(0, sigma_b_init), np.random.normal(0, sigma_x_init), np.random.normal(0, sigma_x_init), np.random.normal(0, sigma_v_init), np.random.normal(0, sigma_v_init), np.random.normal(0, sigma_a_init), np.random.normal(0, sigma_a_init), np.random.normal(0, sigma_b_init), np.random.normal(0, sigma_b_init)])
-
-erreur_init_triche = np.zeros(24)
-erreur_init_triche[0:2] = np.random.normal(0, 2.0, size=2)
-erreur_init_triche[8:10] = np.random.normal(0, 2.0, size=2)
-erreur_init_triche[16:18] = np.random.normal(0, 2.0, size=2)
-
-
-X_est = X_vrai.copy() + erreur_init_triche
-
-P_historique = []
-
-P_est = np.eye(n_variable_etat*n_drone)
-P_est[0, 0] = sigma_P_x_init * sigma_P_x_init #x1
-P_est[1, 1] = sigma_P_x_init * sigma_P_x_init #y1
-P_est[2, 2] = sigma_P_v_init * sigma_P_v_init #vx1
-P_est[3, 3] = sigma_P_v_init * sigma_P_v_init #vy1
-P_est[4, 4] = sigma_P_a_init * sigma_P_a_init #ax1
-P_est[5, 5] = sigma_P_a_init * sigma_P_a_init #ay1
-P_est[6, 6] = sigma_P_b_init * sigma_P_b_init #bx1
-P_est[7, 7] = sigma_P_b_init * sigma_P_b_init #by1
-P_est[8, 8] = sigma_P_x_init * sigma_P_x_init #y2
-P_est[9, 9] = sigma_P_x_init * sigma_P_x_init #y2
-P_est[10, 10] = sigma_P_v_init * sigma_P_v_init #vx2
-P_est[11, 11] = sigma_P_v_init * sigma_P_v_init #vy2
-P_est[12, 12] = sigma_P_a_init * sigma_P_a_init #ax2
-P_est[13, 13] = sigma_P_a_init * sigma_P_a_init #ay2
-P_est[14, 14] = sigma_P_b_init * sigma_P_b_init #bx2
-P_est[15, 15] = sigma_P_b_init * sigma_P_b_init #by2
-P_est[16, 16] = sigma_P_x_init * sigma_P_x_init #x3
-P_est[17, 17] = sigma_P_x_init * sigma_P_x_init #y3
-P_est[18, 18] = sigma_P_v_init * sigma_P_v_init #vx3
-P_est[19, 19] = sigma_P_v_init * sigma_P_v_init #vy3
-P_est[20, 20] = sigma_P_a_init * sigma_P_a_init #ax3
-P_est[21, 21] = sigma_P_a_init * sigma_P_a_init #ay3
-P_est[22, 22] = sigma_P_b_init * sigma_P_b_init #bx3
-P_est[23, 23] = sigma_P_b_init * sigma_P_b_init #by3
-
-P_historique.append(P_est)
-
-I_kalman = np.eye(n_variable_etat * n_drone)
-
-Q_kalman = np.eye(n_variable_etat * n_drone)
-Q_kalman[0, 0] = sigma_Q_x_1*sigma_Q_x_1 #x1
-Q_kalman[1, 1] = sigma_Q_y_1*sigma_Q_y_1 #y1
-Q_kalman[2, 2] = sigma_Q_vx_1*sigma_Q_vx_1 #vx1
-Q_kalman[3, 3] = sigma_Q_vy_1*sigma_Q_vy_1 #vy1
-Q_kalman[4, 4] = sigma_Q_ax_1*sigma_Q_ax_1 #ax1
-Q_kalman[5, 5] = sigma_Q_ay_1*sigma_Q_ay_1 #ay1
-Q_kalman[6, 6] = sigma_Q_bx_1*sigma_Q_bx_1 #bx1
-Q_kalman[7, 7] = sigma_Q_by_1*sigma_Q_by_1 #by1
-Q_kalman[8, 8] = sigma_Q_x_2*sigma_Q_x_2 #x2
-Q_kalman[9, 9] = sigma_Q_y_2*sigma_Q_y_2 #y2
-Q_kalman[10, 10] = sigma_Q_vx_2*sigma_Q_vx_2 #vx2
-Q_kalman[11, 11] = sigma_Q_vy_2*sigma_Q_vy_2 #vy2
-Q_kalman[12, 12] = sigma_Q_ax_2*sigma_Q_ax_2 #ax2
-Q_kalman[13, 13] = sigma_Q_ay_2*sigma_Q_ay_2 #ay2
-Q_kalman[14, 14] = sigma_Q_bx_2*sigma_Q_bx_2 #bx2
-Q_kalman[15, 15] = sigma_Q_by_2*sigma_Q_by_2 #by2
-Q_kalman[16, 16] = sigma_Q_x_3*sigma_Q_x_3 #x3
-Q_kalman[17, 17] = sigma_Q_y_3*sigma_Q_y_3 #y3
-Q_kalman[18, 18] = sigma_Q_vx_3*sigma_Q_vx_3 #vx3
-Q_kalman[19, 19] = sigma_Q_vy_3*sigma_Q_vy_3 #vy3
-Q_kalman[20, 20] = sigma_Q_ax_3*sigma_Q_ax_3 #ax3
-Q_kalman[21, 21] = sigma_Q_ay_3*sigma_Q_ay_3 #ay3
-Q_kalman[22, 22] = sigma_Q_bx_3*sigma_Q_bx_3 #bx3
-Q_kalman[23, 23] = sigma_Q_by_3*sigma_Q_by_3 #by3
-
-R_kalman = np.array([
-    [sigma_R_gps_1*sigma_R_gps_1, 0, 0, 0, 0], #x1
-    [0, sigma_R_gps_1*sigma_R_gps_1, 0, 0, 0], #y1
-    [0, 0, sigma_R_dist_12*sigma_R_dist_12, 0, 0], #d12
-    [0, 0, 0, sigma_R_dist_23*sigma_R_dist_23, 0], #d23
-    [0, 0, 0, 0, sigma_R_dist_13*sigma_R_dist_13]]) #d13
-
-R_kalman_imu = np.array([
-    [sigma_R_acc_2*sigma_R_acc_2, 0],
-    [0, sigma_R_acc_2*sigma_R_acc_2]
-])
-
-F_kalman_1 = np.array([
-    [1, 0, dt, 0, 0.5*dt*dt, 0, 0, 0],
-    [0, 1, 0, dt, 0, 0.5*dt*dt, 0, 0],
-    [0, 0, 1, 0, dt, 0, 0, 0],
-    [0, 0, 0, 1, 0, dt, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 1, 0],
-    [0, 0, 0, 0, 0, 0, 0, 1],
-    ])
-
-F_kalman_2 = np.array([
-    [1, 0, dt, 0, 0.5*dt*dt, 0, 0, 0],
-    [0, 1, 0, dt, 0, 0.5*dt*dt, 0, 0],
-    [0, 0, 1, 0, dt, 0, 0, 0],
-    [0, 0, 0, 1, 0, dt, 0, 0],
-    [0, 0, 0, 0, 1, 0, 0, 0],
-    [0, 0, 0, 0, 0, 1, 0, 0],
-    [0, 0, 0, 0, 0, 0, 1, 0],
-    [0, 0, 0, 0, 0, 0, 0, 1],
-    ])
-
-F_kalman_3 = np.array([
-    [1, 0, dt, 0, 0.5*dt*dt, 0, 0, 0],
-    [0, 1, 0, dt, 0, 0.5*dt*dt, 0, 0],
-    [0, 0, 1, 0, dt, 0, 0, 0],
-    [0, 0, 0, 1, 0, dt, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 1, 0],
-    [0, 0, 0, 0, 0, 0, 0, 1],
-    ])
-
-F_kalman = block_diag(F_kalman_1, F_kalman_2, F_kalman_3)
-
-B_kalman_1 = np.array([[0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [1, 0, 0, 0, 0, 0],
-               [0, 1, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],])
-
-B_kalman_2 = np.array([[0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],])
-
-B_kalman_3 = np.array([[0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 1, 0],
-               [0, 0, 0, 0, 0, 1],
-               [0, 0, 0, 0, 0, 0],
-               [0, 0, 0, 0, 0, 0],])
-
-B_kalman = np.concatenate((B_kalman_1, B_kalman_2, B_kalman_3), axis=0)
-
-################################
-#-----------Commande------------
-################################
-
-Ax1, Ay1, Ax2, Ay2, Ax3, Ay3 = 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
-phi_x = 0
-phi_y = 0
-
-t = 0
-step = 0
-step_capteur = 0
-step_capteur_imu = 0 
-
-traj_kalman[0] = X_est.copy()
-traj_vrai[0] = X_vrai.copy()
-
-compenser_biais = True
-
-if not compenser_biais:
-    # 1. On force l'estimation initiale des biais à 0
-    X_est[6:8] = 0.0
-    X_est[14:16] = 0.0
-    X_est[22:24] = 0.0
-    
-    # 2. On verrouille P0 (Le filtre refuse d'apprendre)
-    # (On utilise 1e-8 au lieu de 0.0 pour éviter l'erreur SingularMatrix)
-    P_est[6, 6] = P_est[7, 7] = 1e-8
-    P_est[14, 14] = P_est[15, 15] = 1e-8
-    P_est[22, 22] = P_est[23, 23] = 1e-8
-    
-    # 3. On verrouille Q (Le filtre refuse de douter)
-    Q_kalman[6, 6] = Q_kalman[7, 7] = 1e-8
-    Q_kalman[14, 14] = Q_kalman[15, 15] = 1e-8
-    Q_kalman[22, 22] = Q_kalman[23, 23] = 1e-8
-
-while t<t_max :
-    #----Choix de la commande----
-    if step<((t_max/dt)/3):
-        
-        u_vrai = np.array([1.0, 0.0 ,1.0, 0.0 ,1.0, 0.0])
-        erreur_commande = np.random.normal(0, 0.1, size=6)
-        erreur_commande[0:2]=[0,0]
-        u_kalman = u_vrai.copy() + erreur_commande
-
-    if step<(2*(t_max/dt)/3) and step>((t_max/dt)/3):
-
-        omega_x = 5 #rad/s
-        omega_y = 1
-
-        phi_x += omega_x * dt
-        phi_y += omega_y * dt
-
-        u_vrai = np.array([Ax1*np.cos(phi_x), Ay1*np.sin(phi_y), Ax2*np.cos(phi_x), Ay2*np.sin(phi_y), Ax3*np.cos(phi_x), Ay3*np.sin(phi_y)])
-        erreur_commande = np.random.normal(0, 0.1, size=6)
-        erreur_commande[0:2]=[0,0]
-        u_kalman = u_vrai.copy() + erreur_commande
-
-    if step>(2*(t_max/dt)/3):
-        
-        u_vrai = np.array([1.0, 0.0,1.0, 0.0 ,1.0, 0.0])
-        erreur_commande = np.random.normal(0, 0.1, size=6)
-        erreur_commande[0:2]=[0,0]
-        u_kalman = u_vrai.copy() + erreur_commande
-
-    #----Propagation du vrai----
-    w_vrai = np.array([np.random.normal(0, sigma_x_1), np.random.normal(0, sigma_y_1), np.random.normal(0, sigma_vx_1), np.random.normal(0, sigma_vy_1), np.random.normal(0, sigma_ax_1), np.random.normal(0, sigma_ay_1), np.random.normal(0, sigma_bx_1), np.random.normal(0, sigma_by_1), np.random.normal(0, sigma_x_2), np.random.normal(0, sigma_y_2), np.random.normal(0, sigma_vx_2), np.random.normal(0, sigma_vy_2), np.random.normal(0, sigma_ax_2), np.random.normal(0, sigma_ay_2), np.random.normal(0, sigma_bx_2), np.random.normal(0, sigma_by_2), np.random.normal(0, sigma_x_3), np.random.normal(0, sigma_y_3), np.random.normal(0, sigma_vx_3), np.random.normal(0, sigma_vy_3), np.random.normal(0, sigma_ax_3), np.random.normal(0, sigma_ay_3), np.random.normal(0, sigma_bx_3), np.random.normal(0, sigma_by_3) ])
-    X_vrai = F_vrai @ X_vrai + B_vrai @ u_vrai + w_vrai
-
-    #----Propagation de Kalman----
-    X_pred = F_kalman @ X_est + B_kalman @ u_kalman
-    P_pred = F_kalman @ P_est @ F_kalman.T + Q_kalman
-
-    #----Correction de Kalman----
-
-    if step % int(dt_imu / dt) ==0 :
-
-        temps_capteur_imu.append(t)
-        X_capteur_0 = X_vrai[12] + X_vrai[14] + np.random.normal(0, sigma_acc_2)
-        X_capteur_1 = X_vrai[13] + X_vrai[15] + np.random.normal(0, sigma_acc_2)
-        X_capteur = np.array([X_capteur_0, X_capteur_1])
-        mesure_kalman_imu = X_capteur.copy()
-
-        H_kalman_1 = np.array([
-            [0,0,0,0,0,0,0,0],
-            [0,0,0,0,0,0,0,0]
-        ])
-
-        H_kalman_2 = np.array([
-            [0,0,0,0,1,0,1,0],
-            [0,0,0,0,0,1,0,1]
-        ])
-
-        H_kalman_3 = np.array([
-            [0,0,0,0,0,0,0,0],
-            [0,0,0,0,0,0,0,0]
-        ])
-
-        H_kalman = np.concatenate((H_kalman_1, H_kalman_2, H_kalman_3), axis=1)
-
-        h_X_pred = np.array([X_pred[12] + X_pred[14], X_pred[13] + X_pred[15]])
-        innov = mesure_kalman_imu - h_X_pred
-        S = H_kalman @ P_pred @ H_kalman.T + R_kalman_imu
-        S_inv = inv(S)
-        K = P_pred @ H_kalman.T @ S_inv
-        X_est = X_pred + K @ innov
-        P_est = (I_kalman - K @ H_kalman) @ P_pred
-        mesures_capteur_imu[step_capteur_imu] = mesure_kalman_imu
-        X_vrai_capteur_imu[step_capteur_imu] = X_vrai
-
-        step_capteur_imu+=1
-
-        if step % int(dt_capteur / dt) ==0 :
-            X_pred = X_est
-            P_pred = P_est
-
-    if step % int(dt_capteur / dt) ==0 :
-        temps_capteur.append(t)
-
-        d12_vrai = np.sqrt((X_vrai[0]-X_vrai[8])**2 + (X_vrai[1]-X_vrai[9])**2)
-        d23_vrai = np.sqrt((X_vrai[8]-X_vrai[16])**2 + (X_vrai[9]-X_vrai[17])**2)
-        d13_vrai = np.sqrt((X_vrai[0]-X_vrai[16])**2 + (X_vrai[1]-X_vrai[17])**2)
-        
-        d12_pred = np.sqrt((X_pred[0]-X_pred[8])**2 + (X_pred[1]-X_pred[9])**2)
-        d23_pred = np.sqrt((X_pred[8]-X_pred[16])**2 + (X_pred[9]-X_pred[17])**2)
-        d13_pred = np.sqrt((X_pred[0]-X_pred[16])**2 + (X_pred[1]-X_pred[17])**2)
-
-        #----Propagation capteur----
-        X_capteur_0 = X_vrai[0] + np.random.normal(0, sigma_gps_1)
-        X_capteur_1 = X_vrai[1] + np.random.normal(0, sigma_gps_1)
-        # X_capteur_2 = X_vrai[12] + X_vrai[14] + np.random.normal(0, sigma_acc_2)
-        # X_capteur_3 = X_vrai[13] + X_vrai[15] + np.random.normal(0, sigma_acc_2)
-        X_capteur_2 = d12_vrai + np.random.normal(0, sigma_dist_12)
-        X_capteur_3 = d23_vrai + np.random.normal(0, sigma_dist_23)
-        X_capteur_4 = d13_vrai + np.random.normal(0, sigma_dist_13)
-
-        X_capteur = np.array([X_capteur_0, X_capteur_1, X_capteur_2, X_capteur_3, X_capteur_4])
-        mesure_kalman = X_capteur.copy()
-
-        h40 = (X_pred[0] - X_pred[8]) / d12_pred
-        h41 = (X_pred[1] - X_pred[9]) / d12_pred
-        h58 = (X_pred[8] - X_pred[16]) / d23_pred
-        h59 = (X_pred[9] - X_pred[17]) / d23_pred
-        h60 = (X_pred[0] - X_pred[16]) / d13_pred
-        h61 = (X_pred[1] - X_pred[17]) / d13_pred
-
-        H_kalman_1 = np.array([
-            [1, 0, 0, 0, 0, 0, 0, 0],
-            [0, 1, 0, 0, 0, 0, 0, 0],
-            [h40, h41, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0],
-            [h60, h61, 0, 0, 0, 0, 0, 0]])
-
-        H_kalman_2 = np.array([
-            [0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0],
-            [-h40, -h41, 0, 0, 0, 0, 0, 0],
-            [h58, h59, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0]])
-
-        H_kalman_3 = np.array([
-            [0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0],
-            [-h58, -h59, 0, 0, 0, 0, 0, 0],
-            [-h60, -h61, 0, 0, 0, 0, 0, 0]])
-
-        H_kalman = np.concatenate((H_kalman_1, H_kalman_2, H_kalman_3), axis=1)
-        
-        h_X_pred = np.array([X_pred[0], X_pred[1], d12_pred, d23_pred, d13_pred])
-        innov = mesure_kalman - h_X_pred
-        S = H_kalman @ P_pred @ H_kalman.T + R_kalman
-        S_inv = inv(S)
-        K = P_pred @ H_kalman.T @ S_inv
-        X_est = X_pred + K @ innov
-        P_est = (I_kalman - K @ H_kalman) @ P_pred
-        mesures_capteur[step_capteur] = mesure_kalman
-        X_vrai_capteur[step_capteur] = X_vrai
-
-        step_capteur += 1
-
-    else : 
-        X_est = X_pred
-        P_est = P_pred
-
-    #---Enregistrement des trajectoires----
-
-    P_historique.append(P_est.copy())
-    traj_vrai[step] = X_vrai
-    traj_kalman[step] = X_est
-    temps.append(t)
-    t = t + dt 
-    step += 1
-
-################################
-#-----------Affichage-----------
-################################
-
-temps_np = np.array(temps)[:step]
-temps_capteur_np = np.array(temps_capteur)[:step_capteur]
-temps_capteur_imu_np = np.array(temps_capteur_imu)[:step_capteur_imu]
-P_hist_np = np.array(P_historique)[:step]
-
-x_vrai_1 = traj_vrai[:step, 0]
-y_vrai_1 = traj_vrai[:step, 1]
-vx_vrai_1 = traj_vrai[:step, 2]
-vy_vrai_1 = traj_vrai[:step, 3]
-ax_vrai_1 = traj_vrai[:step, 4]
-ay_vrai_1 = traj_vrai[:step, 5]
-bx_vrai_1 = traj_vrai[:step, 6]
-by_vrai_1 = traj_vrai[:step, 7]
-
-x_vrai_2 = traj_vrai[:step, 8]
-y_vrai_2 = traj_vrai[:step, 9]
-vx_vrai_2 = traj_vrai[:step, 10]
-vy_vrai_2 = traj_vrai[:step, 11]
-ax_vrai_2 = traj_vrai[:step, 12]
-ay_vrai_2 = traj_vrai[:step, 13]
-bx_vrai_2 = traj_vrai[:step, 14]
-by_vrai_2 = traj_vrai[:step, 15]
-
-x_vrai_3 = traj_vrai[:step, 16]
-y_vrai_3 = traj_vrai[:step, 17]
-vx_vrai_3 = traj_vrai[:step, 18]
-vy_vrai_3 = traj_vrai[:step, 19]
-ax_vrai_3 = traj_vrai[:step, 20]
-ay_vrai_3 = traj_vrai[:step, 21]
-bx_vrai_3 = traj_vrai[:step, 22]
-by_vrai_3 = traj_vrai[:step, 23]
-
-x_capteur_1 = mesures_capteur[:step_capteur, 0]
-y_capteur_1 = mesures_capteur[:step_capteur, 1]
-
-ax_capteur_2 = mesures_capteur_imu[:step_capteur_imu, 0]
-ay_capteur_2 = mesures_capteur_imu[:step_capteur_imu, 1]
-
-d12_capteur_2 = mesures_capteur[:step_capteur, 2]
-d23_capteur_2 = mesures_capteur[:step_capteur, 3]
-
-x_kalman_1 = traj_kalman[:step, 0]
-y_kalman_1 = traj_kalman[:step, 1]
-vx_kalman_1 = traj_kalman[:step, 2]
-vy_kalman_1 = traj_kalman[:step, 3]
-ax_kalman_1 = traj_kalman[:step, 4]
-ay_kalman_1 = traj_kalman[:step, 5]
-bx_kalman_1 = traj_kalman[:step, 6]
-by_kalman_1 = traj_kalman[:step, 7]
-
-x_kalman_2 = traj_kalman[:step, 8]
-y_kalman_2 = traj_kalman[:step, 9]
-vx_kalman_2 = traj_kalman[:step, 10]
-vy_kalman_2 = traj_kalman[:step, 11]
-ax_kalman_2 = traj_kalman[:step, 12]
-ay_kalman_2 = traj_kalman[:step, 13]
-bx_kalman_2 = traj_kalman[:step, 14]
-by_kalman_2 = traj_kalman[:step, 15]
-
-x_kalman_3 = traj_kalman[:step, 16]
-y_kalman_3 = traj_kalman[:step, 17]
-vx_kalman_3 = traj_kalman[:step, 18]
-vy_kalman_3 = traj_kalman[:step, 19]
-ax_kalman_3 = traj_kalman[:step, 20]
-ay_kalman_3 = traj_kalman[:step, 21]
-bx_kalman_3 = traj_kalman[:step, 22]
-by_kalman_3 = traj_kalman[:step, 23]
-
-x_vrai_capteur_x_1 = X_vrai_capteur[:step_capteur, 0]
-x_vrai_capteur_y_1 = X_vrai_capteur[:step_capteur, 1]
-
-x_vrai_capteur_ax_2 = X_vrai_capteur_imu[:step_capteur_imu, 12]
-x_vrai_capteur_ay_2 = X_vrai_capteur_imu[:step_capteur_imu, 13]
-
-
-x_vrai_pos_1 = traj_vrai[:step, 0:2]
-x_kalman_pos_1 = traj_kalman[:step, 0:2]
-
-x_vrai_pos_2 = traj_vrai[:step, 8:10]
-x_kalman_pos_2 = traj_kalman[:step, 8:10]
-
-x_vrai_pos_3 = traj_vrai[:step, 16:18]
-x_kalman_pos_3 = traj_kalman[:step, 16:18]
-
-mse_D1 = np.square(np.subtract(x_vrai_pos_1,x_kalman_pos_1)).mean()
-mse_D1_init = np.square(np.subtract(x_vrai_pos_1[0],x_kalman_pos_1[0])).mean()
-mse_D1_final = np.square(np.subtract(x_vrai_pos_1[step-1],x_kalman_pos_1[step-1])).mean()
-mse_D2 = np.square(np.subtract(x_vrai_pos_2,x_kalman_pos_2)).mean()
-mse_D2_init = np.square(np.subtract(x_vrai_pos_2[0],x_kalman_pos_2[0])).mean()
-mse_D2_final = np.square(np.subtract(x_vrai_pos_2[step-1],x_kalman_pos_2[step-1])).mean()
-mse_D3 = np.square(np.subtract(x_vrai_pos_3,x_kalman_pos_3)).mean()
-mse_D3_init = np.square(np.subtract(x_vrai_pos_3[0],x_kalman_pos_3[0])).mean()
-mse_D3_final = np.square(np.subtract(x_vrai_pos_3[step-1],x_kalman_pos_3[step-1])).mean()
-
-
-print(f"MSE D1 : {mse_D1}")
-print(f"MSE D1 initiale : {mse_D1_init}")
-print(f"MSE D1 finale : {mse_D1_final}")
-print(f"MSE D2 : {mse_D2}")
-print(f"MSE D2 initiale : {mse_D2_init}")
-print(f"MSE D2 finale : {mse_D2_final}")
-print(f"MSE D3 : {mse_D3}")
-print(f"MSE D3 initiale : {mse_D3_init}")
-print(f"MSE D3 finale : {mse_D3_final}")
-
-plot_drones = True
-if plot_drones :
-
+np.random.seed(0)  # reproductibilité (à retirer pour du vrai aléatoire)
+
+# --------------------------------------------------------------------------
+# 1. Paramètres de simulation
+# --------------------------------------------------------------------------
+t_max      = 16.0
+dt         = 0.1
+dt_capteur = 0.5      # cadence GPS + distances
+dt_imu     = 0.1      # cadence IMU
+n_drone    = 3
+n_var      = 8        # variables d'état par drone
+N          = n_drone * n_var
+n_steps    = int(round(t_max / dt))
+
+ratio_imu = int(round(dt_imu / dt))      # un pas IMU tous les `ratio_imu` pas
+ratio_gps = int(round(dt_capteur / dt))  # un pas GPS tous les `ratio_gps` pas
+
+# --------------------------------------------------------------------------
+# 2. Écarts-types
+# --------------------------------------------------------------------------
+# Bruit "physique" injecté dans la vérité terrain
+sigma_w_accel = 5e-2          # bruit de modèle sur l'accélération
+sigma_w_autre = 1e-6          # bruit négligeable sur le reste
+
+# Bruit réel des capteurs (utilisé pour générer les mesures bruitées)
+sigma_gps = 0.5
+sigma_acc = 0.01
+sigma_d   = 0.5
+
+# Bruit supposé par le filtre (matrices R) — volontairement >= bruit réel
+sigma_R_gps = 0.5
+sigma_R_acc = 0.1
+sigma_R_d   = 0.5
+
+# Incertitude initiale (P0)
+sigma_P_x, sigma_P_v, sigma_P_a, sigma_P_b = 2.0, 0.5, 0.5, 1.0
+
+# --------------------------------------------------------------------------
+# 3. Matrices du modèle
+# --------------------------------------------------------------------------
+def Bmat(cols):
+    """Place la commande (2 composantes) sur les lignes accélération (ax, ay)."""
+    M = np.zeros((8, 6))
+    M[4, cols[0]] = 1.0
+    M[5, cols[1]] = 1.0
+    return M
+
+def Fmat(accel_constante):
+    """Matrice de transition d'un drone.
+    accel_constante=True  -> a_{k+1} = a_k (marche aléatoire, cas drone 2)
+    accel_constante=False -> a_{k+1} = 0   (l'accel vient uniquement de B.u)"""
+    a = 1.0 if accel_constante else 0.0
+    return np.array([
+        [1, 0, dt, 0, 0.5*dt*dt, 0,        0, 0],
+        [0, 1, 0,  dt, 0,        0.5*dt*dt, 0, 0],
+        [0, 0, 1,  0,  dt,       0,         0, 0],
+        [0, 0, 0,  1,  0,        dt,        0, 0],
+        [0, 0, 0,  0,  a,        0,         0, 0],
+        [0, 0, 0,  0,  0,        a,         0, 0],
+        [0, 0, 0,  0,  0,        0,         1, 0],
+        [0, 0, 0,  0,  0,        0,         0, 1]], dtype=float)
+
+# Vérité : les 3 drones reçoivent leur accélération de la commande
+F_vrai = block_diag(Fmat(False), Fmat(False), Fmat(False))
+B_vrai = np.concatenate((Bmat([0, 1]), Bmat([2, 3]), Bmat([4, 5])), axis=0)
+
+# Filtre : connaît u1 et u3 ; pour le drone 2, accel = marche aléatoire (B=0)
+F_kalman = block_diag(Fmat(False), Fmat(True), Fmat(False))
+B_kalman = np.concatenate((Bmat([0, 1]), np.zeros((8, 6)), Bmat([4, 5])), axis=0)
+
+# Bruit de processus Q (diagonale)
+Q = np.eye(N) * 1e-3
+for b in (0, 8, 16):
+    Q[b+4, b+4] = Q[b+5, b+5] = 0.5**2     # accel
+    Q[b+6, b+6] = Q[b+7, b+7] = 1e-5**2    # biais (quasi figé)
+Q[10, 10] = Q[11, 11] = 0.1**2             # vitesse drone 2 (plus libre)
+Q[12, 12] = Q[13, 13] = 1e-2**2            # accel drone 2
+
+# Matrices de bruit de mesure
+R_gps = np.diag([sigma_R_gps**2, sigma_R_gps**2,
+                 sigma_R_d**2,   sigma_R_d**2,   sigma_R_d**2])
+R_imu = np.diag([sigma_R_acc**2, sigma_R_acc**2])
+
+I_N = np.eye(N)
+
+# Écarts-types du bruit de vérité, par composante
+w_sigma = np.full(N, sigma_w_autre)
+for b in (0, 8, 16):
+    w_sigma[b+4] = w_sigma[b+5] = sigma_w_accel
+
+# --------------------------------------------------------------------------
+# 4. Initialisation des états
+# --------------------------------------------------------------------------
+X_vrai = np.concatenate(([0, 10, 1, 0, 0, 0, 0,   0],
+                         [10, 0, 1, 0, 0, 0, 0.5, -0.2],
+                         [0, -10, 1, 0, 0, 0, 0,  0])).astype(float)
+
+# Erreur initiale : on ne se trompe que sur la POSITION de chaque drone
+erreur_init = np.zeros(N)
+for b in (0, 8, 16):
+    erreur_init[b:b+2] = np.random.normal(0, 2.0, size=2)
+X_est = X_vrai + erreur_init
+
+# Covariance initiale P0
+P_est = np.eye(N)
+for b in (0, 8, 16):
+    P_est[b,   b]   = P_est[b+1, b+1] = sigma_P_x**2
+    P_est[b+2, b+2] = P_est[b+3, b+3] = sigma_P_v**2
+    P_est[b+4, b+4] = P_est[b+5, b+5] = sigma_P_a**2
+    P_est[b+6, b+6] = P_est[b+7, b+7] = sigma_P_b**2
+
+# --------------------------------------------------------------------------
+# 5. Tableaux d'historique (indexés proprement de 0 à n_steps)
+# --------------------------------------------------------------------------
+traj_vrai   = np.zeros((n_steps + 1, N))
+traj_kalman = np.zeros((n_steps + 1, N))
+P_hist      = np.zeros((n_steps + 1, N, N))
+temps       = np.zeros(n_steps + 1)
+
+traj_vrai[0]   = X_vrai
+traj_kalman[0] = X_est
+P_hist[0]      = P_est
+
+# Mesures (pour superposition sur les graphes)
+mes_gps  = []   # (t, x1, y1)
+mes_imu  = []   # (t, ax2_mes, ay2_mes, ax2_vrai, ay2_vrai)
+mes_gpsv = []   # (x1_vrai, y1_vrai) au même instant
+
+# --------------------------------------------------------------------------
+# 6. Helpers EKF
+# --------------------------------------------------------------------------
+def maj_kalman(X, P, H, innov, R):
+    """Étape de correction (forme de Joseph -> P reste symétrique et définie positive)."""
+    S = H @ P @ H.T + R
+    K = P @ H.T @ inv(S)
+    X = X + K @ innov
+    A = I_N - K @ H
+    P = A @ P @ A.T + K @ R @ K.T
+    return X, P
+
+# --------------------------------------------------------------------------
+# 7. Boucle principale
+# --------------------------------------------------------------------------
+phi_x = phi_y = 0.0
+
+for k in range(1, n_steps + 1):
+    step = k - 1            # indice de pas (pour la cadence des capteurs)
+    t    = k * dt
+
+    # ---- Commande -------------------------------------------------------
+    if step < n_steps / 3:
+        u_vrai = np.array([1., 0., 1., 0., 1., 0.])
+    elif step < 2 * n_steps / 3:
+        phi_x += 5 * dt      # omega_x = 5 rad/s
+        phi_y += 1 * dt      # omega_y = 1 rad/s
+        u_vrai = np.array([np.cos(phi_x), np.sin(phi_y),
+                           np.cos(phi_x), np.sin(phi_y),
+                           np.cos(phi_x), np.sin(phi_y)])
+    else:
+        u_vrai = np.array([1., 0., 1., 0., 1., 0.])
+
+    # Le filtre reçoit une commande bruitée (et ne touche pas u1 en x,y ici)
+    err_cmd = np.random.normal(0, 0.1, size=6)
+    err_cmd[0:2] = 0.0
+    u_kalman = u_vrai + err_cmd
+
+    # ---- Propagation de la vérité --------------------------------------
+    X_vrai = F_vrai @ X_vrai + B_vrai @ u_vrai + np.random.normal(0, 1, N) * w_sigma
+
+    # ---- Prédiction du filtre ------------------------------------------
+    Xc = F_kalman @ X_est + B_kalman @ u_kalman
+    Pc = F_kalman @ P_est @ F_kalman.T + Q
+
+    # ---- Correction IMU (drone 2) — mises à jour SÉQUENTIELLES ----------
+    # On corrige directement (Xc, Pc) : la correction n'est JAMAIS jetée.
+    if step % ratio_imu == 0:
+        mes = np.array([X_vrai[12] + X_vrai[14] + np.random.normal(0, sigma_acc),
+                        X_vrai[13] + X_vrai[15] + np.random.normal(0, sigma_acc)])
+        H = np.zeros((2, N))
+        H[0, 12] = H[0, 14] = 1.0   # mesure = ax2 + bx2
+        H[1, 13] = H[1, 15] = 1.0   # mesure = ay2 + by2
+        innov = mes - H @ Xc
+        Xc, Pc = maj_kalman(Xc, Pc, H, innov, R_imu)
+        mes_imu.append((t, mes[0], mes[1], X_vrai[12], X_vrai[13]))
+
+    # ---- Correction GPS + distances ------------------------------------
+    if step % ratio_gps == 0:
+        # Jacobien linéarisé AUTOUR DE L'ESTIMÉE COURANTE Xc (bonne pratique EKF)
+        d12 = np.hypot(Xc[0]-Xc[8],  Xc[1]-Xc[9])
+        d23 = np.hypot(Xc[8]-Xc[16], Xc[9]-Xc[17])
+        d13 = np.hypot(Xc[0]-Xc[16], Xc[1]-Xc[17])
+
+        d12v = np.hypot(X_vrai[0]-X_vrai[8],  X_vrai[1]-X_vrai[9])
+        d23v = np.hypot(X_vrai[8]-X_vrai[16], X_vrai[9]-X_vrai[17])
+        d13v = np.hypot(X_vrai[0]-X_vrai[16], X_vrai[1]-X_vrai[17])
+
+        mes = np.array([X_vrai[0] + np.random.normal(0, sigma_gps),
+                        X_vrai[1] + np.random.normal(0, sigma_gps),
+                        d12v + np.random.normal(0, sigma_d),
+                        d23v + np.random.normal(0, sigma_d),
+                        d13v + np.random.normal(0, sigma_d)])
+
+        H = np.zeros((5, N))
+        H[0, 0] = 1.0                      # GPS x1
+        H[1, 1] = 1.0                      # GPS y1
+        H[2, 0] =  (Xc[0]-Xc[8])  / d12;  H[2, 1] =  (Xc[1]-Xc[9])  / d12
+        H[2, 8] = -H[2, 0];               H[2, 9] = -H[2, 1]           # d12
+        H[3, 8] =  (Xc[8]-Xc[16]) / d23;  H[3, 9] =  (Xc[9]-Xc[17]) / d23
+        H[3,16] = -H[3, 8];               H[3,17] = -H[3, 9]           # d23
+        H[4, 0] =  (Xc[0]-Xc[16]) / d13;  H[4, 1] =  (Xc[1]-Xc[17]) / d13
+        H[4,16] = -H[4, 0];               H[4,17] = -H[4, 1]           # d13
+
+        h_pred = np.array([Xc[0], Xc[1], d12, d23, d13])
+        innov  = mes - h_pred
+        Xc, Pc = maj_kalman(Xc, Pc, H, innov, R_gps)
+        mes_gps.append((t, mes[0], mes[1]))
+        mes_gpsv.append((X_vrai[0], X_vrai[1]))
+
+    # ---- Enregistrement -------------------------------------------------
+    X_est, P_est = Xc, Pc
+    traj_vrai[k]   = X_vrai
+    traj_kalman[k] = X_est
+    P_hist[k]      = P_est
+    temps[k]       = t
+
+# --------------------------------------------------------------------------
+# 8. Erreurs (MSE de position)
+# --------------------------------------------------------------------------
+def mse(a, b): return np.square(a - b).mean()
+
+print("=== MSE position (x, y) ===")
+for d, b in [(1, 0), (2, 8), (3, 16)]:
+    v = traj_vrai[:, b:b+2]; e = traj_kalman[:, b:b+2]
+    print(f"  Drone {d} : globale {mse(v, e):7.4f} | "
+          f"initiale {mse(v[0], e[0]):7.4f} | finale {mse(v[-1], e[-1]):7.4f}")
+
+# --------------------------------------------------------------------------
+# 9. Affichage
+# --------------------------------------------------------------------------
+labels = ['x', 'y', 'vx', 'vy', 'ax', 'ay', 'bx', 'by']
+mes_gps  = np.array(mes_gps)  if mes_gps  else np.empty((0, 3))
+mes_gpsv = np.array(mes_gpsv) if mes_gpsv else np.empty((0, 2))
+mes_imu  = np.array(mes_imu)  if mes_imu  else np.empty((0, 5))
+
+def figure_drone(d, base):
     fig, axs = plt.subplots(4, 2, figsize=(12, 8), sharex=True)
-    fig.suptitle("Analyse EKF - Drone 1", fontsize=14, fontweight='bold')
+    fig.suptitle(f"Analyse EKF — Drone {d}  (erreur d'estimation et couloir ±3σ)",
+                 fontsize=13, fontweight='bold')
     axs = axs.flatten()
+    for i in range(8):
+        idx   = base + i
+        sigma = np.sqrt(P_hist[:, idx, idx])
+        err   = traj_kalman[:, idx] - traj_vrai[:, idx]
+        axs[i].fill_between(temps, -3*sigma, 3*sigma, color='blue', alpha=0.2,
+                            label=r'Couloir $\pm 3\sigma$')
+        axs[i].plot(temps, err, color='green', label='Erreur EKF')
+        axs[i].axhline(0, color='k', lw=0.6)
+        axs[i].set_title(f"{labels[i]} : estimé − vrai", fontsize=10)
+        axs[i].grid(True, linestyle=':', alpha=0.7)
+    # Superposition des mesures GPS pour le drone 1 (x, y)
+    if d == 1 and len(mes_gps):
+        axs[0].scatter(mes_gps[:, 0], mes_gps[:, 1] - mes_gpsv[:, 0],
+                       color='red', marker='x', s=20, label='Mesure GPS')
+        axs[1].scatter(mes_gps[:, 0], mes_gps[:, 2] - mes_gpsv[:, 1],
+                       color='red', marker='x', s=20, label='Mesure GPS')
+    # Superposition des mesures IMU pour le drone 2 (ax, ay)
+    if d == 2 and len(mes_imu):
+        axs[4].scatter(mes_imu[:, 0], mes_imu[:, 1] - mes_imu[:, 3],
+                       color='red', marker='x', s=20, label='Mesure IMU')
+        axs[5].scatter(mes_imu[:, 0], mes_imu[:, 2] - mes_imu[:, 4],
+                       color='red', marker='x', s=20, label='Mesure IMU')
+    axs[6].set_xlabel("Temps (s)"); axs[7].set_xlabel("Temps (s)")
+    h, l = axs[0].get_legend_handles_labels()
+    fig.legend(h, l, loc='upper center', ncol=3, bbox_to_anchor=(0.5, 0.97))
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    return fig
 
-    sigma = np.sqrt(P_hist_np[:, 0, 0])
-    axs[0].plot(temps_np, x_kalman_1 - x_vrai_1, color='green', label='Estimation EKF')
-    axs[0].scatter(temps_capteur_np, x_capteur_1 - x_vrai_capteur_x_1, color="red", marker="x", label="Mesures Drone 1", linewidths=0.5)
-    axs[0].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[0].set_title("x_vrai - x_pred", fontsize=10)
-    axs[0].grid(True, linestyle=':', alpha=0.7)
+f1 = figure_drone(1, 0)
+f2 = figure_drone(2, 8)
+f3 = figure_drone(3, 16)
 
-    sigma = np.sqrt(P_hist_np[:, 1, 1])
-    axs[1].plot(temps_np, y_kalman_1 - y_vrai_1, color='green', label='Estimation EKF')
-    axs[1].scatter(temps_capteur_np, y_capteur_1 - x_vrai_capteur_y_1, color="red", marker="x", label="Mesures Drone 1", linewidths=0.5)
-    axs[1].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[1].set_title("y_vrai - y_pred", fontsize=10)
-    axs[1].grid(True, linestyle=':', alpha=0.7)
+# Trajectoires 2D
+f4 = plt.figure(figsize=(8, 7))
+i1, i2 = n_steps // 3, 2 * n_steps // 3
+if len(mes_gps):
+    plt.scatter(mes_gps[:, 1], mes_gps[:, 2], color='red', marker='x',
+                s=20, label='Mesures GPS (Drone 1)')
+for d, base, mk in [(1, 0, '^'), (2, 8, 'o'), (3, 16, 's')]:
+    plt.plot(traj_vrai[:, base], traj_vrai[:, base+1], color='black',
+             marker=mk, markevery=[i1], label=f'Drone {d} — vérité')
+    plt.plot(traj_kalman[:, base], traj_kalman[:, base+1], color='green',
+             linestyle='-', marker=mk, markevery=[i2], label=f'Drone {d} — EKF')
+plt.xlabel("X"); plt.ylabel("Y"); plt.title("Trajectoires des 3 drones")
+plt.legend(fontsize=8); plt.grid(True); plt.axis('equal')
 
-    sigma = np.sqrt(P_hist_np[:, 2, 2])
-    axs[2].plot(temps_np, vx_kalman_1 - vx_vrai_1, color='green', label='Estimation EKF')
-    axs[2].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[2].set_title("vx_vrai - vx_pred", fontsize=10)
-    axs[2].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 3, 3])
-    axs[3].plot(temps_np, vy_kalman_1 - vy_vrai_1, color='green', label='Estimation EKF')
-    axs[3].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[3].set_title("vy_vrai - vy_pred", fontsize=10)
-    axs[3].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 4, 4])
-    axs[4].plot(temps_np, ax_kalman_1 - ax_vrai_1, color='green', label='Estimation EKF')
-    axs[4].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[4].set_title("ax_vrai - ax_pred", fontsize=10)
-    axs[4].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 5, 5])
-    axs[5].plot(temps_np, ay_kalman_1 - ay_vrai_1, color='green', label='Estimation EKF')
-    axs[5].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[5].set_title("ay_vrai - ay_pred", fontsize=10)
-    axs[5].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 6, 6])
-    axs[6].plot(temps_np, bx_kalman_1 - bx_vrai_1, color='green', label='Estimation EKF')
-    axs[6].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[6].set_title("bx_vrai - bx_pred", fontsize=10)
-    axs[6].grid(True, linestyle=':', alpha=0.7)
-    axs[6].set_xlabel("Temps (s)")
-
-    sigma = np.sqrt(P_hist_np[:, 7, 7])
-    axs[7].plot(temps_np, by_kalman_1 - by_vrai_1, color='green', label='Estimation EKF')
-    axs[7].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[7].set_title("by_vrai - by_pred", fontsize=10)
-    axs[7].grid(True, linestyle=':', alpha=0.7)
-    axs[7].set_xlabel("Temps (s)")
-
-    handles, labels = axs[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='upper center', ncol=4, bbox_to_anchor=(0.5, 0.95))
-
-    #############################################################################################
-
-    fig, axs = plt.subplots(4, 2, figsize=(12, 8), sharex=True)
-    fig.suptitle("Analyse EKF - Drone 2", fontsize=14, fontweight='bold')
-    axs = axs.flatten()
-
-    sigma = np.sqrt(P_hist_np[:, 8, 8])
-    axs[0].plot(temps_np, x_kalman_2 - x_vrai_2, color='green', label='Estimation EKF')
-    axs[0].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[0].set_title("x_vrai - x_pred", fontsize=10)
-    axs[0].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 9, 9])
-    axs[1].plot(temps_np, y_kalman_2 - y_vrai_2, color='green', label='Estimation EKF')
-    axs[1].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[1].set_title("y_vrai - y_pred", fontsize=10)
-    axs[1].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 10, 10])
-    axs[2].plot(temps_np, vx_kalman_2 - vx_vrai_2, color='green', label='Estimation EKF')
-    axs[2].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[2].set_title("vx_vrai - vx_pred", fontsize=10)
-    axs[2].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 11, 11])
-    axs[3].plot(temps_np, vy_kalman_2 - vy_vrai_2, color='green', label='Estimation EKF')
-    axs[3].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[3].set_title("vy_vrai - vy_pred", fontsize=10)
-    axs[3].grid(True, linestyle=':', alpha=0.7)
-
-
-    print(f"Temps capreur imu : {temps_capteur_imu_np.shape}")
-    print(f"ax capteur imu : {x_vrai_capteur_ax_2.shape}")
-    print(f"ax vrai imu : {ax_capteur_2.shape}")
-
-    sigma = np.sqrt(P_hist_np[:, 12, 12])
-    axs[4].plot(temps_np, ax_kalman_2 - ax_vrai_2, color='green', label='Estimation EKF')
-    axs[4].scatter(temps_capteur_imu_np, ax_capteur_2 - x_vrai_capteur_ax_2, color="red", marker="x", label='Mesures Drone 2', linewidths=0.5)
-    axs[4].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[4].set_title("ax_vrai - ax_pred", fontsize=10)
-    axs[4].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 13, 13])
-    axs[5].plot(temps_np, ay_kalman_2 - ay_vrai_2, color='green', label='Estimation EKF')
-    axs[5].scatter(temps_capteur_imu_np, ay_capteur_2 - x_vrai_capteur_ay_2, color="red", marker="x", label='Mesures Drone 2', linewidths=0.5)
-    axs[5].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[5].set_title("ay_vrai - ay_pred", fontsize=10)
-    axs[5].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 14, 14])
-    axs[6].plot(temps_np, bx_kalman_2 - bx_vrai_2, color='green', label='Estimation EKF')
-    axs[6].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[6].set_title("bx_vrai - bx_pred", fontsize=10)
-    axs[6].grid(True, linestyle=':', alpha=0.7)
-    axs[6].set_xlabel("Temps (s)")
-
-    sigma = np.sqrt(P_hist_np[:, 15, 15])
-    axs[7].plot(temps_np, by_kalman_2 - by_vrai_2, color='green', label='Estimation EKF')
-    axs[7].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[7].set_title("by_vrai - by_pred", fontsize=10)
-    axs[7].grid(True, linestyle=':', alpha=0.7)
-    axs[7].set_xlabel("Temps (s)")
-
-    handles, labels = axs[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='upper center', ncol=4, bbox_to_anchor=(0.5, 0.95))
-
-    ####################################################################################################################
-
-    fig, axs = plt.subplots(4, 2, figsize=(12, 8), sharex=True)
-    fig.suptitle("Analyse EKF - Drone 3", fontsize=14, fontweight='bold')
-    axs = axs.flatten()
-
-    sigma = np.sqrt(P_hist_np[:, 16, 16])
-    axs[0].plot(temps_np, x_kalman_3 - x_vrai_3, color='green', label='Estimation EKF')
-    axs[0].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[0].set_title("x_vrai - x_pred", fontsize=10)
-    axs[0].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 17, 17])
-    axs[1].plot(temps_np, y_kalman_3 - y_vrai_3, color='green', label='Estimation EKF')
-    axs[1].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[1].set_title("y_vrai - y_pred", fontsize=10)
-    axs[1].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 18, 18])
-    axs[2].plot(temps_np, vx_kalman_3 - vx_vrai_3, color='green', label='Estimation EKF')
-    axs[2].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[2].set_title("vx_vrai - vx_pred", fontsize=10)
-    axs[2].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 19, 19])
-    axs[3].plot(temps_np, vy_kalman_3 - vy_vrai_3, color='green', label='Estimation EKF')
-    axs[3].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[3].set_title("vy_vrai - vy_pred", fontsize=10)
-    axs[3].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 20, 20])
-    axs[4].plot(temps_np, ax_kalman_3 - ax_vrai_3, color='green', label='Estimation EKF')
-    axs[4].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[4].set_title("ax_vrai - ax_pred", fontsize=10)
-    axs[4].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 21, 21])
-    axs[5].plot(temps_np, ay_kalman_3 - ay_vrai_3, color='green', label='Estimation EKF')
-    axs[5].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[5].set_title("ay_vrai - ay_pred", fontsize=10)
-    axs[5].grid(True, linestyle=':', alpha=0.7)
-
-    sigma = np.sqrt(P_hist_np[:, 22, 22])
-    axs[6].plot(temps_np, bx_kalman_3 - bx_vrai_3, color='green', label='Estimation EKF')
-    axs[6].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[6].set_title("bx_vrai - bx_pred", fontsize=10)
-    axs[6].grid(True, linestyle=':', alpha=0.7)
-    axs[6].set_xlabel("Temps (s)")
-
-    sigma = np.sqrt(P_hist_np[:, 23, 23])
-    axs[7].plot(temps_np, by_kalman_3 - by_vrai_3, color='green', label='Estimation EKF')
-    axs[7].fill_between(temps_np,- 3*sigma, 3*sigma, color='blue', alpha=0.2, label='Couloir $\pm 3\sigma$')
-    axs[7].set_title("by_vrai - by_pred", fontsize=10)
-    axs[7].grid(True, linestyle=':', alpha=0.7)
-    axs[7].set_xlabel("Temps (s)")
-
-    handles, labels = axs[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='upper center', ncol=4, bbox_to_anchor=(0.5, 0.95))
-
-###################################################################################################################
-
-plot_traj = True
-if plot_traj : 
-    plt.figure(figsize=(8,6))
-
-    indice_inf = int((t_max/dt)/3)
-    indice_sup = int(indice_inf*2)
-    plt.scatter(x_capteur_1, y_capteur_1, color="red", marker="x", label="Mesures Drone 1", linewidths=0.5)
-    plt.plot(x_vrai_1, y_vrai_1, marker='^', markevery=[indice_inf], label='Drone 1 vrai', color='black')
-    plt.plot(x_vrai_2, y_vrai_2, marker='o', markevery=[indice_inf], label='Drone 2 vrai', color='black')
-    plt.plot(x_vrai_3, y_vrai_3, marker='s', markevery=[indice_inf], label='Drone 3 vrai', color='black')
-    plt.plot(x_kalman_1, y_kalman_1, marker='^', markevery=[indice_sup], label='Drone 1 corrige par Kalman', color='green', linestyle='-')
-    plt.plot(x_kalman_2, y_kalman_2, marker='o', markevery=[indice_sup], label='Drone 2 corrige par Kalman', color='green', linestyle='-')
-    plt.plot(x_kalman_3, y_kalman_3, marker='s', markevery=[indice_sup], label='Drone 3 corrige par Kalman', color='green', linestyle='-')
-
-    plt.xlabel("X")
-    plt.ylabel("Y")
-
-    plt.title("Trajectoire des 3 drones")
-    plt.legend()
-    plt.grid(True)
+# Sauvegarde
+import os
+os.makedirs("/mnt/user-data/outputs", exist_ok=True)
+for fig, name in [(f1, "drone1"), (f2, "drone2"), (f3, "drone3"), (f4, "trajectoires")]:
+    fig.savefig(f"/mnt/user-data/outputs/ekf_{name}.png", dpi=110, bbox_inches='tight')
 
 plt.show()
