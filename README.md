@@ -1,4 +1,3 @@
-
 (Environnement) scvmpr10.fr.mbda.priv:/home/gsionsua/Work_bis/Bases/Projet $python simulation.py 
 Scénario A : tous capteurs, biais estimé...
 Scénario B : tous capteurs, biais NON estimé...
@@ -12,17 +11,6 @@ Scénario D : sans distances, biais estimé...
   D - Sans distances, biais estimé         : 986.0845
 Exception in Tkinter callback
 Traceback (most recent call last):
-  File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/matplotlib/lines.py", line 207, in _mark_every_path
-    return Path(verts[markevery], _slice_or_none(codes, markevery))
-  File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/matplotlib/path.py", line 130, in __init__
-    _api.check_shape((None, 2), vertices=vertices)
-  File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/matplotlib/_api/__init__.py", line 162, in check_shape
-    raise ValueError(
-ValueError: 'vertices' must be 2D with shape (N, 2), but your input has shape (1, 1, 2)
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
   File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/tkinter/__init__.py", line 1921, in __call__
     return self.func(*args)
   File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/tkinter/__init__.py", line 839, in callit
@@ -51,22 +39,11 @@ Traceback (most recent call last):
     return draw(artist, renderer)
   File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/matplotlib/lines.py", line 853, in draw
     subsampled = _mark_every_path(
-  File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/matplotlib/lines.py", line 209, in _mark_every_path
-    raise ValueError(
-ValueError: markevery=[(53,)] is iterable but not a valid numpy fancy index
+  File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/matplotlib/lines.py", line 147, in _mark_every_path
+    raise ValueError('`markevery` is a tuple but its len is not 2; '
+ValueError: `markevery` is a tuple but its len is not 2; markevery=(53,)
 Exception in Tkinter callback
 Traceback (most recent call last):
-  File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/matplotlib/lines.py", line 207, in _mark_every_path
-    return Path(verts[markevery], _slice_or_none(codes, markevery))
-  File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/matplotlib/path.py", line 130, in __init__
-    _api.check_shape((None, 2), vertices=vertices)
-  File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/matplotlib/_api/__init__.py", line 162, in check_shape
-    raise ValueError(
-ValueError: 'vertices' must be 2D with shape (N, 2), but your input has shape (1, 1, 2)
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
   File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/tkinter/__init__.py", line 1921, in __call__
     return self.func(*args)
   File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/tkinter/__init__.py", line 839, in callit
@@ -95,6 +72,6 @@ Traceback (most recent call last):
     return draw(artist, renderer)
   File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/matplotlib/lines.py", line 853, in draw
     subsampled = _mark_every_path(
-  File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/matplotlib/lines.py", line 209, in _mark_every_path
-    raise ValueError(
-ValueError: markevery=[(53,)] is iterable but not a valid numpy fancy index
+  File "/home/gsionsua/Work_bis/Environnement/lib/python3.10/site-packages/matplotlib/lines.py", line 147, in _mark_every_path
+    raise ValueError('`markevery` is a tuple but its len is not 2; '
+ValueError: `markevery` is a tuple but its len is not 2; markevery=(53,)
