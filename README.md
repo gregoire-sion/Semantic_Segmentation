@@ -8,6 +8,7 @@
    use_gps         : bool  — GPS sur le drone 1 actif ?
    use_imu         : bool  — IMU (accéléromètre) sur le drone 2 actif ?
    use_distances   : bool  — capteurs de distance inter-drones actifs ?
+   show_corridors  : bool  — afficher les figures ±3σ pour les 3 drones ?
    seed            : int   — graine aléatoire (même seed = même trajectoire vraie)
 ============================================================================
 """
@@ -15,7 +16,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from numpy.linalg import inv
 from scipy.linalg import block_diag
-import os
 
 # --------------------------------------------------------------------------
 # 1. Paramètres de simulation
@@ -96,10 +96,96 @@ def maj_kalman(X, P, H, innov, R):
     return X, P
 
 # --------------------------------------------------------------------------
-# 5. Fonction principale
+# 5. Figures utilitaires
+# --------------------------------------------------------------------------
+labels = ['x', 'y', 'vx', 'vy', 'ax', 'ay', 'bx', 'by']
+
+def figure_drone(d, base, tv, tk, P_hist, temps, mes_gps, mes_imu, mes_gpsv, titre_suffix=""):
+    fig, axs = plt.subplots(4, 2, figsize=(12, 8), sharex=True)
+    fig.suptitle(f"Analyse EKF — Drone {d}  {titre_suffix}",
+                 fontsize=13, fontweight='bold')
+    axs = axs.flatten()
+    for i in range(8):
+        idx   = base + i
+        sigma = np.sqrt(P_hist[:, idx, idx])
+        err   = tk[:, idx] - tv[:, idx]
+        axs[i].fill_between(temps, -3*sigma, 3*sigma, color='blue', alpha=0.2,
+                            label=r'Couloir $\pm 3\sigma$')
+        axs[i].plot(temps, err, color='green', label='Erreur EKF')
+        axs[i].axhline(0, color='k', lw=0.6)
+        axs[i].set_title(f"{labels[i]} : estimé − vrai", fontsize=10)
+        axs[i].grid(True, linestyle=':', alpha=0.7)
+    if d == 1 and len(mes_gps):
+        axs[0].scatter(mes_gps[:, 0], mes_gps[:, 1] - mes_gpsv[:, 0],
+                       color='red', marker='x', s=20, label='Mesure GPS')
+        axs[1].scatter(mes_gps[:, 0], mes_gps[:, 2] - mes_gpsv[:, 1],
+                       color='red', marker='x', s=20, label='Mesure GPS')
+    if d == 2 and len(mes_imu):
+        axs[4].scatter(mes_imu[:, 0], mes_imu[:, 1] - mes_imu[:, 3],
+                       color='red', marker='x', s=20, label='Mesure IMU')
+        axs[5].scatter(mes_imu[:, 0], mes_imu[:, 2] - mes_imu[:, 4],
+                       color='red', marker='x', s=20, label='Mesure IMU')
+    axs[6].set_xlabel("Temps (s)"); axs[7].set_xlabel("Temps (s)")
+    h, l = axs[0].get_legend_handles_labels()
+    fig.legend(h, l, loc='upper center', ncol=3, bbox_to_anchor=(0.5, 0.97))
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    return fig
+
+def figure_comparaison_biais(tv, tk_avec, tk_sans, temps, label_avec, label_sans):
+    fig, axs = plt.subplots(2, 2, figsize=(13, 7))
+    fig.suptitle("Impact de l'estimation du biais — Drone 2  (bx=0.5, by=-0.2)",
+                 fontsize=13, fontweight='bold')
+    axs[0,0].plot(temps, tv[:,8],      'k',   lw=1.5, label='Vérité')
+    axs[0,0].plot(temps, tk_avec[:,8], 'g',   lw=1.5, label=label_avec)
+    axs[0,0].plot(temps, tk_sans[:,8], 'r--', lw=1.5, label=label_sans)
+    axs[0,0].set_title("Position x — Drone 2"); axs[0,0].set_ylabel("x (m)")
+    axs[0,0].legend(); axs[0,0].grid(True, linestyle=':', alpha=0.7)
+
+    axs[0,1].plot(temps, tv[:,9],      'k',   lw=1.5)
+    axs[0,1].plot(temps, tk_avec[:,9], 'g',   lw=1.5)
+    axs[0,1].plot(temps, tk_sans[:,9], 'r--', lw=1.5)
+    axs[0,1].set_title("Position y — Drone 2"); axs[0,1].set_ylabel("y (m)")
+    axs[0,1].grid(True, linestyle=':', alpha=0.7)
+
+    axs[1,0].axhline(0.5, color='k', lw=1.5, label='Vrai biais bx = 0.5')
+    axs[1,0].plot(temps, tk_avec[:,14], 'g',   lw=1.5, label=label_avec)
+    axs[1,0].plot(temps, tk_sans[:,14], 'r--', lw=1.5, label=label_sans)
+    axs[1,0].set_title("Estimation du biais bx — Drone 2"); axs[1,0].set_ylabel("bx")
+    axs[1,0].set_xlabel("Temps (s)")
+    axs[1,0].legend(); axs[1,0].grid(True, linestyle=':', alpha=0.7)
+
+    err_avec = np.sqrt((tv[:,8]-tk_avec[:,8])**2 + (tv[:,9]-tk_avec[:,9])**2)
+    err_sans  = np.sqrt((tv[:,8]-tk_sans[:,8])**2 + (tv[:,9]-tk_sans[:,9])**2)
+    axs[1,1].plot(temps, err_avec, 'g',   lw=1.5, label=label_avec)
+    axs[1,1].plot(temps, err_sans,  'r--', lw=1.5, label=label_sans)
+    axs[1,1].set_title("Erreur de position euclidienne — Drone 2")
+    axs[1,1].set_ylabel("||erreur|| (m)"); axs[1,1].set_xlabel("Temps (s)")
+    axs[1,1].legend(); axs[1,1].grid(True, linestyle=':', alpha=0.7)
+
+    fig.tight_layout()
+    return fig
+
+def figure_trajectoires(tv, tk, temps, mes_gps):
+    fig = plt.figure(figsize=(8, 7))
+    i1, i2 = n_steps // 3, 2 * n_steps // 3
+    if len(mes_gps):
+        plt.scatter(mes_gps[:, 1], mes_gps[:, 2], color='red', marker='x',
+                    s=20, label='Mesures GPS (Drone 1)')
+    for d, base, mk in [(1, 0, '^'), (2, 8, 'o'), (3, 16, 's')]:
+        plt.plot(tv[:, base], tv[:, base+1], color='black',
+                 marker=mk, markevery=[i1], label=f'Drone {d} — vérité')
+        plt.plot(tk[:, base], tk[:, base+1], color='green', linestyle='-',
+                 marker=mk, markevery=[i2], label=f'Drone {d} — EKF')
+    plt.xlabel("X"); plt.ylabel("Y"); plt.title("Trajectoires des 3 drones")
+    plt.legend(fontsize=8); plt.grid(True); plt.axis('equal')
+    return fig
+
+# --------------------------------------------------------------------------
+# 6. Fonction principale
 # --------------------------------------------------------------------------
 def run_ekf(compenser_biais=True, seed=0,
-            use_gps=True, use_imu=True, use_distances=True):
+            use_gps=True, use_imu=True, use_distances=True,
+            show_corridors=False):
     np.random.seed(seed)
 
     # ---- Initialisation --------------------------------------------------
@@ -191,7 +277,6 @@ def run_ekf(compenser_biais=True, seed=0,
         # ---- Correction GPS + distances (construction dynamique) ---------
         if step % ratio_gps == 0:
 
-            # Calcul des distances (toujours nécessaire pour la jacobienne)
             d12 = np.hypot(Xc[0]-Xc[8],  Xc[1]-Xc[9])
             d23 = np.hypot(Xc[8]-Xc[16], Xc[9]-Xc[17])
             d13 = np.hypot(Xc[0]-Xc[16], Xc[1]-Xc[17])
@@ -200,7 +285,6 @@ def run_ekf(compenser_biais=True, seed=0,
             d23v = np.hypot(X_vrai[8]-X_vrai[16], X_vrai[9]-X_vrai[17])
             d13v = np.hypot(X_vrai[0]-X_vrai[16], X_vrai[1]-X_vrai[17])
 
-            # Construction dynamique du vecteur de mesure
             meas_vals = []
             h_vals    = []
             H_rows    = []
@@ -233,13 +317,12 @@ def run_ekf(compenser_biais=True, seed=0,
                 H_rows.append(H_dist)
                 R_diag += [sigma_R_d**2, sigma_R_d**2, sigma_R_d**2]
 
-            # Mise à jour uniquement si au moins un capteur est actif
             if H_rows:
-                mes   = np.array(meas_vals)
+                mes    = np.array(meas_vals)
                 h_pred = np.array(h_vals)
-                H     = np.vstack(H_rows)
-                R     = np.diag(R_diag)
-                innov = mes - h_pred
+                H      = np.vstack(H_rows)
+                R      = np.diag(R_diag)
+                innov  = mes - h_pred
                 Xc, Pc = maj_kalman(Xc, Pc, H, innov, R)
 
         # Enregistrement
@@ -253,159 +336,80 @@ def run_ekf(compenser_biais=True, seed=0,
     mes_imu  = np.array(mes_imu)  if mes_imu  else np.empty((0, 5))
     mes_gpsv = np.array(mes_gpsv) if mes_gpsv else np.empty((0, 2))
 
+    # ---- Figures couloirs ±3σ si demandé --------------------------------
+    if show_corridors:
+        titre = f"({'biais estimé' if compenser_biais else 'biais non estimé'}, " \
+                f"GPS={'on' if use_gps else 'off'}, " \
+                f"IMU={'on' if use_imu else 'off'}, " \
+                f"dist={'on' if use_distances else 'off'})"
+        for d, base in [(1, 0), (2, 8), (3, 16)]:
+            figure_drone(d, base, traj_vrai, traj_kalman, P_hist, temps,
+                         mes_gps, mes_imu, mes_gpsv, titre_suffix=titre)
+
     return traj_vrai, traj_kalman, P_hist, temps, mes_gps, mes_imu, mes_gpsv
-
-# --------------------------------------------------------------------------
-# 6. Figures utilitaires
-# --------------------------------------------------------------------------
-labels = ['x', 'y', 'vx', 'vy', 'ax', 'ay', 'bx', 'by']
-
-def figure_drone(d, base, tv, tk, P_hist, temps, mes_gps, mes_imu, mes_gpsv, titre_suffix=""):
-    fig, axs = plt.subplots(4, 2, figsize=(12, 8), sharex=True)
-    fig.suptitle(f"Analyse EKF — Drone {d}  {titre_suffix}",
-                 fontsize=13, fontweight='bold')
-    axs = axs.flatten()
-    for i in range(8):
-        idx   = base + i
-        sigma = np.sqrt(P_hist[:, idx, idx])
-        err   = tk[:, idx] - tv[:, idx]
-        axs[i].fill_between(temps, -3*sigma, 3*sigma, color='blue', alpha=0.2,
-                            label=r'Couloir $\pm 3\sigma$')
-        axs[i].plot(temps, err, color='green', label='Erreur EKF')
-        axs[i].axhline(0, color='k', lw=0.6)
-        axs[i].set_title(f"{labels[i]} : estimé − vrai", fontsize=10)
-        axs[i].grid(True, linestyle=':', alpha=0.7)
-    if d == 1 and len(mes_gps):
-        axs[0].scatter(mes_gps[:, 0], mes_gps[:, 1] - mes_gpsv[:, 0],
-                       color='red', marker='x', s=20, label='Mesure GPS')
-        axs[1].scatter(mes_gps[:, 0], mes_gps[:, 2] - mes_gpsv[:, 1],
-                       color='red', marker='x', s=20, label='Mesure GPS')
-    if d == 2 and len(mes_imu):
-        axs[4].scatter(mes_imu[:, 0], mes_imu[:, 1] - mes_imu[:, 3],
-                       color='red', marker='x', s=20, label='Mesure IMU')
-        axs[5].scatter(mes_imu[:, 0], mes_imu[:, 2] - mes_imu[:, 4],
-                       color='red', marker='x', s=20, label='Mesure IMU')
-    axs[6].set_xlabel("Temps (s)"); axs[7].set_xlabel("Temps (s)")
-    h, l = axs[0].get_legend_handles_labels()
-    fig.legend(h, l, loc='upper center', ncol=3, bbox_to_anchor=(0.5, 0.97))
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
-    return fig
-
-def figure_comparaison_biais(tv, tk_avec, tk_sans, temps, label_avec, label_sans):
-    fig, axs = plt.subplots(2, 2, figsize=(13, 7))
-    fig.suptitle(f"Impact de l'estimation du biais — Drone 2  (bx=0.5, by=-0.2)",
-                 fontsize=13, fontweight='bold')
-    axs[0,0].plot(temps, tv[:,8],      'k',   lw=1.5, label='Vérité')
-    axs[0,0].plot(temps, tk_avec[:,8], 'g',   lw=1.5, label=label_avec)
-    axs[0,0].plot(temps, tk_sans[:,8], 'r--', lw=1.5, label=label_sans)
-    axs[0,0].set_title("Position x — Drone 2"); axs[0,0].set_ylabel("x (m)")
-    axs[0,0].legend(); axs[0,0].grid(True, linestyle=':', alpha=0.7)
-
-    axs[0,1].plot(temps, tv[:,9],      'k',   lw=1.5)
-    axs[0,1].plot(temps, tk_avec[:,9], 'g',   lw=1.5)
-    axs[0,1].plot(temps, tk_sans[:,9], 'r--', lw=1.5)
-    axs[0,1].set_title("Position y — Drone 2"); axs[0,1].set_ylabel("y (m)")
-    axs[0,1].grid(True, linestyle=':', alpha=0.7)
-
-    axs[1,0].axhline(0.5, color='k', lw=1.5, label='Vrai biais bx = 0.5')
-    axs[1,0].plot(temps, tk_avec[:,14], 'g',   lw=1.5, label=label_avec)
-    axs[1,0].plot(temps, tk_sans[:,14], 'r--', lw=1.5, label=label_sans)
-    axs[1,0].set_title("Estimation du biais bx — Drone 2"); axs[1,0].set_ylabel("bx")
-    axs[1,0].set_xlabel("Temps (s)")
-    axs[1,0].legend(); axs[1,0].grid(True, linestyle=':', alpha=0.7)
-
-    err_avec = np.sqrt((tv[:,8]-tk_avec[:,8])**2 + (tv[:,9]-tk_avec[:,9])**2)
-    err_sans  = np.sqrt((tv[:,8]-tk_sans[:,8])**2 + (tv[:,9]-tk_sans[:,9])**2)
-    axs[1,1].plot(temps, err_avec, 'g',   lw=1.5, label=label_avec)
-    axs[1,1].plot(temps, err_sans,  'r--', lw=1.5, label=label_sans)
-    axs[1,1].set_title("Erreur de position euclidienne — Drone 2")
-    axs[1,1].set_ylabel("||erreur|| (m)"); axs[1,1].set_xlabel("Temps (s)")
-    axs[1,1].legend(); axs[1,1].grid(True, linestyle=':', alpha=0.7)
-
-    fig.tight_layout()
-    return fig
-
-def figure_trajectoires(tv, tk, temps, mes_gps):
-    fig = plt.figure(figsize=(8, 7))
-    i1, i2 = n_steps // 3, 2 * n_steps // 3
-    if len(mes_gps):
-        plt.scatter(mes_gps[:, 1], mes_gps[:, 2], color='red', marker='x',
-                    s=20, label='Mesures GPS (Drone 1)')
-    for d, base, mk in [(1, 0, '^'), (2, 8, 'o'), (3, 16, 's')]:
-        plt.plot(tv[:, base], tv[:, base+1], color='black',
-                 marker=mk, markevery=[i1], label=f'Drone {d} — vérité')
-        plt.plot(tk[:, base], tk[:, base+1], color='green', linestyle='-',
-                 marker=mk, markevery=[i2], label=f'Drone {d} — EKF')
-    plt.xlabel("X"); plt.ylabel("Y"); plt.title("Trajectoires des 3 drones")
-    plt.legend(fontsize=8); plt.grid(True); plt.axis('equal')
-    return fig
 
 # --------------------------------------------------------------------------
 # 7. Scénarios de présentation
 # --------------------------------------------------------------------------
-os.makedirs("/mnt/user-data/outputs", exist_ok=True)
 
 # --- Scénario A : configuration complète, avec biais estimé (référence) ---
 print("Scénario A : tous capteurs, biais estimé...")
 tv, tk_A, Ph_A, temps, gps_A, imu_A, gpsv_A = run_ekf(
     compenser_biais=True, seed=0,
-    use_gps=True, use_imu=True, use_distances=True)
+    use_gps=True, use_imu=True, use_distances=True,
+    show_corridors=True)
 
 # --- Scénario B : tous capteurs, sans estimer le biais ---
 print("Scénario B : tous capteurs, biais NON estimé...")
 _, tk_B, Ph_B, _, gps_B, imu_B, gpsv_B = run_ekf(
     compenser_biais=False, seed=0,
-    use_gps=True, use_imu=True, use_distances=True)
+    use_gps=True, use_imu=True, use_distances=True,
+    show_corridors=False)
 
 # --- Scénario C : sans distances, sans estimer le biais (dérive parabolique) ---
 print("Scénario C : sans distances, biais NON estimé...")
 _, tk_C, Ph_C, _, gps_C, imu_C, gpsv_C = run_ekf(
     compenser_biais=False, seed=0,
-    use_gps=True, use_imu=True, use_distances=False)
+    use_gps=True, use_imu=True, use_distances=False,
+    show_corridors=False)
 
 # --- Scénario D : sans distances, avec biais estimé ---
 print("Scénario D : sans distances, biais estimé...")
 _, tk_D, Ph_D, _, gps_D, imu_D, gpsv_D = run_ekf(
     compenser_biais=True, seed=0,
-    use_gps=True, use_imu=True, use_distances=False)
+    use_gps=True, use_imu=True, use_distances=False,
+    show_corridors=False)
 
 # --------------------------------------------------------------------------
 # 8. Figures de présentation
 # --------------------------------------------------------------------------
 mse = lambda a, b: np.square(a - b).mean()
 print("\n=== MSE position drone 2 ===")
-for label, tk in [("A - Complet + biais estimé", tk_A),
-                  ("B - Complet, biais non estimé", tk_B),
+for label, tk in [("A - Complet + biais estimé",          tk_A),
+                  ("B - Complet, biais non estimé",        tk_B),
                   ("C - Sans distances, biais non estimé", tk_C),
-                  ("D - Sans distances, biais estimé", tk_D)]:
+                  ("D - Sans distances, biais estimé",     tk_D)]:
     print(f"  {label:<40} : {mse(tv[:,8:10], tk[:,8:10]):.4f}")
 
-# Figure 1 — Analyse EKF Drone 2, scénario de référence (A)
-f1 = figure_drone(2, 8, tv, tk_A, Ph_A, temps, gps_A, imu_A, gpsv_A,
-                  titre_suffix="(tous capteurs, biais estimé)")
-f1.savefig("/mnt/user-data/outputs/ekf_drone2_reference.png", dpi=110, bbox_inches='tight')
-
-# Figure 2 — Comparaison B vs A : distances compensent le biais
+# Figure — Comparaison B vs A : distances compensent le biais
 f2 = figure_comparaison_biais(tv, tk_A, tk_B, temps,
                                label_avec="Biais estimé (A)",
                                label_sans="Biais non estimé (B)")
 f2.suptitle("Distances actives — biais estimé vs non estimé", fontsize=13, fontweight='bold')
-f2.savefig("/mnt/user-data/outputs/ekf_comparaison_biais_avec_distances.png", dpi=110, bbox_inches='tight')
 
-# Figure 3 — Comparaison C vs D : sans distances, la dérive parabolique apparaît
+# Figure — Comparaison C vs D : sans distances, la dérive parabolique apparaît
 f3 = figure_comparaison_biais(tv, tk_D, tk_C, temps,
                                label_avec="Biais estimé (D)",
                                label_sans="Biais non estimé (C)")
 f3.suptitle("Sans distances — dérive parabolique si biais non estimé", fontsize=13, fontweight='bold')
-f3.savefig("/mnt/user-data/outputs/ekf_comparaison_biais_sans_distances.png", dpi=110, bbox_inches='tight')
 
-# Figure 4 — 4 scénarios, erreur de position drone 2
+# Figure — 4 scénarios, erreur de position drone 2
 fig4, ax = plt.subplots(figsize=(10, 5))
 for tk, label, color, ls in [
-    (tk_A, "A — Complet, biais estimé",          'green',  '-'),
-    (tk_B, "B — Complet, biais non estimé",       'orange', '--'),
-    (tk_C, "C — Sans distances, biais non estimé",'red',    '-.'),
-    (tk_D, "D — Sans distances, biais estimé",    'blue',   ':'),
+    (tk_A, "A — Complet, biais estimé",           'green',  '-'),
+    (tk_B, "B — Complet, biais non estimé",        'orange', '--'),
+    (tk_C, "C — Sans distances, biais non estimé", 'red',    '-.'),
+    (tk_D, "D — Sans distances, biais estimé",     'blue',   ':'),
 ]:
     err = np.sqrt((tv[:,8]-tk[:,8])**2 + (tv[:,9]-tk[:,9])**2)
     ax.plot(temps, err, color=color, linestyle=ls, lw=1.8, label=label)
@@ -413,10 +417,8 @@ ax.set_title("Comparaison des 4 scénarios — Erreur de position Drone 2", font
 ax.set_xlabel("Temps (s)"); ax.set_ylabel("||erreur|| (m)")
 ax.legend(fontsize=9); ax.grid(True, linestyle=':', alpha=0.7)
 fig4.tight_layout()
-fig4.savefig("/mnt/user-data/outputs/ekf_4_scenarios.png", dpi=110, bbox_inches='tight')
 
-# Figure 5 — Trajectoires scénario de référence
+# Figure — Trajectoires scénario de référence
 f5 = figure_trajectoires(tv, tk_A, temps, gps_A)
-f5.savefig("/mnt/user-data/outputs/ekf_trajectoires.png", dpi=110, bbox_inches='tight')
 
 plt.show()
