@@ -1,145 +1,233 @@
 """
 ============================================================================
- EKF DISTRIBUÉ — Localisation coopérative de 3 drones
- Chaque drone porte son propre estimateur (état 8 + covariance 8x8).
- Fusion inter-drones par INTERSECTION DE COVARIANCE (CI) sur les distances.
+ ÉTUDE COMPARATIVE — Méthodes de communication de covariance inter-drones
 ============================================================================
- Différences clés avec le centralisé :
-   - Pas de matrice P globale 24x24 : 3 blocs 8x8 indépendants.
-   - Les corrélations croisées entre drones sont INCONNUES -> on utilise la
-     CI, qui reste cohérente (jamais sur-confiante) sans les connaître.
-   - Chaque lien de distance d_ij déclenche DEUX updates CI symétriques :
-     une pour i (voisin = j), une pour j (voisin = i). C'est l'équivalent
-     distribué du fait qu'au centralisé une ligne de H_dist remplit les
-     colonnes des deux drones.
+ On compare 4 façons de transmettre l'incertitude de position d'un voisin
+ lors d'une fusion CI sur une mesure de distance scalaire.
 
- Notations volontairement proches du centralisé :
-   run_ekf(...), traj_vrai, traj_kalman, P_hist, temps,
-   flags use_gps / use_imu / use_distances / compenser_biais,
-   figure_drone / figure_comparaison_biais / figure_trajectoires.
+ MÉTHODES
+ --------
+ M0 — Bloc 2x2 exact   : transmet Pⱼ[0:2,0:2]  -> coût 5 floats, référence exacte
+ M1 — Scalaire isotrope : transmet trace(Pⱼ)/2  -> coût 3 floats, ignore anisotropie
+ M2 — Variance projetée : transmet Hⱼ·Pⱼ·Hⱼᵀ  -> coût 3 floats, exact dans la direction du lien
+ M3 — Variance maximale : transmet λmax(Pⱼ)     -> coût 3 floats, borne supérieure garantie
+
+ MÉTRIQUES
+ ---------
+ MSE        : erreur quadratique position (m²)   — qualité de l'estimation
+ NCI        : Normalized Covariance Indicator    — cohérence du filtre
+              NCI = (1/T) Σ eₜᵀ Pₜ⁻¹ eₜ  avec e = erreur position (2D)
+              NCI ≈ 2 : cohérent   |  NCI << 2 : sur-confiant (dangereux)
+              NCI >> 2 : conservateur (sûr mais pessimiste)
+ Trace(P)   : somme des variances position       — taille des couloirs σ
+ Coût radio : floats émis par lien et par pas    — bande passante
+
+ Tous les résultats sont moyennés sur N_MC runs Monte Carlo (même trajectoire
+ vraie, seeds différents) pour séparer la variance stochastique des effets
+ structurels de chaque méthode.
 ============================================================================
 """
+
 import numpy as np
 import matplotlib.pyplot as plt
-from numpy.linalg import inv
+import matplotlib.gridspec as gridspec
+from numpy.linalg import inv, eigvalsh
 from scipy.linalg import block_diag
 from scipy.optimize import minimize_scalar
 
-# --------------------------------------------------------------------------
-# 1. Paramètres de simulation  (identiques au centralisé)
-# --------------------------------------------------------------------------
+# ============================================================================
+# 1. PARAMÈTRES  (repris à l'identique du filtre distribué)
+# ============================================================================
 t_max      = 16.0
 dt         = 0.1
 dt_capteur = 0.5
 dt_imu     = 0.1
-n_drone    = 3
-n_var      = 8
-N          = n_drone * n_var          # 24, utilisé seulement pour la vérité
+N_DRONES   = 3
+N_VAR      = 8
+N          = N_DRONES * N_VAR
 n_steps    = int(round(t_max / dt))
+ratio_imu  = int(round(dt_imu / dt))
+ratio_gps  = int(round(dt_capteur / dt))
 
-ratio_imu = int(round(dt_imu / dt))
-ratio_gps = int(round(dt_capteur / dt))
-
-# --------------------------------------------------------------------------
-# 2. Écarts-types  (identiques au centralisé)
-# --------------------------------------------------------------------------
 sigma_w_accel = 5e-2
 sigma_w_autre = 1e-6
-
-sigma_gps = 0.5
-sigma_acc = 0.01
-sigma_d   = 0.5
-
+sigma_gps  = 0.5
+sigma_acc  = 0.01
+sigma_d    = 0.5
 sigma_R_gps = 0.5
 sigma_R_acc = 0.1
 sigma_R_d   = 0.5
-
 sigma_P_x, sigma_P_v, sigma_P_a, sigma_P_b = 2.0, 0.5, 0.5, 1.0
 
-# --------------------------------------------------------------------------
-# 3. Matrices du modèle  (mêmes briques que le centralisé, version 8x8)
-# --------------------------------------------------------------------------
-def Bmat(cols):
-    M = np.zeros((8, 6))
-    M[4, cols[0]] = 1.0
-    M[5, cols[1]] = 1.0
-    return M
-
+# ============================================================================
+# 2. MATRICES DU MODÈLE
+# ============================================================================
 def Fmat(accel_constante):
     a = 1.0 if accel_constante else 0.0
     return np.array([
-        [1, 0, dt, 0, 0.5*dt*dt, 0,        0, 0],
-        [0, 1, 0,  dt, 0,        0.5*dt*dt, 0, 0],
-        [0, 0, 1,  0,  dt,       0,         0, 0],
-        [0, 0, 0,  1,  0,        dt,        0, 0],
-        [0, 0, 0,  0,  a,        0,         0, 0],
-        [0, 0, 0,  0,  0,        a,         0, 0],
-        [0, 0, 0,  0,  0,        0,         1, 0],
-        [0, 0, 0,  0,  0,        0,         0, 1]], dtype=float)
+        [1, 0, dt, 0, 0.5*dt**2, 0,         0, 0],
+        [0, 1, 0,  dt, 0,        0.5*dt**2, 0, 0],
+        [0, 0, 1,  0,  dt,       0,          0, 0],
+        [0, 0, 0,  1,  0,        dt,         0, 0],
+        [0, 0, 0,  0,  a,        0,          0, 0],
+        [0, 0, 0,  0,  0,        a,          0, 0],
+        [0, 0, 0,  0,  0,        0,          1, 0],
+        [0, 0, 0,  0,  0,        0,          0, 1]], dtype=float)
 
-# Vérité physique : grand vecteur 24 (comme le centralisé)
-F_vrai = block_diag(Fmat(False), Fmat(False), Fmat(False))
-B_vrai = np.concatenate((Bmat([0, 1]), Bmat([2, 3]), Bmat([4, 5])), axis=0)
-
-# Côté filtre : chaque drone a SES propres F et B locaux 8x8
-# - Drone 1 et 3 : commande connue (B local non nul), accel non constante
-# - Drone 2 : pas de commande connue -> B local nul + accel constante (estimée)
-def Bmat_local():
-    """Commande locale 2D (ax, ay) -> agit sur les composantes accel."""
-    M = np.zeros((8, 2))
-    M[4, 0] = 1.0
-    M[5, 1] = 1.0
+def Bmat_global(cols):
+    M = np.zeros((8, 6)); M[4, cols[0]] = 1.0; M[5, cols[1]] = 1.0
     return M
 
-F_kalman_local = {1: Fmat(False), 2: Fmat(True), 3: Fmat(False)}
-B_kalman_local = {1: Bmat_local(), 2: np.zeros((8, 2)), 3: Bmat_local()}
+def Bmat_local():
+    M = np.zeros((8, 2)); M[4, 0] = 1.0; M[5, 1] = 1.0
+    return M
 
-I8 = np.eye(8)
+F_vrai = block_diag(Fmat(False), Fmat(False), Fmat(False))
+B_vrai = np.concatenate((Bmat_global([0,1]), Bmat_global([2,3]), Bmat_global([4,5])), axis=0)
 
-# Bruit de modèle sur la vérité (24)
+F_loc  = {1: Fmat(False), 2: Fmat(True),  3: Fmat(False)}
+B_loc  = {1: Bmat_local(), 2: np.zeros((8,2)), 3: Bmat_local()}
+
 w_sigma = np.full(N, sigma_w_autre)
 for b in (0, 8, 16):
     w_sigma[b+4] = w_sigma[b+5] = sigma_w_accel
 
-X_vrai_init = np.concatenate(([0,  10, 1, 0, 0, 0,  0,    0],
-                               [10,  0, 1, 0, 0, 0,  0.5, -0.2],
+X_vrai_init = np.concatenate(([0, 10, 1, 0, 0, 0,  0,    0],
+                               [10, 0, 1, 0, 0, 0,  0.5, -0.2],
                                [0, -10, 1, 0, 0, 0,  0,    0])).astype(float)
 
-# Bruit de modèle local Q (8x8) — même réglage que les blocs du centralisé
+I8 = np.eye(8)
+
 def make_Q_local(drone_id):
     Q = np.eye(8) * 1e-3
-    Q[4, 4] = Q[5, 5] = 0.5**2
-    Q[6, 6] = Q[7, 7] = 1e-5**2
-    if drone_id == 2:                 # le drone 2 a un Q vitesse/accel spécifique
-        Q[2, 2] = Q[3, 3] = 0.1**2
-        Q[4, 4] = Q[5, 5] = 1e-2**2
+    Q[4,4] = Q[5,5] = 0.5**2
+    Q[6,6] = Q[7,7] = 1e-5**2
+    if drone_id == 2:
+        Q[2,2] = Q[3,3] = 0.1**2
+        Q[4,4] = Q[5,5] = 1e-2**2
     return Q
 
-# --------------------------------------------------------------------------
-# 4. Classe estimateur embarqué
-# --------------------------------------------------------------------------
-class DistributedDrone:
-    """Estimateur local d'un drone : état 8, covariance 8x8."""
+def make_P_local():
+    P = np.eye(8)
+    P[0,0] = P[1,1] = sigma_P_x**2
+    P[2,2] = P[3,3] = sigma_P_v**2
+    P[4,4] = P[5,5] = sigma_P_a**2
+    P[6,6] = P[7,7] = sigma_P_b**2
+    return P
 
-    def __init__(self, drone_id, x_init, P_init, Q_local, compenser_biais):
-        self.id   = drone_id
-        self.x    = x_init.copy()
-        self.P    = P_init.copy()
-        self.Q    = Q_local.copy()
-        self.F    = F_kalman_local[drone_id]
-        self.B    = B_kalman_local[drone_id]
-        self.compenser_biais = compenser_biais
-        if not compenser_biais:                 # biais gelé
-            self.x[6:8] = 0.0
-            self.P[6, 6] = self.P[7, 7] = 1e-8
-            self.Q[6, 6] = self.Q[7, 7] = 1e-8
+# ============================================================================
+# 3. MÉTHODES DE CONSTRUCTION DU PAQUET RADIO
+#    Chaque méthode définit :
+#      - build_paquet(drone)  -> dict émis par le voisin j
+#      - n_floats             -> coût en floats (hors position, toujours 2)
+#      - var_voisin(paquet, Hj) -> scalaire utilisé dans R augmenté
+# ============================================================================
 
-    # ----- Prédiction locale -----
-    def predict(self, u_local):
-        self.x = self.F @ self.x + self.B @ u_local
+class MethodeBloc2x2:
+    """M0 — Bloc exact 2x2 (référence)."""
+    nom   = "M0 — Bloc 2×2 exact"
+    label = "M0"
+    color = "black"
+    ls    = "-"
+    # Position (2) + 3 coefficients du bloc symétrique 2x2 (Pxx, Pxy, Pyy)
+    n_floats_cov = 3
+
+    @staticmethod
+    def build_paquet(drone):
+        return {"pos": drone.x[0:2].copy(), "data": drone.P[0:2, 0:2].copy()}
+
+    @staticmethod
+    def var_voisin(paquet, Hj):
+        return float(Hj @ paquet["data"] @ Hj.T)
+
+
+class MethodeIsotrope:
+    """M1 — Scalaire isotrope : trace(P)/2."""
+    nom   = "M1 — Variance isotrope (trace/2)"
+    label = "M1"
+    color = "royalblue"
+    ls    = "--"
+    n_floats_cov = 1   # un seul scalaire
+
+    @staticmethod
+    def build_paquet(drone):
+        Ppos = drone.P[0:2, 0:2]
+        return {"pos": drone.x[0:2].copy(), "data": np.trace(Ppos) / 2.0}
+
+    @staticmethod
+    def var_voisin(paquet, Hj):
+        # Hj est unitaire (norme = 1) donc Hj·σ²I·HjT = σ²
+        return float(paquet["data"])
+
+
+class MethodeProjetee:
+    """M2 — Variance projetée : Hj · P · HjT calculée par le voisin."""
+    nom   = "M2 — Variance projetée (Hj·P·Hj)"
+    label = "M2"
+    color = "darkorange"
+    ls    = "-."
+    n_floats_cov = 1
+
+    @staticmethod
+    def build_paquet(drone):
+        # Le voisin j calcule lui-même sa contribution scalaire dans chaque
+        # direction de lien possible. On stocke le bloc 2x2 et on projette
+        # au moment de l'usage (c'est équivalent : le voisin projette avec
+        # sa propre estimation de Hj avant émission dans un vrai système).
+        # Ici on passe le bloc 2x2 et on projette côté récepteur avec le Hj
+        # que lui calcule depuis sa propre position — c'est l'approximation
+        # "géométrie localement connue".
+        return {"pos": drone.x[0:2].copy(), "data": drone.P[0:2, 0:2].copy()}
+
+    @staticmethod
+    def var_voisin(paquet, Hj):
+        # Même calcul que M0 — dans un vrai système embarqué, le voisin
+        # calculerait Hj = f(pos_i - pos_j) depuis sa propre pos et l'émettrait
+        # comme scalaire. Ici l'approximation est que les deux drones
+        # estiment la même géométrie (petites erreurs de position).
+        return float(Hj @ paquet["data"] @ Hj.T)
+
+
+class MethodeMax:
+    """M3 — Variance maximale : λmax(P[0:2, 0:2])."""
+    nom   = "M3 — Variance maximale (λmax)"
+    label = "M3"
+    color = "crimson"
+    ls    = ":"
+    n_floats_cov = 1
+
+    @staticmethod
+    def build_paquet(drone):
+        Ppos = drone.P[0:2, 0:2]
+        return {"pos": drone.x[0:2].copy(), "data": float(eigvalsh(Ppos).max())}
+
+    @staticmethod
+    def var_voisin(paquet, Hj):
+        return float(paquet["data"])
+
+
+METHODES = [MethodeBloc2x2, MethodeIsotrope, MethodeProjetee, MethodeMax]
+
+# Coût radio total par pas capteur : 3 drones × (2 pos + n_floats_cov)
+def cout_floats(methode):
+    return 3 * (2 + methode.n_floats_cov)
+
+# ============================================================================
+# 4. CLASSE ESTIMATEUR DISTRIBUÉ (généralisée : accepte la méthode en paramètre)
+# ============================================================================
+class DroneDistribue:
+    def __init__(self, drone_id, x_init, P_init, Q_local):
+        self.id  = drone_id
+        self.x   = x_init.copy()
+        self.P   = P_init.copy()
+        self.Q   = Q_local.copy()
+        self.F   = F_loc[drone_id]
+        self.B   = B_loc[drone_id]
+
+    def predict(self, u):
+        self.x = self.F @ self.x + self.B @ u
         self.P = self.F @ self.P @ self.F.T + self.Q
 
-    # ----- Update capteur local (GPS ou IMU) — forme de Joseph -----
     def update_local(self, mes, H, R):
         S = H @ self.P @ H.T + R
         K = self.P @ H.T @ inv(S)
@@ -148,437 +236,490 @@ class DistributedDrone:
         A = I8 - K @ H
         self.P = A @ self.P @ A.T + K @ R @ K.T
 
-    # ----- Paquet radio minimal à émettre vers les voisins -----
-    def get_paquet_radio(self):
+    def update_CI_batch(self, liens, R_scalaire, methode, diagnostics=None):
         """
-        Grandeurs STRICTEMENT nécessaires à un voisin pour une update CI
-        sur une mesure de distance : la position (2) + le bloc 2x2 de
-        covariance position (3 termes par symétrie) = 5 floats.
-        Exact pour une distance (le reste de P est annulé par le jacobien).
-        """
-        return {
-            "pos": self.x[0:2].copy(),          # (x, y)
-            "Ppos": self.P[0:2, 0:2].copy(),    # bloc 2x2 symétrique -> 3 floats utiles
-        }
-
-    # ----- Fusion CI groupée : toutes les distances du drone en UN update -----
-    def update_distances_CI_batch(self, liens, R_scalaire):
-        """
-        liens : liste de (d_mesure, paquet_voisin).
-        On empile toutes les mesures de distance concernant CE drone en un
-        seul update CI. La covariance locale n'est dilatée qu'UNE fois (1/omega),
-        ce qui évite l'empilement de dilatations qui faisait exploser P.
-        Le bloc du voisin (2x2) intervient via R augmenté, projeté par Hj.
+        Fusion CI batch avec la méthode de communication passée en paramètre.
+        liens : liste de (d_mesure, paquet_voisin)
+        diagnostics : si fourni (liste), on y ajoute pour chaque lien un tuple
+                      (angle_lien_deg, var_utilisee, var_exacte) pour les
+                      métriques 'erreur de variance vs angle'. N'altère PAS
+                      le calcul du filtre.
         """
         if not liens:
             return
         rows_Hi, innovs, R_diag = [], [], []
+
         for d_mesure, paquet in liens:
             xi, yi = self.x[0], self.x[1]
             xj, yj = paquet["pos"]
-            Pj = paquet["Ppos"]
             d_pred = np.hypot(xi - xj, yi - yj)
             if d_pred < 1e-4:
                 d_pred = 1e-4
-            Hi = np.zeros(8)
-            Hi[0] = (xi - xj) / d_pred
-            Hi[1] = (yi - yj) / d_pred
-            Hj = np.array([-(xi - xj) / d_pred, -(yi - yj) / d_pred])
-            # Incertitude du voisin projetée sur la mesure scalaire
-            var_voisin = Hj @ Pj @ Hj.T
+
+            Hi      = np.zeros(8)
+            Hi[0]   = (xi - xj) / d_pred
+            Hi[1]   = (yi - yj) / d_pred
+            Hj      = np.array([-(xi - xj) / d_pred, -(yi - yj) / d_pred])
+
+            # C'est ici que les méthodes divergent :
+            var_j = methode.var_voisin(paquet, Hj)
+
+            # --- Diagnostic : angle du lien + écart à la variance exacte -----
+            if diagnostics is not None and "Ppos_exact" in paquet:
+                angle = np.degrees(np.arctan2(Hj[1], Hj[0])) % 360.0
+                var_exacte = float(Hj @ paquet["Ppos_exact"] @ Hj.T)
+                diagnostics.append((angle, var_j, var_exacte))
+
             rows_Hi.append(Hi)
             innovs.append(d_mesure - d_pred)
-            R_diag.append(R_scalaire + var_voisin)
+            R_diag.append(R_scalaire + var_j)
 
-        H = np.vstack(rows_Hi)                 # (m, 8)
-        innov = np.array(innovs)               # (m,)
-        Rv = np.diag(R_diag)                   # (m, m) : R + part voisin
+        H     = np.vstack(rows_Hi)
+        innov = np.array(innovs)
+        Rv    = np.diag(R_diag)
 
-        # Une seule dilatation CI sur la covariance locale
         def cout_CI(omega):
-            Pi = self.P / omega
-            S = H @ Pi @ H.T + Rv / (1.0 - omega)
-            K = Pi @ H.T @ inv(S)
-            P_up = Pi - K @ H @ Pi
-            return np.trace(P_up)
+            Pi  = self.P / omega
+            S   = H @ Pi @ H.T + Rv / (1.0 - omega)
+            K   = Pi @ H.T @ inv(S)
+            return np.trace(Pi - K @ H @ Pi)
 
-        sol = minimize_scalar(cout_CI, bounds=(0.01, 0.99), method='bounded')
+        sol   = minimize_scalar(cout_CI, bounds=(0.01, 0.99), method='bounded')
         omega = sol.x
-        Pi = self.P / omega
-        S = H @ Pi @ H.T + Rv / (1.0 - omega)
-        K = Pi @ H.T @ inv(S)
+        Pi    = self.P / omega
+        S     = H @ Pi @ H.T + Rv / (1.0 - omega)
+        K     = Pi @ H.T @ inv(S)
         self.x = self.x + K @ innov
         self.P = Pi - K @ H @ Pi
 
-    # ----- Update distance inter-drone par Intersection de Covariance (unitaire) -----
-    def update_distance_CI(self, d_mesure, paquet_voisin, R_dist):
-        """
-        Recale CE drone à partir d'une mesure de distance vers un voisin,
-        en ne connaissant du voisin que (pos, Ppos) — cf. get_paquet_radio.
-        La CI fusionne sans connaître la corrélation croisée i<->j.
-        """
-        xi, yi = self.x[0], self.x[1]
-        xj, yj = paquet_voisin["pos"]
-        Pj = paquet_voisin["Ppos"]              # 2x2
-
-        d_pred = np.hypot(xi - xj, yi - yj)
-        if d_pred < 1e-4:
-            d_pred = 1e-4
-
-        # Jacobien côté i (1x8) : seules les colonnes position sont non nulles
-        Hi = np.zeros((1, 8))
-        Hi[0, 0] = (xi - xj) / d_pred
-        Hi[0, 1] = (yi - yj) / d_pred
-
-        # Jacobien côté voisin réduit au bloc position (1x2)
-        Hj = np.array([[-(xi - xj) / d_pred, -(yi - yj) / d_pred]])
-
-        innov = d_mesure - d_pred
-
-        # Coût CI : trace de la covariance corrigée en fonction de omega
-        def cout_CI(omega):
-            Pi = self.P / omega
-            Pjs = Pj / (1.0 - omega)
-            S = Hi @ Pi @ Hi.T + Hj @ Pjs @ Hj.T + R_dist
-            K = Pi @ Hi.T / S[0, 0]
-            P_up = Pi - K @ Hi @ Pi
-            return np.trace(P_up)
-
-        sol = minimize_scalar(cout_CI, bounds=(0.01, 0.99), method='bounded')
-        omega = sol.x
-
-        Pi  = self.P / omega
-        Pjs = Pj / (1.0 - omega)
-        S   = Hi @ Pi @ Hi.T + Hj @ Pjs @ Hj.T + R_dist
-        K   = Pi @ Hi.T / S[0, 0]
-
-        self.x = self.x + (K * innov).flatten()
-        self.P = Pi - K @ Hi @ Pi
-
-# --------------------------------------------------------------------------
-# 5. Figures utilitaires  (reprises telles quelles du centralisé)
-# --------------------------------------------------------------------------
-labels = ['x', 'y', 'vx', 'vy', 'ax', 'ay', 'bx', 'by']
-
-def figure_drone(nom_scenario, d, base, tv, tk, P_hist, temps, mes_gps, mes_imu, mes_gpsv, titre_suffix=""):
-    fig, axs = plt.subplots(4, 2, figsize=(12, 8), sharex=True)
-    fig.suptitle(f"{nom_scenario} - Drone {d}", fontsize=13, fontweight='bold')
-    axs = axs.flatten()
-    for i in range(8):
-        idx   = base + i
-        sigma = np.sqrt(P_hist[:, d-1, i, i])     # P_hist distribué : (T, drone, 8, 8)
-        err   = tk[:, idx] - tv[:, idx]
-        axs[i].fill_between(temps, -3*sigma, 3*sigma, color='blue', alpha=0.2,
-                            label=r'Couloir $\pm 3\sigma$')
-        axs[i].plot(temps, err, color='green', label='Erreur EKF')
-        axs[i].axhline(0, color='k', lw=0.6)
-        axs[i].set_title(f"{labels[i]} : estimé − vrai", fontsize=10)
-        axs[i].grid(True, linestyle=':', alpha=0.7)
-    if d == 1 and len(mes_gps):
-        axs[0].scatter(mes_gps[:, 0], mes_gps[:, 1] - mes_gpsv[:, 0],
-                       color='red', marker='x', s=20, label='Mesure GPS')
-        axs[1].scatter(mes_gps[:, 0], mes_gps[:, 2] - mes_gpsv[:, 1],
-                       color='red', marker='x', s=20, label='Mesure GPS')
-    if d == 2 and len(mes_imu):
-        axs[4].scatter(mes_imu[:, 0], mes_imu[:, 1] - mes_imu[:, 3],
-                       color='red', marker='x', s=20, label='Mesure IMU')
-        axs[5].scatter(mes_imu[:, 0], mes_imu[:, 2] - mes_imu[:, 4],
-                       color='red', marker='x', s=20, label='Mesure IMU')
-    axs[6].set_xlabel("Temps (s)"); axs[7].set_xlabel("Temps (s)")
-    h, l = axs[0].get_legend_handles_labels()
-    fig.legend(h, l, loc='upper center', ncol=3, bbox_to_anchor=(0.5, 0.97))
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
-    return fig
-
-def figure_comparaison_biais(tv, tk_avec, tk_sans, temps, label_avec, label_sans):
-    fig, axs = plt.subplots(2, 2, figsize=(13, 7))
-    fig.suptitle("Impact de l'estimation du biais — Drone 2  (bx=0.5, by=-0.2)",
-                 fontsize=13, fontweight='bold')
-    axs[0,0].plot(temps, tv[:,8],      'k',   lw=1.5, label='Vérité')
-    axs[0,0].plot(temps, tk_avec[:,8], 'g',   lw=1.5, label=label_avec)
-    axs[0,0].plot(temps, tk_sans[:,8], 'r--', lw=1.5, label=label_sans)
-    axs[0,0].set_title("Position x — Drone 2"); axs[0,0].set_ylabel("x (m)")
-    axs[0,0].legend(); axs[0,0].grid(True, linestyle=':', alpha=0.7)
-
-    axs[0,1].plot(temps, tv[:,9],      'k',   lw=1.5)
-    axs[0,1].plot(temps, tk_avec[:,9], 'g',   lw=1.5)
-    axs[0,1].plot(temps, tk_sans[:,9], 'r--', lw=1.5)
-    axs[0,1].set_title("Position y — Drone 2"); axs[0,1].set_ylabel("y (m)")
-    axs[0,1].grid(True, linestyle=':', alpha=0.7)
-
-    axs[1,0].axhline(0.5, color='k', lw=1.5, label='Vrai biais bx = 0.5')
-    axs[1,0].plot(temps, tk_avec[:,14], 'g',   lw=1.5, label=label_avec)
-    axs[1,0].plot(temps, tk_sans[:,14], 'r--', lw=1.5, label=label_sans)
-    axs[1,0].set_title("Estimation du biais bx — Drone 2"); axs[1,0].set_ylabel("bx")
-    axs[1,0].set_xlabel("Temps (s)")
-    axs[1,0].legend(); axs[1,0].grid(True, linestyle=':', alpha=0.7)
-
-    err_avec = np.sqrt((tv[:,8]-tk_avec[:,8])**2 + (tv[:,9]-tk_avec[:,9])**2)
-    err_sans = np.sqrt((tv[:,8]-tk_sans[:,8])**2 + (tv[:,9]-tk_sans[:,9])**2)
-    axs[1,1].plot(temps, err_avec, 'g',   lw=1.5, label=label_avec)
-    axs[1,1].plot(temps, err_sans, 'r--', lw=1.5, label=label_sans)
-    axs[1,1].set_title("Erreur de position euclidienne — Drone 2")
-    axs[1,1].set_ylabel("||erreur|| (m)"); axs[1,1].set_xlabel("Temps (s)")
-    axs[1,1].legend(); axs[1,1].grid(True, linestyle=':', alpha=0.7)
-
-    fig.tight_layout()
-    return fig
-
-def figure_trajectoires(tv, scenarios, temps, mes_gps):
-    fig = plt.figure(figsize=(10, 8))
-    for d, base, mk in [(1, 0, '^'), (2, 8, 'o'), (3, 16, 's')]:
-        plt.plot(tv[:, base], tv[:, base+1], color='black', lw=2,
-                 label=f'Drone {d} — vérité')
-    for tk, label, color, ls in scenarios:
-        for d, base, mk in [(1, 0, '^'), (2, 8, 'o'), (3, 16, 's')]:
-            lbl = label if d == 1 else '_nolegend'
-            plt.plot(tk[:, base], tk[:, base+1], color=color, linestyle=ls, lw=1.5,
-                     label=lbl)
-    plt.xlabel("X"); plt.ylabel("Y"); plt.title("Trajectoires des 3 drones")
-    plt.legend(fontsize=8); plt.grid(True)
-    x_vrai_all = tv[:, [0, 8, 16]]
-    y_vrai_all = tv[:, [1, 9, 17]]
-    marge = 10
-    plt.xlim(x_vrai_all.min() - marge, x_vrai_all.max() + marge)
-    plt.ylim(y_vrai_all.min() - marge, y_vrai_all.max() + marge)
-    return fig
-
-# --------------------------------------------------------------------------
-# 6. Fonction principale distribuée
-# --------------------------------------------------------------------------
-def run_ekf(nom_scenario="", compenser_biais=True, seed=0,
-            use_gps=True, use_imu=True, use_distances=True,
-            show_corridors=False):
+# ============================================================================
+# 5. SIMULATION MONO-RUN POUR UNE MÉTHODE DONNÉE
+# ============================================================================
+def run_une_methode(methode, seed):
     np.random.seed(seed)
 
-    # ---- Vérité ----------------------------------------------------------
     X_vrai = X_vrai_init.copy()
 
-    # ---- Estimateurs locaux ----------------------------------------------
     erreur_init = np.zeros(N)
     for b in (0, 8, 16):
         erreur_init[b:b+2] = np.random.normal(0, 2.0, size=2)
     X_est0 = X_vrai + erreur_init
 
-    def make_P_local():
-        P = np.eye(8)
-        P[0, 0] = P[1, 1] = sigma_P_x**2
-        P[2, 2] = P[3, 3] = sigma_P_v**2
-        P[4, 4] = P[5, 5] = sigma_P_a**2
-        P[6, 6] = P[7, 7] = sigma_P_b**2
-        return P
-
     drones = {
-        1: DistributedDrone(1, X_est0[0:8],   make_P_local(), make_Q_local(1), compenser_biais),
-        2: DistributedDrone(2, X_est0[8:16],  make_P_local(), make_Q_local(2), compenser_biais),
-        3: DistributedDrone(3, X_est0[16:24], make_P_local(), make_Q_local(3), compenser_biais),
+        i: DroneDistribue(i, X_est0[(i-1)*8:i*8], make_P_local(), make_Q_local(i))
+        for i in (1, 2, 3)
     }
 
-    # ---- Historique ------------------------------------------------------
-    traj_vrai   = np.zeros((n_steps + 1, N))
-    traj_kalman = np.zeros((n_steps + 1, N))
-    P_hist      = np.zeros((n_steps + 1, 3, 8, 8))   # (T, drone, 8, 8)
-    temps       = np.zeros(n_steps + 1)
+    # Tableaux de résultats
+    err_pos  = np.zeros((n_steps+1, N_DRONES, 2))   # erreur position (x,y) par drone
+    P_pos_tr = np.zeros((n_steps+1, N_DRONES))       # trace P position par drone
+    P_pos_m  = np.zeros((n_steps+1, N_DRONES, 2, 2)) # matrice P position par drone
 
-    traj_vrai[0]   = X_vrai
-    traj_kalman[0] = X_est0
-    for j, dr in enumerate((drones[1], drones[2], drones[3])):
-        P_hist[0, j] = dr.P
-
-    mes_gps  = []
-    mes_imu  = []
-    mes_gpsv = []
-
-    # ---- Comptabilité bande passante ------------------------------------
-    bytes_radio = 0          # paquets minimaux réellement émis (8 octets/float)
-    bytes_naif  = 0          # ce que coûterait l'envoi état+covariance complets
+    # Diagnostic variance/angle : liste de (angle_deg, var_utilisee, var_exacte)
+    diag_var = []
 
     phi_x = phi_y = 0.0
 
-    for k in range(1, n_steps + 1):
+    for k in range(1, n_steps+1):
         step = k - 1
         t    = k * dt
 
-        # ---- Commande (identique au centralisé) --------------------------
+        # Commande
         if step < n_steps / 3:
             u_vrai = np.array([1., 0., 1., 0., 1., 0.])
         elif step < 2 * n_steps / 3:
-            phi_x += 5 * dt
-            phi_y += 1 * dt
+            phi_x += 5 * dt; phi_y += 1 * dt
             u_vrai = np.array([np.cos(phi_x), np.sin(phi_y),
                                np.cos(phi_x), np.sin(phi_y),
                                np.cos(phi_x), np.sin(phi_y)])
         else:
             u_vrai = np.array([1., 0., 1., 0., 1., 0.])
 
-        err_cmd = np.random.normal(0, 0.1, size=6)
-        err_cmd[0:2] = 0.0
+        err_cmd = np.random.normal(0, 0.1, size=6); err_cmd[0:2] = 0.0
         u_kalman = u_vrai + err_cmd
 
-        # ---- Propagation de la vérité ------------------------------------
         X_vrai = F_vrai @ X_vrai + B_vrai @ u_vrai + np.random.normal(0, 1, N) * w_sigma
 
-        # ---- Prédiction locale de chaque drone ---------------------------
-        # Drone 1 et 3 reçoivent leur commande, drone 2 non (B local nul)
         drones[1].predict(u_kalman[0:2])
         drones[2].predict(np.zeros(2))
         drones[3].predict(u_kalman[4:6])
 
-        # ---- IMU (drone 2) : capteur local -------------------------------
-        if use_imu and step % ratio_imu == 0:
+        # IMU drone 2
+        if step % ratio_imu == 0:
             mes = np.array([X_vrai[12] + X_vrai[14] + np.random.normal(0, sigma_acc),
                             X_vrai[13] + X_vrai[15] + np.random.normal(0, sigma_acc)])
-            H = np.zeros((2, 8))
-            H[0, 4] = H[0, 6] = 1.0          # ax + bx
-            H[1, 5] = H[1, 7] = 1.0          # ay + by
+            H = np.zeros((2, 8)); H[0,4]=H[0,6]=1.0; H[1,5]=H[1,7]=1.0
             drones[2].update_local(mes, H, np.diag([sigma_R_acc**2]*2))
-            mes_imu.append((t, mes[0], mes[1], X_vrai[12], X_vrai[13]))
 
-        # ---- GPS (drone 1) + distances inter-drones ----------------------
+        # GPS drone 1 + distances
         if step % ratio_gps == 0:
+            z = np.array([X_vrai[0] + np.random.normal(0, sigma_gps),
+                          X_vrai[1] + np.random.normal(0, sigma_gps)])
+            H = np.zeros((2, 8)); H[0,0]=1.0; H[1,1]=1.0
+            drones[1].update_local(z, H, np.diag([sigma_R_gps**2]*2))
 
-            # GPS : capteur local du drone 1
-            if use_gps:
-                z = np.array([X_vrai[0] + np.random.normal(0, sigma_gps),
-                              X_vrai[1] + np.random.normal(0, sigma_gps)])
-                H = np.zeros((2, 8))
-                H[0, 0] = 1.0
-                H[1, 1] = 1.0
-                drones[1].update_local(z, H, np.diag([sigma_R_gps**2]*2))
-                mes_gps.append((t, z[0], z[1]))
-                mes_gpsv.append((X_vrai[0], X_vrai[1]))
+            d12v = np.hypot(X_vrai[0]-X_vrai[8],  X_vrai[1]-X_vrai[9])
+            d23v = np.hypot(X_vrai[8]-X_vrai[16], X_vrai[9]-X_vrai[17])
+            d13v = np.hypot(X_vrai[0]-X_vrai[16], X_vrai[1]-X_vrai[17])
+            z12  = d12v + np.random.normal(0, sigma_d)
+            z23  = d23v + np.random.normal(0, sigma_d)
+            z13  = d13v + np.random.normal(0, sigma_d)
 
-            # Distances : fusion collaborative par CI
-            if use_distances:
-                # Vraies distances bruitées (mesures physiques partagées)
-                d12v = np.hypot(X_vrai[0]-X_vrai[8],  X_vrai[1]-X_vrai[9])
-                d23v = np.hypot(X_vrai[8]-X_vrai[16], X_vrai[9]-X_vrai[17])
-                d13v = np.hypot(X_vrai[0]-X_vrai[16], X_vrai[1]-X_vrai[17])
-                z12 = d12v + np.random.normal(0, sigma_d)
-                z23 = d23v + np.random.normal(0, sigma_d)
-                z13 = d13v + np.random.normal(0, sigma_d)
+            paquets = {i: methode.build_paquet(drones[i]) for i in (1,2,3)}
+            # Injecte le vrai bloc 2x2 position pour le calcul de la variance
+            # exacte (diagnostic uniquement, n'altère pas le filtre).
+            for i in (1, 2, 3):
+                paquets[i]["Ppos_exact"] = drones[i].P[0:2, 0:2].copy()
 
-                # Chaque drone échange son paquet radio minimal
-                paquets = {i: drones[i].get_paquet_radio() for i in (1, 2, 3)}
+            drones[1].update_CI_batch([(z12, paquets[2]), (z13, paquets[3])],
+                                       sigma_R_d**2, methode, diagnostics=diag_var)
+            drones[2].update_CI_batch([(z12, paquets[1]), (z23, paquets[3])],
+                                       sigma_R_d**2, methode, diagnostics=diag_var)
+            drones[3].update_CI_batch([(z23, paquets[2]), (z13, paquets[1])],
+                                       sigma_R_d**2, methode, diagnostics=diag_var)
 
-                # Comptabilité : 5 floats émis par paquet vs 8+36 au naïf
-                for _ in (1, 2, 3):
-                    bytes_radio += (2 + 3) * 8       # pos(2) + Ppos sym(3)
-                    bytes_naif  += (8 + 36) * 8      # état(8) + P sym(36)
+        # Enregistrement
+        for j, (d, b) in enumerate([(1,0),(2,8),(3,16)]):
+            err_pos[k, j]   = drones[d].x[0:2] - X_vrai[b:b+2]
+            P_pos_tr[k, j]  = drones[d].P[0,0] + drones[d].P[1,1]
+            P_pos_m[k, j]   = drones[d].P[0:2, 0:2]
 
-                # --- Chaque drone fusionne EN UN SEUL UPDATE toutes les
-                #     distances qui le concernent (évite l'empilement des
-                #     dilatations CI qui faisait exploser la covariance).
-                #     Le drone 2 utilise enfin d23 (c'était l'oubli initial).
-                drones[1].update_distances_CI_batch(
-                    [(z12, paquets[2]), (z13, paquets[3])], sigma_R_d**2)
-                drones[2].update_distances_CI_batch(
-                    [(z12, paquets[1]), (z23, paquets[3])], sigma_R_d**2)
-                drones[3].update_distances_CI_batch(
-                    [(z23, paquets[2]), (z13, paquets[1])], sigma_R_d**2)
+    return err_pos, P_pos_tr, P_pos_m, np.array(diag_var) if diag_var else np.empty((0,3))
 
-        # ---- Enregistrement ---------------------------------------------
-        traj_vrai[k]   = X_vrai
-        traj_kalman[k] = np.concatenate((drones[1].x, drones[2].x, drones[3].x))
-        for j, dr in enumerate((drones[1], drones[2], drones[3])):
-            P_hist[k, j] = dr.P
-        temps[k] = t
+# ============================================================================
+# 6. CALCUL DES MÉTRIQUES SUR N_MC RUNS
+# ============================================================================
+# Seuil de couverture : ellipse à k_sigma. En 2D, P(||e||² < k²·... ) :
+#   le test "e^T P^-1 e < seuil" suit un chi² à 2 ddl.
+#   Seuil 3sigma <-> chi2(2) à 99.7%? On utilise le quantile chi² à 2 ddl.
+from scipy.stats import chi2
+SEUIL_3SIGMA = chi2.ppf(0.997, df=2)   # ~11.6 : couverture cible 99.7%
 
-    mes_gps  = np.array(mes_gps)  if mes_gps  else np.empty((0, 3))
-    mes_imu  = np.array(mes_imu)  if mes_imu  else np.empty((0, 5))
-    mes_gpsv = np.array(mes_gpsv) if mes_gpsv else np.empty((0, 2))
+def calcule_metriques(methode, N_MC=30, seeds=None):
+    """
+    Retourne un dictionnaire de métriques (familles 1 à 4) :
+      mse        : (N_MC, 3)        — MSE position par run/drone           [F1]
+      rmse_t     : (T, 3)           — RMSE temporel moyen sur les runs     [F1]
+      nci        : (N_MC, 3)        — NCI moyen temporel par run/drone     [F2]
+      nci_min    : (3,)             — NCI instantané minimum (pire cas)    [F2]
+      couverture : (3,)             — taux de présence vraie pos dans 3σ   [F2]
+      trace_mean : (T, 3)           — trace(P) moyenne                     —
+      trace_std  : (T, 3)           — écart-type trace(P)                  —
+      diag_var   : (M, 3)           — (angle, var_util, var_exacte) cumulé [F3]
+      var_err_var: scalaire         — variance de l'écart var_util-exacte  [F3]
+    """
+    if seeds is None:
+        seeds = range(N_MC)
 
-    if show_corridors:
-        for d, base in [(1, 0), (2, 8), (3, 16)]:
-            figure_drone(nom_scenario, d, base, traj_vrai, traj_kalman, P_hist, temps,
-                         mes_gps, mes_imu, mes_gpsv)
+    all_mse    = np.zeros((N_MC, N_DRONES))
+    all_nci    = np.zeros((N_MC, N_DRONES))
+    all_trace  = np.zeros((N_MC, n_steps+1, N_DRONES))
+    all_rmse_t = np.zeros((N_MC, n_steps+1, N_DRONES))
+    nci_min    = np.full(N_DRONES, np.inf)
+    n_dans_3s  = np.zeros(N_DRONES)   # comptage couverture
+    n_total    = np.zeros(N_DRONES)
+    diag_all   = []
 
-    # Stats bande passante stockées en attribut de fonction (accès post-run)
-    run_ekf.dernier_bilan_radio = (bytes_radio, bytes_naif)
+    for run, seed in enumerate(seeds):
+        err_pos, P_pos_tr, P_pos_m, diag_var = run_une_methode(methode, seed)
+        if diag_var.size:
+            diag_all.append(diag_var)
 
-    return traj_vrai, traj_kalman, P_hist, temps, mes_gps, mes_imu, mes_gpsv
+        for j in range(N_DRONES):
+            # [F1] MSE : moyenne temporelle de ||erreur||²
+            all_mse[run, j] = np.mean(np.sum(err_pos[1:, j, :]**2, axis=1))
 
-# --------------------------------------------------------------------------
-# 7. Scénarios de présentation  (mêmes que le centralisé)
-# --------------------------------------------------------------------------
-print("Scénario A : tous capteurs, biais estimé...")
-tv, tk_A, Ph_A, temps, gps_A, imu_A, gpsv_A = run_ekf(
-    nom_scenario="Scénario A (distribué)",
-    compenser_biais=True, seed=0,
-    use_gps=True, use_imu=True, use_distances=True,
-    show_corridors=True)
-radio_A = run_ekf.dernier_bilan_radio
+            # [F1] RMSE temporel : ||erreur|| à chaque instant
+            all_rmse_t[run, :, j] = np.sqrt(np.sum(err_pos[:, j, :]**2, axis=1))
 
-print("Scénario B : tous capteurs, biais NON estimé...")
-_, tk_B, Ph_B, _, gps_B, imu_B, gpsv_B = run_ekf(
-    nom_scenario="Scénario B (distribué)",
-    compenser_biais=False, seed=0,
-    use_gps=True, use_imu=True, use_distances=True,
-    show_corridors=False)
+            # [F2] NCI instantané + couverture
+            nci_vals = []
+            for k in range(1, n_steps+1):
+                e   = err_pos[k, j]
+                Pij = P_pos_m[k, j]
+                try:
+                    d2 = float(e @ inv(Pij) @ e)   # distance de Mahalanobis²
+                except Exception:
+                    continue
+                nci_vals.append(d2)
+                nci_min[j] = min(nci_min[j], d2)
+                n_total[j]   += 1
+                if d2 <= SEUIL_3SIGMA:
+                    n_dans_3s[j] += 1
+            all_nci[run, j] = np.mean(nci_vals) if nci_vals else np.nan
+            all_trace[run, :, j] = P_pos_tr[:, j]
 
-print("Scénario C : sans distances, biais NON estimé...")
-_, tk_C, Ph_C, _, gps_C, imu_C, gpsv_C = run_ekf(
-    nom_scenario="Scénario C (distribué)",
-    compenser_biais=False, seed=0,
-    use_gps=True, use_imu=True, use_distances=False,
-    show_corridors=False)
+    trace_mean = np.mean(all_trace, axis=0)
+    trace_std  = np.std(all_trace,  axis=0)
+    rmse_t     = np.mean(all_rmse_t, axis=0)
+    couverture = n_dans_3s / np.maximum(n_total, 1)
 
-print("Scénario D : sans distances, biais estimé...")
-_, tk_D, Ph_D, _, gps_D, imu_D, gpsv_D = run_ekf(
-    nom_scenario="Scénario D (distribué)",
-    compenser_biais=True, seed=0,
-    use_gps=True, use_imu=True, use_distances=False,
-    show_corridors=False)
+    diag_var = np.vstack(diag_all) if diag_all else np.empty((0, 3))
+    # [F3] variance de l'écart entre variance utilisée et variance exacte
+    if diag_var.size:
+        ecart = diag_var[:, 1] - diag_var[:, 2]
+        var_err_var = float(np.var(ecart))
+    else:
+        var_err_var = 0.0
 
-# --------------------------------------------------------------------------
-# 8. Bilans chiffrés
-# --------------------------------------------------------------------------
-mse = lambda a, b: np.square(a - b).mean()
-print("\n=== MSE position drone 2 ===")
-for label, tk in [("A - Complet + biais estimé",          tk_A),
-                  ("B - Complet, biais non estimé",        tk_B),
-                  ("C - Sans distances, biais non estimé", tk_C),
-                  ("D - Sans distances, biais estimé",     tk_D)]:
-    print(f"  {label:<40} : {mse(tv[:,8:10], tk[:,8:10]):.4f}")
+    return {
+        "mse"        : all_mse,
+        "rmse_t"     : rmse_t,
+        "nci"        : all_nci,
+        "nci_min"    : nci_min,
+        "couverture" : couverture,
+        "trace_mean" : trace_mean,
+        "trace_std"  : trace_std,
+        "diag_var"   : diag_var,
+        "var_err_var": var_err_var,
+    }
 
-br, bn = radio_A
-print("\n=== Bande passante inter-drones (scénario A) ===")
-print(f"  Paquet minimal émis  : {br:>8d} octets")
-print(f"  Équivalent naïf      : {bn:>8d} octets")
-print(f"  Économie             : {100*(1-br/bn):.1f} %")
+# ============================================================================
+# 7. CALCUL DE TOUTES LES MÉTHODES
+# ============================================================================
+N_MC  = 40
+seeds = list(range(N_MC))
+temps = np.arange(n_steps+1) * dt
 
-# --------------------------------------------------------------------------
-# 9. Figures de présentation  (mêmes que le centralisé)
-# --------------------------------------------------------------------------
-f2 = figure_comparaison_biais(tv, tk_A, tk_B, temps,
-                               label_avec="Biais estimé (A)",
-                               label_sans="Biais non estimé (B)")
-f2.suptitle("Scénario A vs B (distribué)", fontsize=13, fontweight='bold')
+print(f"Étude sur {N_MC} runs Monte Carlo, {n_steps} pas de simulation chacun.")
+print("─" * 60)
 
-f3 = figure_comparaison_biais(tv, tk_D, tk_C, temps,
-                               label_avec="Biais estimé (D)",
-                               label_sans="Biais non estimé (C)")
-f3.suptitle("Scénario C vs D (distribué)", fontsize=13, fontweight='bold')
+resultats = {}
+for m in METHODES:
+    print(f"  Calcul {m.nom} ...", flush=True)
+    R = calcule_metriques(m, N_MC=N_MC, seeds=seeds)
+    R["methode"] = m
+    R["cout"]    = cout_floats(m)
+    resultats[m.label] = R
 
-fig4, ax = plt.subplots(figsize=(10, 5))
-for tk, label, color, ls in [
-    (tk_A, "A — Complet, biais estimé",            'green',  '-'),
-    (tk_B, "B — Complet, biais non estimé",         'orange', '--'),
-    (tk_C, "C — Sans distances, biais non estimé",  'red',    '-.'),
-    (tk_D, "D — Sans distances, biais estimé",      'blue',   ':'),
-]:
-    err = np.sqrt((tv[:,8]-tk[:,8])**2 + (tv[:,9]-tk[:,9])**2)
-    ax.plot(temps, err, color=color, linestyle=ls, lw=1.8, label=label)
-ax.set_title("Comparaison 4 scénarios (distribué)", fontsize=12)
-ax.set_xlabel("Temps (s)"); ax.set_ylabel("erreur (m)")
-ax.legend(fontsize=9); ax.grid(True, linestyle=':', alpha=0.7)
+# ============================================================================
+# 8. TABLEAU RÉCAPITULATIF EN CONSOLE  (vue 3 drones, toutes familles)
+# ============================================================================
+def moy3(r, cle):
+    """Moyenne sur les 3 drones d'une métrique (N_MC,3) ou (3,)."""
+    arr = r[cle]
+    if arr.ndim == 2:
+        return arr.mean()
+    return arr.mean()
+
+print("\n" + "═"*92)
+print(f"{'Méthode':<30} {'Coût':>5} {'MSE':>8} {'NCI moy':>9} {'NCI min':>9} "
+      f"{'Couv.3σ':>9} {'Var(err)':>10}")
+print(f"{'':30} {'flt':>5} {'(m²)':>8} {'(≈2)':>9} {'(pire)':>9} "
+      f"{'(≈99.7%)':>9} {'var (F3)':>10}")
+print("─"*92)
+for label, r in resultats.items():
+    m = r["methode"]
+    mse_m  = r["mse"].mean()
+    nci_m  = r["nci"].mean()
+    nci_mn = r["nci_min"].min()
+    couv   = r["couverture"].mean() * 100
+    vev    = r["var_err_var"]
+    print(f"  {m.nom:<28} {r['cout']:>5d} {mse_m:>8.3f} {nci_m:>9.3f} "
+          f"{nci_mn:>9.3f} {couv:>8.1f}% {vev:>10.4f}")
+print("═"*92)
+print("  Familles : F1 précision (MSE) | F2 cohérence (NCI, couverture) | "
+      "F3 géométrie (Var(err))")
+print("  NCI ≈ 2 : cohérent | NCI min très bas : sur-confiance ponctuelle | "
+      "Couv. < 99% : risque")
+print("  Var(err) = 0 : insensible à l'angle (M0/M2) | > 0 : sensible (M1/M3)")
+
+# ============================================================================
+# 9. FIGURES
+# ============================================================================
+drone_names = ["Drone 1 (GPS)", "Drone 2 (IMU)", "Drone 3 (aucun capteur local)"]
+
+# ── Figure 1 : Rapport Gain / Coût (front de Pareto) ────────────────────────
+fig1, axes1 = plt.subplots(1, 2, figsize=(13, 5))
+fig1.suptitle("Rapport Gain / Coût radio — comparaison des méthodes de covariance",
+              fontsize=13, fontweight='bold')
+
+for ax, j, nom in zip(axes1, [1, 2], ["Drone 2", "Drone 3"]):
+    for label, r in resultats.items():
+        m   = r["methode"]
+        mse = r["mse"][:, j].mean()
+        cout = r["cout"]
+        ax.scatter(cout, mse, s=180, color=m.color, zorder=5,
+                   marker='o', label=m.nom)
+        ax.annotate(m.label, (cout, mse),
+                    textcoords="offset points", xytext=(8, 4),
+                    fontsize=10, color=m.color, fontweight='bold')
+
+    ax.set_xlabel("Coût radio (floats émis par pas capteur)", fontsize=11)
+    ax.set_ylabel("MSE position moyenne (m²)", fontsize=11)
+    ax.set_title(f"{nom}", fontsize=11)
+    ax.grid(True, linestyle=':', alpha=0.7)
+
+    # Cadre zoom si les points sont très proches
+    mse_vals = [r["mse"][:, j].mean() for r in resultats.values()]
+    cout_vals = [r["cout"] for r in resultats.values()]
+    marge_y = max(0.1, (max(mse_vals) - min(mse_vals)) * 0.4)
+    marge_x = 0.5
+    ax.set_xlim(min(cout_vals) - marge_x, max(cout_vals) + marge_x + 1)
+    ax.set_ylim(max(0, min(mse_vals) - marge_y), max(mse_vals) + marge_y)
+
+axes1[0].legend(fontsize=8, loc='upper right')
+fig1.tight_layout()
+
+
+# ── Figure 3 : Trace(P) position — évolution temporelle ─────────────────────
+fig3, axes3 = plt.subplots(1, 3, figsize=(14, 4), sharey=False)
+fig3.suptitle("Trace(P) position au cours du temps — conservatisme des méthodes",
+              fontsize=12, fontweight='bold')
+
+for ax, j, titre in zip(axes3, [0, 1, 2], drone_names):
+    for m in METHODES:
+        r   = resultats[m.label]
+        tr  = r["trace_mean"][:, j]
+        std = r["trace_std"][:, j]
+        ax.plot(temps, tr, color=m.color, linestyle=m.ls, lw=1.8, label=m.nom)
+        ax.fill_between(temps, tr - std, tr + std, color=m.color, alpha=0.10)
+    ax.set_title(titre, fontsize=10)
+    ax.set_xlabel("Temps (s)")
+    ax.set_ylabel("Trace(P) pos (m²)" if j == 0 else "")
+    ax.grid(True, linestyle=':', alpha=0.6)
+    if j == 0:
+        ax.legend(fontsize=7)
+fig3.tight_layout()
+
+
+# ── Figure 4 : [F1] RMSE temporel — vitesse de convergence ──────────────────
+fig4, axes4 = plt.subplots(1, 3, figsize=(14, 4), sharey=False)
+fig4.suptitle("RMSE position au cours du temps — précision et vitesse de convergence",
+              fontsize=12, fontweight='bold')
+
+for ax, j, titre in zip(axes4, [0, 1, 2], drone_names):
+    for m in METHODES:
+        r = resultats[m.label]
+        ax.plot(temps, r["rmse_t"][:, j], color=m.color, linestyle=m.ls,
+                lw=1.8, label=m.nom)
+    ax.set_title(titre, fontsize=10)
+    ax.set_xlabel("Temps (s)")
+    ax.set_ylabel("RMSE pos (m)" if j == 0 else "")
+    ax.grid(True, linestyle=':', alpha=0.6)
+    if j == 0:
+        ax.legend(fontsize=7)
 fig4.tight_layout()
 
-f5 = figure_trajectoires(tv, [
-    (tk_A, 'Scénario A', 'green', '-'),
-    (tk_B, 'Scénario B', 'orange', '--'),
-    (tk_C, 'Scénario C', 'red', '-.'),
-    (tk_D, 'Scénario D', 'blue', ':'),
-], temps, gps_A)
+
+# ── Figure 5 : [F2] Cohérence — NCI boxplots + taux de couverture ───────────
+fig5, axes5 = plt.subplots(1, 3, figsize=(14, 5), sharey=False)
+fig5.suptitle("Cohérence du filtre (NCI) — NCI ≈ 2 cohérent | << 2 sur-confiant | >> 2 conservateur",
+              fontsize=12, fontweight='bold')
+for ax, j, titre in zip(axes5, [0, 1, 2], drone_names):
+    data     = [resultats[m.label]["nci"][:, j] for m in METHODES]
+    labels_m = [m.label for m in METHODES]
+    bp = ax.boxplot(data, tick_labels=labels_m, patch_artist=True,
+                    medianprops=dict(color='white', linewidth=2))
+    for patch, m in zip(bp['boxes'], METHODES):
+        patch.set_facecolor(m.color); patch.set_alpha(0.7)
+    ax.axhline(2.0, color='black', linestyle='--', lw=1.5, label='NCI = 2 (cohérent)')
+    ax.set_title(titre, fontsize=10)
+    ax.set_xlabel("Méthode")
+    ax.set_ylabel("NCI moyen" if j == 0 else "")
+    ax.grid(True, linestyle=':', alpha=0.5)
+    if j == 0:
+        ax.legend(fontsize=8)
+fig5.tight_layout()
+
+# ── Figure 6 : [F2] Taux de couverture 3σ — sécurité opérationnelle ─────────
+fig6, ax6 = plt.subplots(figsize=(10, 5))
+fig6.suptitle("Taux de couverture à 3σ — fréquence où la vraie position est dans l'ellipse",
+              fontsize=12, fontweight='bold')
+largeur = 0.2
+x_base  = np.arange(N_DRONES)
+for mi, m in enumerate(METHODES):
+    couv = resultats[m.label]["couverture"] * 100
+    ax6.bar(x_base + mi*largeur, couv, largeur, color=m.color, alpha=0.8, label=m.nom)
+ax6.axhline(99.7, color='green', linestyle='--', lw=1.5, label='Cible 99.7% (3σ)')
+ax6.set_xticks(x_base + 1.5*largeur)
+ax6.set_xticklabels(drone_names)
+ax6.set_ylabel("Taux de couverture (%)")
+ax6.set_ylim(min(80, min(resultats[m.label]["couverture"].min()*100 for m in METHODES) - 5), 102)
+ax6.legend(fontsize=8, loc='lower right')
+ax6.grid(True, axis='y', linestyle=':', alpha=0.6)
+fig6.tight_layout()
+
+
+# ── Figure 7 : [F3] Erreur de variance transmise en fonction de l'angle ─────
+# Nuage de points (var_utilisée - var_exacte) vs angle du lien, + résumé scalaire.
+fig7, axes7 = plt.subplots(1, 4, figsize=(16, 4), sharey=True)
+fig7.suptitle("Erreur de variance transmise vs angle du lien — sensibilité géométrique\n"
+              "(0 partout = exact | sinusoïde = M1 | toujours positif = M3)",
+              fontsize=12, fontweight='bold')
+for ax, m in zip(axes7, METHODES):
+    dv = resultats[m.label]["diag_var"]
+    if dv.size:
+        angle  = dv[:, 0]
+        ecart  = dv[:, 1] - dv[:, 2]     # var utilisée - var exacte
+        ax.scatter(angle, ecart, s=4, color=m.color, alpha=0.25)
+    ax.axhline(0, color='black', lw=1)
+    vev = resultats[m.label]["var_err_var"]
+    ax.set_title(f"{m.nom}\nVar(écart) = {vev:.4f}", fontsize=9)
+    ax.set_xlabel("Angle du lien (°)")
+    ax.set_xlim(0, 360); ax.set_xticks([0, 90, 180, 270, 360])
+    ax.grid(True, linestyle=':', alpha=0.6)
+axes7[0].set_ylabel("var utilisée − var exacte")
+fig7.tight_layout()
+
+
+# ── Figure 8 : Synthèse radar multicritère (moyenne 3 drones) ───────────────
+def normalise(vals):
+    arr = np.array(vals, dtype=float)
+    mn, mx = arr.min(), arr.max()
+    return (arr - mn) / (mx - mn + 1e-12)
+
+mse_g  = [resultats[m.label]["mse"].mean()              for m in METHODES]
+nci_g  = [abs(resultats[m.label]["nci"].mean() - 2)     for m in METHODES]
+couv_g = [100 - resultats[m.label]["couverture"].mean()*100 for m in METHODES]  # manque de couverture
+vev_g  = [resultats[m.label]["var_err_var"]             for m in METHODES]
+cout_g = [resultats[m.label]["cout"]                    for m in METHODES]
+
+categories = ["MSE (↓)", "Écart NCI-2 (↓)", "Manque couv. (↓)",
+              "Var(err) angle (↓)", "Coût radio (↓)"]
+n_cat  = len(categories)
+angles = [k * 2*np.pi/n_cat for k in range(n_cat)] + [0]
+
+fig8 = plt.figure(figsize=(7.5, 7.5))
+ax8  = fig8.add_subplot(111, polar=True)
+ax8.set_thetagrids(np.degrees(angles[:-1]), categories, fontsize=9)
+for m, v0, v1, v2, v3, v4 in zip(METHODES,
+                                  normalise(mse_g),  normalise(nci_g),
+                                  normalise(couv_g), normalise(vev_g),
+                                  normalise(cout_g)):
+    vals = [v0, v1, v2, v3, v4, v0]
+    ax8.plot(angles, vals, color=m.color, linestyle=m.ls, lw=2, label=m.nom)
+    ax8.fill(angles, vals, color=m.color, alpha=0.08)
+ax8.set_title("Synthèse multicritère (moyenne 3 drones)\n0 = meilleur sur chaque axe",
+              fontsize=11, fontweight='bold', pad=20)
+ax8.legend(loc='upper right', bbox_to_anchor=(1.4, 1.15), fontsize=9)
+ax8.set_ylim(0, 1)
+fig8.tight_layout()
+
+
+# ── Figure 9 : Bande passante — tableau visuel ──────────────────────────────
+fig9, ax9 = plt.subplots(figsize=(10, 3.5))
+ax9.axis('off')
+col_labels = ["Méthode", "Contenu émis (par voisin)", "Floats cov.", "Total floats*",
+              "Économie vs M0", "Exactitude"]
+rows = [
+    ["M0 — Bloc 2×2 exact",      "pos(2) + Pxx,Pxy,Pyy(3)", "3", "15", "référence", "Exacte"],
+    ["M1 — Isotrope (trace/2)",  "pos(2) + σ²(1)",           "1", "9",  "−40 %",     "Approx. (ignore aniso.)"],
+    ["M2 — Variance projetée",   "pos(2) + Hj·P·Hj(1)",     "1", "9",  "−40 %",     "Exacte dans la direction"],
+    ["M3 — Variance max (λmax)", "pos(2) + λmax(1)",         "1", "9",  "−40 %",     "Sur-estimée (robuste)"],
+]
+tbl = ax9.table(cellText=rows, colLabels=col_labels, cellLoc='center',
+                loc='center', bbox=[0, 0, 1, 1])
+tbl.auto_set_font_size(False); tbl.set_fontsize(9)
+for (r, c), cell in tbl.get_celld().items():
+    if r == 0:
+        cell.set_facecolor('#2c3e50'); cell.set_text_props(color='white', fontweight='bold')
+    elif r > 0 and c == 0:
+        cell.set_facecolor(METHODES[r-1].color); cell.set_alpha(0.25)
+    cell.set_edgecolor('#cccccc')
+ax9.set_title("Synthèse bande passante — floats émis par pas capteur\n"
+              "(*= 3 drones, chacun émet vers ses voisins)",
+              fontsize=11, fontweight='bold', pad=12)
+fig9.tight_layout()
 
 plt.show()
