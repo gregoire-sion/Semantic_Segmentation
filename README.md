@@ -525,201 +525,205 @@ print("  NCI ≈ 2 : cohérent | NCI min très bas : sur-confiance ponctuelle | 
 print("  Var(err) = 0 : insensible à l'angle (M0/M2) | > 0 : sensible (M1/M3)")
 
 # ============================================================================
-# 9. FIGURES
+# 9. FIGURES  (3 figures sélectionnées pour la présentation)
+#
+#   Fig 1 — Erreur de variance vs angle  : signature géométrique de chaque méthode
+#   Fig 2 — MSE (barres) + Couverture 3σ : précision et sécurité côte à côte
+#   Fig 3 — Radar multicritère           : synthèse finale toutes familles
 # ============================================================================
-drone_names = ["Drone 1 (GPS)", "Drone 2 (IMU)", "Drone 3 (aucun capteur local)"]
+drone_names   = ["Drone 1\n(GPS)", "Drone 2\n(IMU)", "Drone 3\n(sans capteur)"]
+drone_names_l = ["Drone 1 (GPS)", "Drone 2 (IMU)", "Drone 3 (sans capteur)"]
 
-# ── Figure 1 : Rapport Gain / Coût (front de Pareto) ────────────────────────
-fig1, axes1 = plt.subplots(1, 2, figsize=(13, 5))
-fig1.suptitle("Rapport Gain / Coût radio — comparaison des méthodes de covariance",
-              fontsize=13, fontweight='bold')
+# ── Figure 1 : Erreur de variance transmise vs angle du lien ────────────────
+# Chaque point = une fusion CI (un lien à un instant t, dans un run Monte Carlo).
+# L'axe X est l'angle entre le lien et l'axe x au moment de la fusion.
+# L'axe Y est l'écart entre la variance utilisée par la méthode et la vraie
+# projection exacte (M0). Zéro = parfait.
+# ─────────────────────────────────────────────────────────────────────────────
+fig1, axes1 = plt.subplots(1, 4, figsize=(17, 4.5), sharey=True)
+fig1.suptitle(
+    "Figure 1 — Erreur de variance transmise vs orientation du lien\n"
+    "Chaque point = une fusion CI (lien × instant × run Monte Carlo). "
+    "Axe Y = variance utilisée − variance exacte. Zéro = parfait.",
+    fontsize=11, fontweight='bold')
 
-for ax, j, nom in zip(axes1, [1, 2], ["Drone 2", "Drone 3"]):
-    for label, r in resultats.items():
-        m   = r["methode"]
-        mse = r["mse"][:, j].mean()
-        cout = r["cout"]
-        ax.scatter(cout, mse, s=180, color=m.color, zorder=5,
-                   marker='o', label=m.nom)
-        ax.annotate(m.label, (cout, mse),
-                    textcoords="offset points", xytext=(8, 4),
-                    fontsize=10, color=m.color, fontweight='bold')
-
-    ax.set_xlabel("Coût radio (floats émis par pas capteur)", fontsize=11)
-    ax.set_ylabel("MSE position moyenne (m²)", fontsize=11)
-    ax.set_title(f"{nom}", fontsize=11)
-    ax.grid(True, linestyle=':', alpha=0.7)
-
-    # Cadre zoom si les points sont très proches
-    mse_vals = [r["mse"][:, j].mean() for r in resultats.values()]
-    cout_vals = [r["cout"] for r in resultats.values()]
-    marge_y = max(0.1, (max(mse_vals) - min(mse_vals)) * 0.4)
-    marge_x = 0.5
-    ax.set_xlim(min(cout_vals) - marge_x, max(cout_vals) + marge_x + 1)
-    ax.set_ylim(max(0, min(mse_vals) - marge_y), max(mse_vals) + marge_y)
-
-axes1[0].legend(fontsize=8, loc='upper right')
-fig1.tight_layout()
-
-
-# ── Figure 3 : Trace(P) position — évolution temporelle ─────────────────────
-fig3, axes3 = plt.subplots(1, 3, figsize=(14, 4), sharey=False)
-fig3.suptitle("Trace(P) position au cours du temps — conservatisme des méthodes",
-              fontsize=12, fontweight='bold')
-
-for ax, j, titre in zip(axes3, [0, 1, 2], drone_names):
-    for m in METHODES:
-        r   = resultats[m.label]
-        tr  = r["trace_mean"][:, j]
-        std = r["trace_std"][:, j]
-        ax.plot(temps, tr, color=m.color, linestyle=m.ls, lw=1.8, label=m.nom)
-        ax.fill_between(temps, tr - std, tr + std, color=m.color, alpha=0.10)
-    ax.set_title(titre, fontsize=10)
-    ax.set_xlabel("Temps (s)")
-    ax.set_ylabel("Trace(P) pos (m²)" if j == 0 else "")
-    ax.grid(True, linestyle=':', alpha=0.6)
-    if j == 0:
-        ax.legend(fontsize=7)
-fig3.tight_layout()
-
-
-# ── Figure 4 : [F1] RMSE temporel — vitesse de convergence ──────────────────
-fig4, axes4 = plt.subplots(1, 3, figsize=(14, 4), sharey=False)
-fig4.suptitle("RMSE position au cours du temps — précision et vitesse de convergence",
-              fontsize=12, fontweight='bold')
-
-for ax, j, titre in zip(axes4, [0, 1, 2], drone_names):
-    for m in METHODES:
-        r = resultats[m.label]
-        ax.plot(temps, r["rmse_t"][:, j], color=m.color, linestyle=m.ls,
-                lw=1.8, label=m.nom)
-    ax.set_title(titre, fontsize=10)
-    ax.set_xlabel("Temps (s)")
-    ax.set_ylabel("RMSE pos (m)" if j == 0 else "")
-    ax.grid(True, linestyle=':', alpha=0.6)
-    if j == 0:
-        ax.legend(fontsize=7)
-fig4.tight_layout()
-
-
-# ── Figure 5 : [F2] Cohérence — NCI boxplots + taux de couverture ───────────
-fig5, axes5 = plt.subplots(1, 3, figsize=(14, 5), sharey=False)
-fig5.suptitle("Cohérence du filtre (NCI) — NCI ≈ 2 cohérent | << 2 sur-confiant | >> 2 conservateur",
-              fontsize=12, fontweight='bold')
-for ax, j, titre in zip(axes5, [0, 1, 2], drone_names):
-    data     = [resultats[m.label]["nci"][:, j] for m in METHODES]
-    labels_m = [m.label for m in METHODES]
-    bp = ax.boxplot(data, tick_labels=labels_m, patch_artist=True,
-                    medianprops=dict(color='white', linewidth=2))
-    for patch, m in zip(bp['boxes'], METHODES):
-        patch.set_facecolor(m.color); patch.set_alpha(0.7)
-    ax.axhline(2.0, color='black', linestyle='--', lw=1.5, label='NCI = 2 (cohérent)')
-    ax.set_title(titre, fontsize=10)
-    ax.set_xlabel("Méthode")
-    ax.set_ylabel("NCI moyen" if j == 0 else "")
-    ax.grid(True, linestyle=':', alpha=0.5)
-    if j == 0:
-        ax.legend(fontsize=8)
-fig5.tight_layout()
-
-# ── Figure 6 : [F2] Taux de couverture 3σ — sécurité opérationnelle ─────────
-fig6, ax6 = plt.subplots(figsize=(10, 5))
-fig6.suptitle("Taux de couverture à 3σ — fréquence où la vraie position est dans l'ellipse",
-              fontsize=12, fontweight='bold')
-largeur = 0.2
-x_base  = np.arange(N_DRONES)
-for mi, m in enumerate(METHODES):
-    couv = resultats[m.label]["couverture"] * 100
-    ax6.bar(x_base + mi*largeur, couv, largeur, color=m.color, alpha=0.8, label=m.nom)
-ax6.axhline(99.7, color='green', linestyle='--', lw=1.5, label='Cible 99.7% (3σ)')
-ax6.set_xticks(x_base + 1.5*largeur)
-ax6.set_xticklabels(drone_names)
-ax6.set_ylabel("Taux de couverture (%)")
-ax6.set_ylim(min(80, min(resultats[m.label]["couverture"].min()*100 for m in METHODES) - 5), 102)
-ax6.legend(fontsize=8, loc='lower right')
-ax6.grid(True, axis='y', linestyle=':', alpha=0.6)
-fig6.tight_layout()
-
-
-# ── Figure 7 : [F3] Erreur de variance transmise en fonction de l'angle ─────
-# Nuage de points (var_utilisée - var_exacte) vs angle du lien, + résumé scalaire.
-fig7, axes7 = plt.subplots(1, 4, figsize=(16, 4), sharey=True)
-fig7.suptitle("Erreur de variance transmise vs angle du lien — sensibilité géométrique\n"
-              "(0 partout = exact | sinusoïde = M1 | toujours positif = M3)",
-              fontsize=12, fontweight='bold')
-for ax, m in zip(axes7, METHODES):
+# Calcul de la plage Y globale pour un axe partagé propre
+all_ecarts = []
+for m in METHODES:
     dv = resultats[m.label]["diag_var"]
     if dv.size:
-        angle  = dv[:, 0]
-        ecart  = dv[:, 1] - dv[:, 2]     # var utilisée - var exacte
-        ax.scatter(angle, ecart, s=4, color=m.color, alpha=0.25)
-    ax.axhline(0, color='black', lw=1)
-    vev = resultats[m.label]["var_err_var"]
-    ax.set_title(f"{m.nom}\nVar(écart) = {vev:.4f}", fontsize=9)
-    ax.set_xlabel("Angle du lien (°)")
+        all_ecarts.append(dv[:, 1] - dv[:, 2])
+all_ecarts = np.concatenate(all_ecarts)
+y_lim = np.percentile(np.abs(all_ecarts), 99) * 1.15  # coupe les outliers extrêmes
+
+for ax, m in zip(axes1, METHODES):
+    dv = resultats[m.label]["diag_var"]
+    if dv.size:
+        angle = dv[:, 0]
+        ecart = dv[:, 1] - dv[:, 2]
+        # Zone de sur-estimation (orange clair) et sous-estimation (bleue clair)
+        ax.axhspan(0, y_lim,  color='#f7c97e', alpha=0.08, label='Sur-estime')
+        ax.axhspan(-y_lim, 0, color='#7eb8f7', alpha=0.08, label='Sous-estime')
+        ax.scatter(angle, ecart, s=3, color=m.color, alpha=0.30, rasterized=True)
+        # Médiane glissante par tranche de 20°
+        bins  = np.arange(0, 361, 20)
+        mids  = (bins[:-1] + bins[1:]) / 2
+        meds  = [np.median(ecart[(angle >= bins[k]) & (angle < bins[k+1])])
+                 if np.any((angle >= bins[k]) & (angle < bins[k+1])) else np.nan
+                 for k in range(len(bins)-1)]
+        ax.plot(mids, meds, color='white', lw=2.0, zorder=5, label='Médiane / 20°')
+
+    ax.axhline(0, color='black', lw=1.2)
     ax.set_xlim(0, 360); ax.set_xticks([0, 90, 180, 270, 360])
-    ax.grid(True, linestyle=':', alpha=0.6)
-axes7[0].set_ylabel("var utilisée − var exacte")
-fig7.tight_layout()
+    ax.set_ylim(-y_lim, y_lim)
+    vev = resultats[m.label]["var_err_var"]
+    ax.set_title(f"{m.nom}\nVar(écart) = {vev:.1f}", fontsize=9,
+                 color=m.color, fontweight='bold')
+    ax.set_xlabel("Angle du lien (°)", fontsize=9)
+    ax.grid(True, linestyle=':', alpha=0.5)
+
+axes1[0].set_ylabel("Variance utilisée − Variance exacte", fontsize=9)
+# Annotations interprétatives dans le premier panneau
+axes1[0].text(5,  y_lim*0.75, "sur-estime\n(trop prudent)", fontsize=7,
+              color='#c08000', va='top')
+axes1[0].text(5, -y_lim*0.75, "sous-estime\n(risque sur-confiance)", fontsize=7,
+              color='#2060c0', va='bottom')
+# Légende commune
+handles1, labels1 = axes1[0].get_legend_handles_labels()
+fig1.legend(handles1, labels1, loc='lower center', ncol=3,
+            fontsize=8, bbox_to_anchor=(0.5, -0.02))
+fig1.tight_layout(rect=[0, 0.06, 1, 1])
 
 
-# ── Figure 8 : Synthèse radar multicritère (moyenne 3 drones) ───────────────
+# ── Figure 2 : MSE position (barres) + Taux de couverture 3σ ────────────────
+# Deux sous-figures côte à côte, une par métrique, pour les 3 drones.
+# Les barres groupées permettent de comparer les 4 méthodes d'un coup d'œil.
+# ─────────────────────────────────────────────────────────────────────────────
+fig2 = plt.figure(figsize=(15, 5.5))
+fig2.suptitle(
+    "Figure 2 — Précision (MSE) et Sécurité (Couverture 3σ) pour les 3 drones\n"
+    "MSE : erreur quadratique moyenne de position (m²) — plus petit = plus précis\n"
+    "Couverture : % d'instants où la vraie position est dans l'ellipse ±3σ — cible 99.7%",
+    fontsize=10, fontweight='bold')
+
+largeur = 0.19
+x_base  = np.arange(N_DRONES)
+ax2a = fig2.add_subplot(1, 2, 1)   # MSE
+ax2b = fig2.add_subplot(1, 2, 2)   # Couverture
+
+for mi, m in enumerate(METHODES):
+    offset = (mi - 1.5) * largeur
+    # MSE : moyenne sur les N_MC runs + barre d'erreur (±1 std inter-runs)
+    mse_mean = resultats[m.label]["mse"].mean(axis=0)     # (3,)
+    mse_std  = resultats[m.label]["mse"].std(axis=0)
+    bars = ax2a.bar(x_base + offset, mse_mean, largeur,
+                    color=m.color, alpha=0.85, label=m.nom,
+                    yerr=mse_std, error_kw=dict(elinewidth=1, capsize=3,
+                                                 ecolor='#444444'))
+    # Valeur au-dessus de chaque barre
+    for bar, val in zip(bars, mse_mean):
+        ax2a.text(bar.get_x() + bar.get_width()/2, bar.get_height() + mse_std[0]*0.1,
+                  f"{val:.1f}", ha='center', va='bottom', fontsize=6.5, color=m.color)
+
+    # Couverture
+    couv = resultats[m.label]["couverture"] * 100   # (3,)
+    bars2 = ax2b.bar(x_base + offset, couv, largeur,
+                     color=m.color, alpha=0.85, label=m.nom)
+    for bar, val in zip(bars2, couv):
+        ax2b.text(bar.get_x() + bar.get_width()/2, val + 0.1,
+                  f"{val:.1f}", ha='center', va='bottom', fontsize=6.5, color=m.color)
+
+# MSE : axes et annotations
+ax2a.set_xticks(x_base); ax2a.set_xticklabels(drone_names_l, fontsize=9)
+ax2a.set_ylabel("MSE position (m²)", fontsize=10)
+ax2a.set_title("Précision — MSE position\n(barres d'erreur = ±1σ inter-runs Monte Carlo)",
+               fontsize=9)
+ax2a.legend(fontsize=8, loc='upper left')
+ax2a.grid(True, axis='y', linestyle=':', alpha=0.6)
+# Annotation : M0 = M2 en flèche double
+mse_M0 = resultats["M0"]["mse"].mean(axis=0)[1]
+mse_M2 = resultats["M2"]["mse"].mean(axis=0)[1]
+ax2a.annotate("M0 = M2\n(même précision,\n−40% radio)", xy=(1 + 0*largeur, mse_M0),
+              xytext=(1.55, mse_M0 + 1.5),
+              fontsize=7, color='gray',
+              arrowprops=dict(arrowstyle='->', color='gray', lw=1))
+
+# Couverture : axes et annotations
+ax2b.axhline(99.7, color='green', linestyle='--', lw=1.8,
+             label='Cible 99.7% (3σ théorique)')
+ax2b.set_xticks(x_base); ax2b.set_xticklabels(drone_names_l, fontsize=9)
+ax2b.set_ylabel("Taux de couverture (%)", fontsize=10)
+ax2b.set_title("Sécurité — Couverture à 3σ\n(% d'instants où la vraie pos. est dans l'ellipse)",
+               fontsize=9)
+couv_min = min(resultats[m.label]["couverture"].min() for m in METHODES) * 100
+ax2b.set_ylim(min(95, couv_min - 1), 101)
+ax2b.legend(fontsize=8, loc='lower right')
+ax2b.grid(True, axis='y', linestyle=':', alpha=0.6)
+
+fig2.tight_layout(rect=[0, 0, 1, 0.88])
+
+
+# ── Figure 3 : Radar multicritère — synthèse finale ─────────────────────────
+# 5 axes normalisés 0→1 (0 = meilleur sur chaque axe).
+# Montre d'un seul coup d'œil le profil complet de chaque méthode.
+# ─────────────────────────────────────────────────────────────────────────────
 def normalise(vals):
     arr = np.array(vals, dtype=float)
     mn, mx = arr.min(), arr.max()
     return (arr - mn) / (mx - mn + 1e-12)
 
-mse_g  = [resultats[m.label]["mse"].mean()              for m in METHODES]
-nci_g  = [abs(resultats[m.label]["nci"].mean() - 2)     for m in METHODES]
-couv_g = [100 - resultats[m.label]["couverture"].mean()*100 for m in METHODES]  # manque de couverture
-vev_g  = [resultats[m.label]["var_err_var"]             for m in METHODES]
-cout_g = [resultats[m.label]["cout"]                    for m in METHODES]
+mse_g  = [resultats[m.label]["mse"].mean()                   for m in METHODES]
+nci_g  = [abs(resultats[m.label]["nci"].mean() - 2)          for m in METHODES]
+couv_g = [100 - resultats[m.label]["couverture"].mean()*100   for m in METHODES]
+vev_g  = [resultats[m.label]["var_err_var"]                   for m in METHODES]
+cout_g = [resultats[m.label]["cout"]                          for m in METHODES]
 
-categories = ["MSE (↓)", "Écart NCI-2 (↓)", "Manque couv. (↓)",
-              "Var(err) angle (↓)", "Coût radio (↓)"]
-n_cat  = len(categories)
-angles = [k * 2*np.pi/n_cat for k in range(n_cat)] + [0]
-
-fig8 = plt.figure(figsize=(7.5, 7.5))
-ax8  = fig8.add_subplot(111, polar=True)
-ax8.set_thetagrids(np.degrees(angles[:-1]), categories, fontsize=9)
-for m, v0, v1, v2, v3, v4 in zip(METHODES,
-                                  normalise(mse_g),  normalise(nci_g),
-                                  normalise(couv_g), normalise(vev_g),
-                                  normalise(cout_g)):
-    vals = [v0, v1, v2, v3, v4, v0]
-    ax8.plot(angles, vals, color=m.color, linestyle=m.ls, lw=2, label=m.nom)
-    ax8.fill(angles, vals, color=m.color, alpha=0.08)
-ax8.set_title("Synthèse multicritère (moyenne 3 drones)\n0 = meilleur sur chaque axe",
-              fontsize=11, fontweight='bold', pad=20)
-ax8.legend(loc='upper right', bbox_to_anchor=(1.4, 1.15), fontsize=9)
-ax8.set_ylim(0, 1)
-fig8.tight_layout()
-
-
-# ── Figure 9 : Bande passante — tableau visuel ──────────────────────────────
-fig9, ax9 = plt.subplots(figsize=(10, 3.5))
-ax9.axis('off')
-col_labels = ["Méthode", "Contenu émis (par voisin)", "Floats cov.", "Total floats*",
-              "Économie vs M0", "Exactitude"]
-rows = [
-    ["M0 — Bloc 2×2 exact",      "pos(2) + Pxx,Pxy,Pyy(3)", "3", "15", "référence", "Exacte"],
-    ["M1 — Isotrope (trace/2)",  "pos(2) + σ²(1)",           "1", "9",  "−40 %",     "Approx. (ignore aniso.)"],
-    ["M2 — Variance projetée",   "pos(2) + Hj·P·Hj(1)",     "1", "9",  "−40 %",     "Exacte dans la direction"],
-    ["M3 — Variance max (λmax)", "pos(2) + λmax(1)",         "1", "9",  "−40 %",     "Sur-estimée (robuste)"],
+categories = [
+    "Précision\nMSE (↓)",
+    "Cohérence\n|NCI−2| (↓)",
+    "Sécurité\nManque couv. (↓)",
+    "Géométrie\nVar(err) (↓)",
+    "Bande\npassante (↓)"
 ]
-tbl = ax9.table(cellText=rows, colLabels=col_labels, cellLoc='center',
-                loc='center', bbox=[0, 0, 1, 1])
-tbl.auto_set_font_size(False); tbl.set_fontsize(9)
-for (r, c), cell in tbl.get_celld().items():
-    if r == 0:
-        cell.set_facecolor('#2c3e50'); cell.set_text_props(color='white', fontweight='bold')
-    elif r > 0 and c == 0:
-        cell.set_facecolor(METHODES[r-1].color); cell.set_alpha(0.25)
-    cell.set_edgecolor('#cccccc')
-ax9.set_title("Synthèse bande passante — floats émis par pas capteur\n"
-              "(*= 3 drones, chacun émet vers ses voisins)",
-              fontsize=11, fontweight='bold', pad=12)
-fig9.tight_layout()
+n_cat  = len(categories)
+ang    = [k * 2*np.pi/n_cat for k in range(n_cat)] + [0]
+
+fig3 = plt.figure(figsize=(8.5, 8))
+ax3  = fig3.add_subplot(111, polar=True)
+
+# Cercles de référence annotés
+for r_ref, txt in [(0.25, '25%'), (0.5, '50%'), (0.75, '75%'), (1.0, '100% (pire)')]:
+    ax3.plot([a for a in ang], [r_ref]*n_cat + [r_ref], color='#444', lw=0.5, ls=':')
+    ax3.text(ang[0], r_ref + 0.03, txt, fontsize=6, color='#666', ha='center')
+
+ax3.set_thetagrids(np.degrees(ang[:-1]), categories, fontsize=9)
+ax3.set_rlabel_position(0)
+ax3.set_yticklabels([])
+
+for m, v0, v1, v2, v3, v4 in zip(METHODES,
+                                   normalise(mse_g),  normalise(nci_g),
+                                   normalise(couv_g), normalise(vev_g),
+                                   normalise(cout_g)):
+    vals = [v0, v1, v2, v3, v4, v0]
+    ax3.plot(ang, vals, color=m.color, linestyle=m.ls, lw=2.5, label=m.nom)
+    ax3.fill(ang, vals, color=m.color, alpha=0.07)
+    # Point sur chaque axe pour la lisibilité
+    ax3.scatter(ang[:-1], vals[:-1], s=40, color=m.color, zorder=5)
+
+ax3.set_title(
+    "Figure 3 — Synthèse multicritère (moyenne sur 3 drones et 40 runs)\n"
+    "0 = meilleur sur chaque axe  |  Surface = 'coût total' de la méthode",
+    fontsize=10, fontweight='bold', pad=28)
+ax3.legend(loc='upper right', bbox_to_anchor=(1.42, 1.18), fontsize=9,
+           framealpha=0.9)
+ax3.set_ylim(0, 1)
+
+# Annotation textuelle M2 vs M1
+ax3.annotate("M2 domine M1\nà coût égal", xy=(ang[3], normalise(vev_g)[1]),
+             xytext=(ang[3] + 0.3, 0.75),
+             fontsize=8, color='darkorange',
+             arrowprops=dict(arrowstyle='->', color='darkorange', lw=1))
+
+fig3.tight_layout()
 
 plt.show()
