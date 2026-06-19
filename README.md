@@ -463,6 +463,11 @@ MODE_MONTE_CARLO = True    # True = exécution Monte-Carlo ; False = single-run 
 N_MC             = 50      # nombre de runs Monte-Carlo par scénario
 BASE_SEED_MC     = 1000    # seed de départ (incrémenté à chaque run)
 
+# Drones à tracer sur les figures de consistance. base = colonne de départ dans X.
+#   [(2, 8)]                     -> seulement le drone 2
+#   [(1, 0), (2, 8), (3, 16)]    -> les 3 drones
+DRONES_A_TRACER  = [(1, 0), (2, 8), (3, 16)]
+
 # Configuration des 4 scénarios (réutilisée par les deux modes)
 CONFIGS = [
     ("Scénario A", dict(compenser_biais=True,  use_gps=True, use_imu=True, use_distances=True)),
@@ -497,12 +502,15 @@ if MODE_MONTE_CARLO:
         print(f"  {nom:<12} : {mse_runs:.4f}")
 
     # --- Figures de cohérence (spaghetti + RMSE vs ±3σ) -------------------
-    # Recommandation : pour la consistance, on montre TOUS les runs.
-    # On affiche les scénarios les plus parlants (A cohérent, C incohérent).
-    figure_mc_consistance(err_mc["Scénario A"], Pref_mc["Scénario A"], temps,
-                          base=8, nom="Scénario A", drone=2)
-    figure_mc_consistance(err_mc["Scénario C"], Pref_mc["Scénario C"], temps,
-                          base=8, nom="Scénario C", drone=2)
+    # Une figure par (scénario, drone). base et drone varient ENSEMBLE :
+    # c'est 'base' qui sélectionne réellement les colonnes du drone dans
+    # err_all/P_ref ; 'drone' ne sert qu'au titre. Les dissocier (ex. base
+    # figé à 8 pendant que drone change) afficherait 3 fois les mêmes données
+    # avec des titres différents.
+    for nom, cfg in CONFIGS:
+        for drone, base in DRONES_A_TRACER:
+            figure_mc_consistance(err_mc[nom], Pref_mc[nom], temps,
+                                  base=base, nom=nom, drone=drone)
 
     # --- Figure de synthèse : RMSE des 4 scénarios ------------------------
     figure_mc_rmse_position([
