@@ -2,6 +2,7 @@
 ============================================================================
  EKF — Localisation coopérative de 3 drones
  Capteurs activables / désactivables pour la présentation des résultats
+ + Mode Monte-Carlo activable (MODE_MONTE_CARLO en section 7)
 ============================================================================
  Paramètres de run_ekf() :
    compenser_biais : bool  — le filtre estime-t-il le biais ?
@@ -171,7 +172,7 @@ def figure_trajectoires(tv, scenarios, temps, mes_gps):
     # if len(mes_gps):
     #     plt.scatter(mes_gps[:, 1], mes_gps[:, 2], color='red', marker='x',
     #                 s=20, label='Mesures GPS (Drone 1)', zorder=5)
-                    
+
     for d, base, mk in [(1, 0, '^'), (2, 8, 'o'), (3, 16, 's')]:
         plt.plot(tv[:, base], tv[:, base+1], color='black', lw=2,
                 label=f'Drone {d} — vérité')
@@ -183,7 +184,7 @@ def figure_trajectoires(tv, scenarios, temps, mes_gps):
                 lbl = '_nolegend'
             plt.plot(tk[:, base], tk[:, base+1], color=color, linestyle=ls, lw=1.5,
                     label=lbl)
-                    
+
     plt.xlabel("X"); plt.ylabel("Y"); plt.title("Trajectoires des 3 drones")
     plt.legend(fontsize=8); plt.grid(True)
     x_vrai_all = tv[:, [0, 8, 16]]
@@ -362,85 +363,238 @@ def run_ekf(nom_scenario="", compenser_biais=True, seed=0,
     return traj_vrai, traj_kalman, P_hist, temps, mes_gps, mes_imu, mes_gpsv
 
 # --------------------------------------------------------------------------
+# 9. Couche Monte-Carlo
+# --------------------------------------------------------------------------
+def run_monte_carlo(n_mc=50, base_seed=1000, nom_scenario="", **kwargs):
+    """Exécute n_mc runs EKF indépendants (seeds différents).
+
+    kwargs = compenser_biais, use_gps, use_imu, use_distances...
+    show_corridors et seed sont forcés/ignorés ici : on trace nous-mêmes.
+
+    Retourne :
+      tk_all  (n_mc, n_steps+1, N) : trajectoires estimées
+      err_all (n_mc, n_steps+1, N) : erreurs (estimé - vrai) par run
+      P_ref   (n_steps+1, N, N)    : un P représentatif (σ prédit par le filtre)
+      tv_ref  (n_steps+1, N)       : une trajectoire vraie de référence (1 run)
+      temps   (n_steps+1,)
+    """
+    kwargs.pop('show_corridors', None)
+    kwargs.pop('seed', None)
+    kwargs.pop('nom_scenario', None)
+
+    tk_all  = np.zeros((n_mc, n_steps + 1, N))
+    err_all = np.zeros((n_mc, n_steps + 1, N))
+    P_ref   = None
+    tv_ref  = None
+    temps   = None
+
+    for i in range(n_mc):
+        tv, tk, Ph, temps, *_ = run_ekf(
+            seed=base_seed + i, show_corridors=False, **kwargs)
+        tk_all[i]  = tk
+        err_all[i] = tk - tv
+        if P_ref is None:
+            # P dépend de la géométrie (H) plus que des valeurs de bruit :
+            # un run sert de référence représentative pour le couloir ±3σ.
+            P_ref  = Ph
+            tv_ref = tv
+
+    return tk_all, err_all, P_ref, tv_ref, temps
+
+
+def figure_mc_consistance(err_all, P_ref, temps, base, nom="", drone=2):
+    """Diagnostic de cohérence : spaghetti des erreurs de tous les runs,
+    RMSE empirique (rouge) et couloir ±3σ prédit par le filtre (bleu).
+
+    Lecture : si le filtre est cohérent, la RMSE empirique reste dans le
+    couloir ±3σ et n'en sort pas. Si elle déborde, le filtre est trop
+    confiant (sous-estime son incertitude réelle)."""
+    n_mc = err_all.shape[0]
+    fig, axs = plt.subplots(4, 2, figsize=(12, 8), sharex=True)
+    fig.suptitle(f"{nom} — Drone {drone} — {n_mc} runs Monte-Carlo",
+                 fontsize=13, fontweight='bold')
+    axs = axs.flatten()
+    for i in range(8):
+        idx   = base + i
+        sigma = np.sqrt(P_ref[:, idx, idx])
+        rmse  = np.sqrt(np.mean(err_all[:, :, idx]**2, axis=0))
+        for r in range(n_mc):
+            axs[i].plot(temps, err_all[r, :, idx],
+                        color='green', alpha=0.08, lw=0.6)
+        axs[i].fill_between(temps, -3*sigma, 3*sigma, color='blue', alpha=0.15,
+                            label=r'Couloir $\pm 3\sigma$ prédit')
+        axs[i].plot(temps,  rmse, 'r-', lw=1.5, label='RMSE empirique')
+        axs[i].plot(temps, -rmse, 'r-', lw=1.5)
+        axs[i].axhline(0, color='k', lw=0.6)
+        axs[i].set_title(f"{labels[i]} : estimé − vrai", fontsize=10)
+        axs[i].grid(True, linestyle=':', alpha=0.7)
+    axs[6].set_xlabel("Temps (s)"); axs[7].set_xlabel("Temps (s)")
+    h, l = axs[0].get_legend_handles_labels()
+    fig.legend(h, l, loc='upper center', ncol=3, bbox_to_anchor=(0.5, 0.97))
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    return fig
+
+
+def figure_mc_rmse_position(scenarios_mc, temps, drone=2):
+    """Synthèse : RMSE de position euclidienne (drone choisi) par scénario,
+    avec bande de dispersion inter-runs (min/max). Idéale en diapo bilan."""
+    base = {1: 0, 2: 8, 3: 16}[drone]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for err_all, label, color in scenarios_mc:
+        # erreur de position euclidienne, par run, à chaque instant
+        err_pos = np.sqrt(err_all[:, :, base]**2 + err_all[:, :, base+1]**2)
+        rmse    = np.sqrt(np.mean(err_pos**2, axis=0))   # RMSE inter-runs
+        lo      = err_pos.min(axis=0)
+        hi      = err_pos.max(axis=0)
+        ax.fill_between(temps, lo, hi, color=color, alpha=0.12)
+        ax.plot(temps, rmse, color=color, lw=1.8, label=label)
+    ax.set_title(f"RMSE de position — Drone {drone} (bande = min/max des runs)",
+                 fontsize=12)
+    ax.set_xlabel("Temps (s)"); ax.set_ylabel("RMSE (m)")
+    ax.legend(fontsize=9); ax.grid(True, linestyle=':', alpha=0.7)
+    fig.tight_layout()
+    return fig
+
+# --------------------------------------------------------------------------
 # 7. Scénarios de présentation
 # --------------------------------------------------------------------------
 
-# --- Scénario A : configuration complète, avec biais estimé (référence) ---
-print("Scénario A : tous capteurs, biais estimé...")
-tv, tk_A, Ph_A, temps, gps_A, imu_A, gpsv_A = run_ekf(
-    nom_scenario="Scénario A",
-    compenser_biais=True, seed=0,
-    use_gps=True, use_imu=True, use_distances=True,
-    show_corridors=True)
+MODE_MONTE_CARLO = True    # True = exécution Monte-Carlo ; False = single-run d'origine
+N_MC             = 50      # nombre de runs Monte-Carlo par scénario
+BASE_SEED_MC     = 1000    # seed de départ (incrémenté à chaque run)
 
-# --- Scénario B : tous capteurs, sans estimer le biais ---
-print("Scénario B : tous capteurs, biais NON estimé...")
-_, tk_B, Ph_B, _, gps_B, imu_B, gpsv_B = run_ekf(
-    nom_scenario="Scénario B",
-    compenser_biais=False, seed=0,
-    use_gps=True, use_imu=True, use_distances=True,
-    show_corridors=True)
+# Configuration des 4 scénarios (réutilisée par les deux modes)
+CONFIGS = [
+    ("Scénario A", dict(compenser_biais=True,  use_gps=True, use_imu=True, use_distances=True)),
+    ("Scénario B", dict(compenser_biais=False, use_gps=True, use_imu=True, use_distances=True)),
+    ("Scénario C", dict(compenser_biais=False, use_gps=True, use_imu=True, use_distances=False)),
+    ("Scénario D", dict(compenser_biais=True,  use_gps=True, use_imu=True, use_distances=False)),
+]
 
-# --- Scénario C : sans distances, sans estimer le biais (dérive parabolique) ---
-print("Scénario C : sans distances, biais NON estimé...")
-_, tk_C, Ph_C, _, gps_C, imu_C, gpsv_C = run_ekf(
-    nom_scenario="Scénario C",
-    compenser_biais=False, seed=0,
-    use_gps=True, use_imu=True, use_distances=False,
-    show_corridors=True)
+if MODE_MONTE_CARLO:
+    # ======================================================================
+    #  MODE MONTE-CARLO
+    # ======================================================================
+    print(f"Mode Monte-Carlo : {N_MC} runs par scénario...\n")
 
-# --- Scénario D : sans distances, avec biais estimé ---
-print("Scénario D : sans distances, biais estimé...")
-_, tk_D, Ph_D, _, gps_D, imu_D, gpsv_D = run_ekf(
-    nom_scenario="Scénario D",
-    compenser_biais=True, seed=0,
-    use_gps=True, use_imu=True, use_distances=False,
-    show_corridors=True)
+    err_mc   = {}   # nom -> err_all
+    Pref_mc  = {}   # nom -> P_ref
+    tvref_mc = {}   # nom -> tv_ref
+    temps    = None
 
-# --------------------------------------------------------------------------
-# 8. Figures de présentation
-# --------------------------------------------------------------------------
-mse = lambda a, b: np.square(a - b).mean()
-print("\n=== MSE position drone 2 ===")
-for label, tk in [("A - Complet + biais estimé",          tk_A),
-                  ("B - Complet, biais non estimé",        tk_B),
-                  ("C - Sans distances, biais non estimé", tk_C),
-                  ("D - Sans distances, biais estimé",     tk_D)]:
-    print(f"  {label:<40} : {mse(tv[:,8:10], tk[:,8:10]):.4f}")
+    for nom, cfg in CONFIGS:
+        print(f"  {nom} ...")
+        _, err_all, P_ref, tv_ref, temps = run_monte_carlo(
+            n_mc=N_MC, base_seed=BASE_SEED_MC, **cfg)
+        err_mc[nom]   = err_all
+        Pref_mc[nom]  = P_ref
+        tvref_mc[nom] = tv_ref
 
-# Figure — Comparaison B vs A : distances compensent le biais
-f2 = figure_comparaison_biais(tv, tk_A, tk_B, temps,
-                               label_avec="Biais estimé (A)",
-                               label_sans="Biais non estimé (B)")
-f2.suptitle("Scénario A vs B", fontsize=13, fontweight='bold')
+    # --- MSE position drone 2, moyenné sur tous les runs ------------------
+    print("\n=== MSE position drone 2 (moyenne sur les runs) ===")
+    for nom, cfg in CONFIGS:
+        mse_runs = np.mean(err_mc[nom][:, :, 8:10]**2)
+        print(f"  {nom:<12} : {mse_runs:.4f}")
 
-# Figure — Comparaison C vs D : sans distances, la dérive parabolique apparaît
-f3 = figure_comparaison_biais(tv, tk_D, tk_C, temps,
-                               label_avec="Biais estimé (D)",
-                               label_sans="Biais non estimé (C)")
-f3.suptitle("Scénario C vs D", fontsize=13, fontweight='bold')
+    # --- Figures de cohérence (spaghetti + RMSE vs ±3σ) -------------------
+    # Recommandation : pour la consistance, on montre TOUS les runs.
+    # On affiche les scénarios les plus parlants (A cohérent, C incohérent).
+    figure_mc_consistance(err_mc["Scénario A"], Pref_mc["Scénario A"], temps,
+                          base=8, nom="Scénario A", drone=2)
+    figure_mc_consistance(err_mc["Scénario C"], Pref_mc["Scénario C"], temps,
+                          base=8, nom="Scénario C", drone=2)
 
-# Figure — 4 scénarios, erreur de position drone 2
-fig4, ax = plt.subplots(figsize=(10, 5))
-for tk, label, color, ls in [
-    (tk_A, "A — Complet, biais estimé",           'green',  '-'),
-    (tk_B, "B — Complet, biais non estimé",        'orange', '--'),
-    (tk_C, "C — Sans distances, biais non estimé", 'red',    '-.'),
-    (tk_D, "D — Sans distances, biais estimé",     'blue',   ':'),
-]:
-    err = np.sqrt((tv[:,8]-tk[:,8])**2 + (tv[:,9]-tk[:,9])**2)
-    ax.plot(temps, err, color=color, linestyle=ls, lw=1.8, label=label)
-ax.set_title("Comparaison 4 scénarios", fontsize=12)
-ax.set_xlabel("Temps (s)"); ax.set_ylabel("erreur (m)")
-ax.legend(fontsize=9); ax.grid(True, linestyle=':', alpha=0.7)
-fig4.tight_layout()
+    # --- Figure de synthèse : RMSE des 4 scénarios ------------------------
+    figure_mc_rmse_position([
+        (err_mc["Scénario A"], "A — Complet, biais estimé",            'green'),
+        (err_mc["Scénario B"], "B — Complet, biais non estimé",         'orange'),
+        (err_mc["Scénario C"], "C — Sans distances, biais non estimé",  'red'),
+        (err_mc["Scénario D"], "D — Sans distances, biais estimé",      'blue'),
+    ], temps, drone=2)
 
-# Figure — Trajectoires scénario de référence
-f5 = figure_trajectoires(tv, [
-    (tk_A, 'Scénario A', 'green', '-'),
-    (tk_B, 'Scénario B', 'orange', '--'),
-    (tk_C, 'Scénario C', 'red', '-.'),
-    (tk_D, 'Scénario D', 'blue', ':'),
-], temps, gps_A)
+    plt.show()
 
-plt.show()
+else:
+    # ======================================================================
+    #  MODE SINGLE-RUN (comportement d'origine)
+    # ======================================================================
+
+    # --- Scénario A : configuration complète, avec biais estimé (référence) ---
+    print("Scénario A : tous capteurs, biais estimé...")
+    tv, tk_A, Ph_A, temps, gps_A, imu_A, gpsv_A = run_ekf(
+        nom_scenario="Scénario A",
+        compenser_biais=True, seed=0,
+        use_gps=True, use_imu=True, use_distances=True,
+        show_corridors=True)
+
+    # --- Scénario B : tous capteurs, sans estimer le biais ---
+    print("Scénario B : tous capteurs, biais NON estimé...")
+    _, tk_B, Ph_B, _, gps_B, imu_B, gpsv_B = run_ekf(
+        nom_scenario="Scénario B",
+        compenser_biais=False, seed=0,
+        use_gps=True, use_imu=True, use_distances=True,
+        show_corridors=True)
+
+    # --- Scénario C : sans distances, sans estimer le biais (dérive parabolique) ---
+    print("Scénario C : sans distances, biais NON estimé...")
+    _, tk_C, Ph_C, _, gps_C, imu_C, gpsv_C = run_ekf(
+        nom_scenario="Scénario C",
+        compenser_biais=False, seed=0,
+        use_gps=True, use_imu=True, use_distances=False,
+        show_corridors=True)
+
+    # --- Scénario D : sans distances, avec biais estimé ---
+    print("Scénario D : sans distances, biais estimé...")
+    _, tk_D, Ph_D, _, gps_D, imu_D, gpsv_D = run_ekf(
+        nom_scenario="Scénario D",
+        compenser_biais=True, seed=0,
+        use_gps=True, use_imu=True, use_distances=False,
+        show_corridors=True)
+
+    # ----------------------------------------------------------------------
+    # 8. Figures de présentation
+    # ----------------------------------------------------------------------
+    mse = lambda a, b: np.square(a - b).mean()
+    print("\n=== MSE position drone 2 ===")
+    for label, tk in [("A - Complet + biais estimé",          tk_A),
+                      ("B - Complet, biais non estimé",        tk_B),
+                      ("C - Sans distances, biais non estimé", tk_C),
+                      ("D - Sans distances, biais estimé",     tk_D)]:
+        print(f"  {label:<40} : {mse(tv[:,8:10], tk[:,8:10]):.4f}")
+
+    # Figure — Comparaison B vs A : distances compensent le biais
+    f2 = figure_comparaison_biais(tv, tk_A, tk_B, temps,
+                                   label_avec="Biais estimé (A)",
+                                   label_sans="Biais non estimé (B)")
+    f2.suptitle("Scénario A vs B", fontsize=13, fontweight='bold')
+
+    # Figure — Comparaison C vs D : sans distances, la dérive parabolique apparaît
+    f3 = figure_comparaison_biais(tv, tk_D, tk_C, temps,
+                                   label_avec="Biais estimé (D)",
+                                   label_sans="Biais non estimé (C)")
+    f3.suptitle("Scénario C vs D", fontsize=13, fontweight='bold')
+
+    # Figure — 4 scénarios, erreur de position drone 2
+    fig4, ax = plt.subplots(figsize=(10, 5))
+    for tk, label, color, ls in [
+        (tk_A, "A — Complet, biais estimé",           'green',  '-'),
+        (tk_B, "B — Complet, biais non estimé",        'orange', '--'),
+        (tk_C, "C — Sans distances, biais non estimé", 'red',    '-.'),
+        (tk_D, "D — Sans distances, biais estimé",     'blue',   ':'),
+    ]:
+        err = np.sqrt((tv[:,8]-tk[:,8])**2 + (tv[:,9]-tk[:,9])**2)
+        ax.plot(temps, err, color=color, linestyle=ls, lw=1.8, label=label)
+    ax.set_title("Comparaison 4 scénarios", fontsize=12)
+    ax.set_xlabel("Temps (s)"); ax.set_ylabel("erreur (m)")
+    ax.legend(fontsize=9); ax.grid(True, linestyle=':', alpha=0.7)
+    fig4.tight_layout()
+
+    # Figure — Trajectoires scénario de référence
+    f5 = figure_trajectoires(tv, [
+        (tk_A, 'Scénario A', 'green', '-'),
+        (tk_B, 'Scénario B', 'orange', '--'),
+        (tk_C, 'Scénario C', 'red', '-.'),
+        (tk_D, 'Scénario D', 'blue', ':'),
+    ], temps, gps_A)
+
+    plt.show()
