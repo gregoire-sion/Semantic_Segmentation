@@ -562,46 +562,63 @@ print()
 # ============================================================================
 
 # ── Figure 1 : Erreur de variance transmise vs angle du lien ────────────────
-# Lecture : chaque point est une fusion CI. Y = variance utilisée − exacte.
-#   - trait plat sur 0  -> méthode exacte (M0, M2)
-#   - nuage qui oscille -> sensible à l'angle (M1)
-#   - nuage toujours > 0 -> sur-estime toujours (M3)
-# La ligne foncée est la médiane glissante : elle résume la tendance.
+# Lecture : pour chaque tranche d'angle, on résume l'écart (variance utilisée −
+# exacte) par sa MÉDIANE (trait plein) et sa dispersion inter-quartiles (bande).
+# IMPORTANT : on n'affiche PAS le nuage brut, car certains angles sont beaucoup
+# plus fréquents que d'autres dans la trajectoire (densité inégale) — ce qui
+# induirait en erreur. Ici chaque tranche d'angle est traitée à égalité.
+#   - trait plat sur 0    -> méthode exacte (M0, M2)
+#   - trait qui oscille    -> sensible à l'angle, sous-estime près de 0/180°,
+#                              sur-estime près de 90/270° (M1)
+#   - trait toujours > 0   -> sur-estime toujours (M3)
 # ─────────────────────────────────────────────────────────────────────────────
 fig1, axes1 = plt.subplots(1, 4, figsize=(16, 4), sharey=True)
-fig1.suptitle("Erreur de variance transmise selon l'orientation du lien",
-              fontsize=13, fontweight='bold')
+fig1.suptitle("Erreur de variance transmise selon l'orientation du lien\n"
+              "(médiane et écart inter-quartiles par tranche d'angle — densité normalisée)",
+              fontsize=12, fontweight='bold')
 
-# Plage Y commune (on coupe les 1% d'outliers extrêmes pour la lisibilité)
+# Plage Y commune (on borne aux quantiles pour éviter que les outliers écrasent)
 ecarts_tous = np.concatenate([resultats[m.label]["diag_var"][:, 1]
                               - resultats[m.label]["diag_var"][:, 2]
                               for m in METHODES])
-y_lim = np.percentile(np.abs(ecarts_tous), 99)
+y_lim = np.percentile(np.abs(ecarts_tous), 98)
+
+# Tranches d'angle régulières : chaque tranche compte pour 1, quel que soit
+# le nombre de points qu'elle contient -> densité normalisée.
+bins = np.arange(0, 361, 15)
+mids = (bins[:-1] + bins[1:]) / 2
 
 for ax, m in zip(axes1, METHODES):
     dv    = resultats[m.label]["diag_var"]
     angle = dv[:, 0]
     ecart = dv[:, 1] - dv[:, 2]
 
-    # Nuage de points discret
-    ax.scatter(angle, ecart, s=3, color=m.color, alpha=0.25)
+    med, q1, q3 = [], [], []
+    for k in range(len(bins) - 1):
+        sel = (angle >= bins[k]) & (angle < bins[k+1])
+        if np.any(sel):
+            med.append(np.median(ecart[sel]))
+            q1.append(np.percentile(ecart[sel], 25))
+            q3.append(np.percentile(ecart[sel], 75))
+        else:
+            med.append(np.nan); q1.append(np.nan); q3.append(np.nan)
+    med, q1, q3 = np.array(med), np.array(q1), np.array(q3)
 
-    # Médiane glissante par tranche de 20° (la tendance qui résume tout)
-    bins = np.arange(0, 361, 20)
-    mids = (bins[:-1] + bins[1:]) / 2
-    meds = [np.median(ecart[(angle >= bins[k]) & (angle < bins[k+1])])
-            if np.any((angle >= bins[k]) & (angle < bins[k+1])) else np.nan
-            for k in range(len(bins) - 1)]
-    ax.plot(mids, meds, color=m.color, lw=2.5, zorder=5)
+    # Bande inter-quartiles (dispersion) + médiane (tendance)
+    ax.fill_between(mids, q1, q3, color=m.color, alpha=0.20,
+                    label='Écart inter-quartiles')
+    ax.plot(mids, med, color=m.color, lw=2.5, marker='o', ms=3,
+            zorder=5, label='Médiane')
 
     ax.axhline(0, color='black', lw=1)
-    ax.set_xlim(0, 360); ax.set_xticks([0, 180, 360])
+    ax.set_xlim(0, 360); ax.set_xticks([0, 90, 180, 270, 360])
     ax.set_ylim(-y_lim, y_lim)
     ax.set_title(m.label, fontsize=12, color=m.color, fontweight='bold')
     ax.set_xlabel("Angle du lien (°)")
     ax.grid(True, linestyle=':', alpha=0.4)
 
 axes1[0].set_ylabel("Variance utilisée − exacte")
+axes1[0].legend(fontsize=7, loc='upper left')
 fig1.tight_layout()
 
 
