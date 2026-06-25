@@ -1,72 +1,115 @@
-import torch
 import numpy as np
-import matplotlib.pyplot as plt
 
+dt = 0.1
+m = 24
+n = 8
+EPS = 1e-9
 
-def _np(x):
-    """Rapatrie un tenseur (GPU ou CPU) en numpy ; laisse passer un array."""
-    if torch.is_tensor(x):
-        return x.detach().cpu().numpy()
-    return np.asarray(x)
+# Indices par drone : drone d occupe [8d .. 8d+7] = x,y,vx,vy,ax,ay,bx,by
+def idx(d):
+    base = 8*d
+    return dict(x=base, y=base+1, vx=base+2, vy=base+3,
+                ax=base+4, ay=base+5, bx=base+6, by=base+7)
 
+I = [idx(0), idx(1), idx(2)]  # drones 1,2,3
 
-def plot_state_component(test_target, kf_out, knet_out, dim,
-                         file_name,
-                         kf_P=None,        # variance (T,) de la composante 'dim' ; optionnel
-                         n_sigma=3,        # largeur du couloir (2 ou 3 typiquement)
-                         obs=None,         # observations a superposer ; optionnel
-                         sample=0,         # element du batch a afficher
-                         dt=1.0,
-                         labels=("position", "velocity", "acceleration")):
-    """
-    Trace une composante de l'etat : trajectoire (haut) + erreur (bas),
-    avec couloir +/- n_sigma de l'EKF/KF si kf_P est fourni.
-    """
-    gt   = _np(test_target[sample][dim, :])
-    kf   = _np(kf_out[sample][dim, :])
-    knet = _np(knet_out[sample][dim, :])
-    T = len(gt)
-    t = np.arange(T) * dt
+def f(x, u):
+    """x: (24,), u: (2,2) commande [ux,uy] pour drones 1 et 3. Retourne x_{t+1}."""
+    xn = np.zeros(m)
+    for d in range(3):
+        p = I[d]
+        ax, ay = x[p['ax']], x[p['ay']]
+        # cinématique commune (CA sur cet intervalle)
+        xn[p['x']]  = x[p['x']]  + x[p['vx']]*dt + 0.5*ax*dt**2
+        xn[p['y']]  = x[p['y']]  + x[p['vy']]*dt + 0.5*ay*dt**2
+        xn[p['vx']] = x[p['vx']] + ax*dt
+        xn[p['vy']] = x[p['vy']] + ay*dt
+        if d == 1:  # drone 2 : random walk sur accel + biais
+            xn[p['ax']] = ax
+            xn[p['ay']] = ay
+            xn[p['bx']] = x[p['bx']]
+            xn[p['by']] = x[p['by']]
+        else:       # drones 1 et 3 : accel = commande, biais gelé
+            ui = 0 if d == 0 else 1
+            xn[p['ax']] = u[ui,0]
+            xn[p['ay']] = u[ui,1]
+            xn[p['bx']] = x[p['bx']]
+            xn[p['by']] = x[p['by']]
+    return xn
 
-    fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(11, 7), sharex=True,
-        gridspec_kw={'height_ratios': [3, 1.4]})
+def dist(x, di, dj):
+    pi, pj = I[di], I[dj]
+    dx = x[pi['x']] - x[pj['x']]
+    dy = x[pi['y']] - x[pj['y']]
+    return np.sqrt(dx*dx + dy*dy)
 
-    if kf_P is not None:
-        sig = np.sqrt(np.clip(_np(kf_P), 0, None))
-        ax1.fill_between(t, kf - n_sigma*sig, kf + n_sigma*sig,
-                         color='#1f77b4', alpha=0.18,
-                         label=rf'KF $\pm{n_sigma}\sigma$')
+def h(x):
+    """8 mesures : x1,y1, ax2+bx2, ay2+by2, d12, d23, d13, d23(redondant)."""
+    p1, p2, p3 = I[0], I[1], I[2]
+    y = np.zeros(n)
+    y[0] = x[p1['x']]
+    y[1] = x[p1['y']]
+    y[2] = x[p2['ax']] + x[p2['bx']]
+    y[3] = x[p2['ay']] + x[p2['by']]
+    y[4] = dist(x, 0, 1)  # d12
+    y[5] = dist(x, 1, 2)  # d23
+    y[6] = dist(x, 0, 2)  # d13
+    y[7] = dist(x, 1, 2)  # d23 redondant
+    return y
 
-    if obs is not None:
-        ax1.scatter(t, _np(obs[sample][dim, :]), s=12, c='#cccccc',
-                    zorder=1, label='Observations')
-    ax1.plot(t, gt,   'k-',  lw=2.4, label='Ground truth', zorder=3)
-    ax1.plot(t, kf,   color='#1f77b4', lw=1.7, label='KF', zorder=4)
-    ax1.plot(t, knet, color='#2ca02c', lw=1.7, ls='--',
-             label='KalmanNet', zorder=5)
+def H_analytic(x):
+    """Jacobienne analytique 8x24 de h."""
+    H = np.zeros((n, m))
+    p1, p2, p3 = I[0], I[1], I[2]
+    # mesures linéaires
+    H[0, p1['x']] = 1.0
+    H[1, p1['y']] = 1.0
+    H[2, p2['ax']] = 1.0; H[2, p2['bx']] = 1.0
+    H[3, p2['ay']] = 1.0; H[3, p2['by']] = 1.0
+    # distances : ligne row, paire (di,dj)
+    def fill_dist(row, di, dj):
+        pi, pj = I[di], I[dj]
+        dx = x[pi['x']] - x[pj['x']]
+        dy = x[pi['y']] - x[pj['y']]
+        d = np.sqrt(dx*dx + dy*dy) + EPS
+        H[row, pi['x']] =  dx/d; H[row, pi['y']] =  dy/d
+        H[row, pj['x']] = -dx/d; H[row, pj['y']] = -dy/d
+    fill_dist(4, 0, 1)  # d12
+    fill_dist(5, 1, 2)  # d23
+    fill_dist(6, 0, 2)  # d13
+    fill_dist(7, 1, 2)  # d23 redondant
+    return H
 
-    comp = labels[dim] if dim < len(labels) else f'state[{dim}]'
-    mse_kf   = np.mean((kf - gt)**2)
-    mse_knet = np.mean((knet - gt)**2)
-    ax1.set_title(
-        f"{comp}  -  MSE  KF={10*np.log10(mse_kf):.1f} dB   "
-        f"KNet={10*np.log10(mse_knet):.1f} dB", fontsize=13)
-    ax1.set_ylabel(comp, fontsize=12)
-    ax1.grid(alpha=0.3)
-    ax1.legend(fontsize=10, ncol=2, loc='best')
+# ---- TEST 1 : Jacobienne de h vs différences finies ----
+np.random.seed(0)
+x0 = np.random.randn(m) * 5  # positions écartées pour éviter d->0
+Ha = H_analytic(x0)
+Hfd = np.zeros((n, m))
+h0 = h(x0)
+delta = 1e-6
+for k in range(m):
+    xp = x0.copy(); xp[k] += delta
+    Hfd[:, k] = (h(xp) - h0) / delta
+err_h = np.max(np.abs(Ha - Hfd))
+print(f"[h] erreur max Jacobienne analytique vs diff finies : {err_h:.3e}")
 
-    if kf_P is not None:
-        ax2.fill_between(t, -n_sigma*sig, n_sigma*sig,
-                         color='#1f77b4', alpha=0.18)
-    ax2.axhline(0, color='k', lw=0.8)
-    ax2.plot(t, kf - gt,   color='#1f77b4', lw=1.3, label='err KF')
-    ax2.plot(t, knet - gt, color='#2ca02c', lw=1.3, ls='--', label='err KNet')
-    ax2.set_ylabel('erreur', fontsize=12)
-    ax2.set_xlabel('t [s]', fontsize=12)
-    ax2.grid(alpha=0.3)
-    ax2.legend(fontsize=9, ncol=2)
+# ---- TEST 2 : structure (zéros attendus) ----
+print(f"[h] mesure 5 et 7 (d23 redondant) identiques : {np.allclose(h0[5], h0[7])}")
+print(f"[h] lignes 5 et 7 de H identiques : {np.allclose(Ha[5], Ha[7])}")
 
-    fig.tight_layout()
-    fig.savefig(file_name, dpi=140, bbox_inches='tight')
-    plt.close(fig)
+# ---- TEST 3 : f produit des trajectoires bornées avec commande sinusoïdale ----
+T = 200
+x = np.zeros(m)
+x[I[0]['x']], x[I[1]['x']], x[I[2]['x']] = 0.0, 10.0, 5.0
+x[I[0]['y']], x[I[1]['y']], x[I[2]['y']] = 0.0, 0.0, 8.0
+x[I[1]['bx']], x[I[1]['by']] = 0.3, -0.2  # biais vrai du drone 2
+traj = np.zeros((T, m))
+for t in range(T):
+    tt = t*dt
+    u = np.array([[0.8*np.sin(2*np.pi*0.5*tt), 0.6*np.cos(2*np.pi*0.4*tt)],
+                  [0.7*np.sin(2*np.pi*0.3*tt), 0.5*np.sin(2*np.pi*0.6*tt)]])
+    x = f(x, u)
+    traj[t] = x
+pos_max = np.max(np.abs(traj[:, [0,1,8,9,16,17]]))
+print(f"[f] position max sur {T} pas (commande sinus moy. nulle) : {pos_max:.1f}")
+print(f"[f] biais drone2 conservé : bx={traj[-1,I[1]['bx']]:.3f}, by={traj[-1,I[1]['by']]:.3f}")
