@@ -1,530 +1,536 @@
-"""
-Etat        : m = 24  (3 drones x 8 : x, y, vx, vy, ax, ay, bx, by)
-Observation : n = 8   (GPS drone1, accelero biaise drone2 (x,y),
-                       distances d12, d23, d13, d23_redondant)
-
-Format batche PyTorch : tenseurs [batch, m, 1] / [batch, n, 1].
-"""
-
-import torch
 import numpy as np
+import matplotlib.pyplot as plt
+from numpy.linalg import inv
+from scipy.linalg import block_diag
 
-# =========================================================================
-# DIMENSIONS
-# =========================================================================
-M = 24 
-N = 8 
-N_DRONES = 3
-DT = 0.1 
+# --------------------------------------------------------------------------
+# 1. Paramètres de simulation
+# --------------------------------------------------------------------------
+t_max      = 16.0
+dt         = 0.1
+dt_capteur = 0.5
+dt_imu     = 0.1
+n_drone    = 3
+n_var      = 8
+N          = n_drone * n_var
+n_steps    = int(round(t_max / dt))
 
-DIST_EPS = 1e-2
+ratio_imu = int(round(dt_imu / dt))
+ratio_gps = int(round(dt_capteur / dt))
 
-_COMMAND_SEQUENCE = None
+# --------------------------------------------------------------------------
+# 2. Écarts-types
+# --------------------------------------------------------------------------
+sigma_w_accel = 5e-2
+sigma_w_autre = 1e-6
 
+sigma_gps = 0.5
+sigma_acc = 0.01
+sigma_d   = 0.5
 
-def build_command_sequence(T, dt=DT):
+sigma_R_gps = 0.5
+sigma_R_acc = 0.1
+sigma_R_d   = 0.5
 
-    t = torch.arange(T, dtype=torch.float32) * dt
-    u = torch.zeros(T, M)
+sigma_P_x, sigma_P_v, sigma_P_a, sigma_P_b = 2.0, 0.5, 0.5, 1.0
 
-    A1, w1 = 1.0, 0.5
-    u[:, 4] = A1 * torch.sin(w1 * t)
-    u[:, 5] = A1 * torch.cos(w1 * t)
+# --------------------------------------------------------------------------
+# 3. Matrices du modèle
+# --------------------------------------------------------------------------
+def Bmat(cols):
+    M = np.zeros((8, 6))
+    M[4, cols[0]] = 1.0
+    M[5, cols[1]] = 1.0
+    return M
 
-    A3, w3 = 1.0, 0.7
-    u[:, 20] = A3 * torch.sin(w3 * t)
-    u[:, 21] = A3 * torch.cos(w3 * t)
+def Fmat(accel_constante):
+    a = 1.0 if accel_constante else 0.0
+    return np.array([
+        [1, 0, dt, 0, 0.5*dt*dt, 0,        0, 0],
+        [0, 1, 0,  dt, 0,        0.5*dt*dt, 0, 0],
+        [0, 0, 1,  0,  dt,       0,         0, 0],
+        [0, 0, 0,  1,  0,        dt,        0, 0],
+        [0, 0, 0,  0,  a,        0,         0, 0],
+        [0, 0, 0,  0,  0,        a,         0, 0],
+        [0, 0, 0,  0,  0,        0,         1, 0],
+        [0, 0, 0,  0,  0,        0,         0, 1]], dtype=float)
 
-    return u
+F_vrai = block_diag(Fmat(False), Fmat(True), Fmat(False))
+B_vrai = np.concatenate((Bmat([0, 1]), Bmat([2, 3]), Bmat([4, 5])), axis=0)
+F_kalman = block_diag(Fmat(False), Fmat(True), Fmat(False))
+B_kalman = np.concatenate((Bmat([0, 1]), np.zeros((8, 6)), Bmat([4, 5])), axis=0)
 
+I_N = np.eye(N)
 
-def set_command_sequence(u_seq):
-    """Enregistre la sequence courante (partagee data-gen / filtre)."""
-    global _COMMAND_SEQUENCE
-    _COMMAND_SEQUENCE = u_seq
+w_sigma = np.full(N, sigma_w_autre)
+for b in (0, 8, 16):
+    w_sigma[b+4] = w_sigma[b+5] = sigma_w_accel
 
+X_vrai_init = np.concatenate(([0,  10, 1, 0, 0, 0,  0,    0],
+                               [10,  0, 1, 0, 0, 0,  0.5, -0.2],
+                               [0, -10, 1, 0, 0, 0,  0,    0])).astype(float)
 
-def reset_command():
-    """Remet le pointeur de commande a zero (debut de trajectoire)."""
-    global _COMMAND_SEQUENCE
-    _COMMAND_SEQUENCE = None
+# --------------------------------------------------------------------------
+# 4. Helper EKF — forme de Joseph
+# --------------------------------------------------------------------------
+def maj_kalman(X, P, H, innov, R):
+    S = H @ P @ H.T + R
+    K = P @ H.T @ inv(S)
+    X = X + K @ innov
+    A = I_N - K @ H
+    P = A @ P @ A.T + K @ R @ K.T
+    return X, P
 
+# --------------------------------------------------------------------------
+# 5. Figures utilitaires
+# --------------------------------------------------------------------------
+labels = ['x', 'y', 'vx', 'vy', 'ax', 'ay', 'bx', 'by']
 
-def get_command(t):
-    """Renvoie la commande u_t [M, 1] a l'instant t, ou 0 si non definie."""
-    if _COMMAND_SEQUENCE is None:
-        return torch.zeros(M, 1)
-    return _COMMAND_SEQUENCE[t].reshape(M, 1)
+def figure_drone(nom_scenario, d, base, tv, tk, P_hist, temps, mes_gps, mes_imu, mes_gpsv, titre_suffix=""):
+    fig, axs = plt.subplots(4, 2, figsize=(12, 8), sharex=True)
+    fig.suptitle(f"{nom_scenario} - Drone {d}",
+                 fontsize=13, fontweight='bold')
+    axs = axs.flatten()
+    for i in range(8):
+        idx   = base + i
+        sigma = np.sqrt(P_hist[:, idx, idx])
+        err   = tk[:, idx] - tv[:, idx]
+        axs[i].fill_between(temps, -3*sigma, 3*sigma, color='blue', alpha=0.2,
+                            label=r'Couloir $\pm 3\sigma$')
+        axs[i].plot(temps, err, color='green', label='Erreur EKF')
+        axs[i].axhline(0, color='k', lw=0.6)
+        axs[i].set_title(f"{labels[i]} : estimé − vrai", fontsize=10)
+        axs[i].grid(True, linestyle=':', alpha=0.7)
+    if d == 1 and len(mes_gps):
+        axs[0].scatter(mes_gps[:, 0], mes_gps[:, 1] - mes_gpsv[:, 0],
+                       color='red', marker='x', s=20, label='Mesure GPS')
+        axs[1].scatter(mes_gps[:, 0], mes_gps[:, 2] - mes_gpsv[:, 1],
+                       color='red', marker='x', s=20, label='Mesure GPS')
+    if d == 2 and len(mes_imu):
+        axs[4].scatter(mes_imu[:, 0], mes_imu[:, 1] - mes_imu[:, 3],
+                       color='red', marker='x', s=20, label='Mesure IMU')
+        axs[5].scatter(mes_imu[:, 0], mes_imu[:, 2] - mes_imu[:, 4],
+                       color='red', marker='x', s=20, label='Mesure IMU')
+    axs[6].set_xlabel("Temps (s)"); axs[7].set_xlabel("Temps (s)")
+    h, l = axs[0].get_legend_handles_labels()
+    fig.legend(h, l, loc='upper center', ncol=3, bbox_to_anchor=(0.5, 0.97))
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    return fig
 
+def figure_comparaison_biais(tv, tk_avec, tk_sans, temps, label_avec, label_sans):
+    fig, axs = plt.subplots(2, 2, figsize=(13, 7))
+    fig.suptitle("Impact de l'estimation du biais — Drone 2  (bx=0.5, by=-0.2)",
+                 fontsize=13, fontweight='bold')
+    axs[0,0].plot(temps, tv[:,8],      'k',   lw=1.5, label='Vérité')
+    axs[0,0].plot(temps, tk_avec[:,8], 'g',   lw=1.5, label=label_avec)
+    axs[0,0].plot(temps, tk_sans[:,8], 'r--', lw=1.5, label=label_sans)
+    axs[0,0].set_title("Position x — Drone 2"); axs[0,0].set_ylabel("x (m)")
+    axs[0,0].legend(); axs[0,0].grid(True, linestyle=':', alpha=0.7)
 
-# =========================================================================
-# DYNAMIQUE : f(x, t)  ->  etat suivant
-# =========================================================================
-def f(x, t=0):
-    """Evolution d'etat (batchee). x : [batch, M, 1] -> [batch, M, 1].
+    axs[0,1].plot(temps, tv[:,9],      'k',   lw=1.5)
+    axs[0,1].plot(temps, tk_avec[:,9], 'g',   lw=1.5)
+    axs[0,1].plot(temps, tk_sans[:,9], 'r--', lw=1.5)
+    axs[0,1].set_title("Position y — Drone 2"); axs[0,1].set_ylabel("y (m)")
+    axs[0,1].grid(True, linestyle=':', alpha=0.7)
 
-    Replaye la commande deterministe a l'instant t (drones 1 et 3).
-    C'est le point critique : f DOIT utiliser get_command(t), pas un
-    u_current fige.
-    """
-    batch = x.shape[0]
-    x_next = x.clone()
+    axs[1,0].axhline(0.5, color='k', lw=1.5, label='Vrai biais bx = 0.5')
+    axs[1,0].plot(temps, tk_avec[:,14], 'g',   lw=1.5, label=label_avec)
+    axs[1,0].plot(temps, tk_sans[:,14], 'r--', lw=1.5, label=label_sans)
+    axs[1,0].set_title("Estimation du biais bx — Drone 2"); axs[1,0].set_ylabel("bx")
+    axs[1,0].set_xlabel("Temps (s)")
+    axs[1,0].legend(); axs[1,0].grid(True, linestyle=':', alpha=0.7)
 
-    u_t = get_command(t).to(x.device).unsqueeze(0)
+    err_avec = np.sqrt((tv[:,8]-tk_avec[:,8])**2 + (tv[:,9]-tk_avec[:,9])**2)
+    err_sans  = np.sqrt((tv[:,8]-tk_sans[:,8])**2 + (tv[:,9]-tk_sans[:,9])**2)
+    axs[1,1].plot(temps, err_avec, 'g',   lw=1.5, label=label_avec)
+    axs[1,1].plot(temps, err_sans,  'r--', lw=1.5, label=label_sans)
+    axs[1,1].set_title("Erreur de position euclidienne — Drone 2")
+    axs[1,1].set_ylabel("||erreur|| (m)"); axs[1,1].set_xlabel("Temps (s)")
+    axs[1,1].legend(); axs[1,1].grid(True, linestyle=':', alpha=0.7)
 
-    for d in [0,2] :
-        b = d * 8
+    fig.tight_layout()
+    return fig
 
-        px, py = x[:, b+0, 0], x[:, b+1, 0]
-        vx, vy = x[:, b+2, 0], x[:, b+3, 0]
-        bx, by = x[:, b+6, 0], x[:, b+7, 0]
+def figure_trajectoires(tv, scenarios, temps, mes_gps):
+    fig = plt.figure(figsize=(10, 8))
+    i1 = n_steps // 3,
+    for d, base, mk in [(1, 0, '^'), (2, 8, 'o'), (3, 16, 's')]:
+        plt.plot(tv[:, base], tv[:, base+1], color='black', lw=2,
+                label=f'Drone {d} — vérité')
+    for tk, label, color, ls in scenarios :
+        for d, base, mk in [(1,0, '^'), (2, 8, 'o'), (3, 16, 's')]:
+            if d == 1 :
+                lbl = label
+            else :
+                lbl = '_nolegend'
+            plt.plot(tk[:, base], tk[:, base+1], color=color, linestyle=ls, lw=1.5,
+                    label=lbl)
 
-        ux = u_t[:, b+4, 0]
-        uy = u_t[:, b+5, 0]
+    plt.xlabel("X"); plt.ylabel("Y"); plt.title("Trajectoires des 3 drones")
+    plt.legend(fontsize=8); plt.grid(True)
+    x_vrai_all = tv[:, [0, 8, 16]]
+    y_vrai_all = tv[:, [1, 9, 17]]
+    marge = 10
+    plt.xlim(x_vrai_all.min() - marge, x_vrai_all.max() + marge)
+    plt.ylim(y_vrai_all.min() - marge, y_vrai_all.max() + marge)
+    return fig
 
-        x_next[:, b+0, 0] = px + DT * vx + 0.5 * DT**2 * ux
-        x_next[:, b+1, 0] = py + DT * vy + 0.5 * DT**2 * uy
-        x_next[:, b+2, 0] = vx + DT * ux
-        x_next[:, b+3, 0] = vy + DT * uy
-        x_next[:, b+4, 0] = ux
-        x_next[:, b+5, 0] = uy
-        x_next[:, b+6, 0] = bx
-        x_next[:, b+7, 0] = by
+def run_ekf(nom_scenario="", compenser_biais=True, seed=0,
+            use_gps=True, use_imu=True, use_distances=True,
+            show_corridors=False):
+    np.random.seed(seed)
 
-    b=8
-    px, py = x[:, b+0, 0], x[:, b+1, 0]
-    vx, vy = x[:, b+2, 0], x[:, b+3, 0]
-    ax, ay = x[:, b+4, 0], x[:, b+5, 0]
-    bx, by = x[:, b+6, 0], x[:, b+7, 0]
+    X_vrai = X_vrai_init.copy()
 
-    x_next[:, b+0, 0] = px + DT * vx + 0.5 * DT**2 * ax
-    x_next[:, b+1, 0] = py + DT * vy + 0.5 * DT**2 * ay
-    x_next[:, b+2, 0] = vx + DT * ax
-    x_next[:, b+3, 0] = vy + DT * ay
-    x_next[:, b+4, 0] = ax
-    x_next[:, b+5, 0] = ay
-    x_next[:, b+6, 0] = bx
-    x_next[:, b+7, 0] = by
+    erreur_init = np.zeros(N)
+    for b in (0, 8, 16):
+        erreur_init[b:b+2] = np.random.normal(0, 2.0, size=2)
+    X_est = X_vrai + erreur_init
 
-    return x_next
+    P_est = np.eye(N)
+    for b in (0, 8, 16):
+        P_est[b,   b]   = P_est[b+1, b+1] = sigma_P_x**2
+        P_est[b+2, b+2] = P_est[b+3, b+3] = sigma_P_v**2
+        P_est[b+4, b+4] = P_est[b+5, b+5] = sigma_P_a**2
+        P_est[b+6, b+6] = P_est[b+7, b+7] = sigma_P_b**2
 
-
-def jacobian_f(x, t=0):
-
-    batch = x.shape[0]
-    F = torch.zeros(batch, M, M, device=x.device)
-
-    for d in [0,2]:
-        b = d * 8
-        # Bloc cinematique 8x8 par drone
-        # px depend de px, vx, ax
-        F[:, b+0, b+0] = 1.0; F[:, b+0, b+2] = DT
-        F[:, b+1, b+1] = 1.0; F[:, b+1, b+3] = DT
-        F[:, b+2, b+2] = 1.0
-        F[:, b+3, b+3] = 1.0
-        F[:, b+6, b+6] = 1.0
-        F[:, b+7, b+7] = 1.0
-       
-    b=8
-    F[:, b+0, b+0] = 1.0; F[:, b+0, b+2] = DT; F[:, b+0, b+4] = 0.5*DT**2
-    F[:, b+1, b+1] = 1.0; F[:, b+1, b+3] = DT; F[:, b+1, b+5] = 0.5*DT**2
-    F[:, b+2, b+2] = 1.0; F[:, b+2, b+4] = DT
-    F[:, b+3, b+3] = 1.0; F[:, b+3, b+5] = DT
-    F[:, b+4, b+4] = 1.0
-    F[:, b+5, b+5] = 1.0
-    F[:, b+6, b+6] = 1.0
-    F[:, b+7, b+7] = 1.0
-
-    return F
-
-
-# =========================================================================
-# OBSERVATION : h(x)  ->  mesure
-# =========================================================================
-def _dist(x, da, db):
-    """Distance euclidienne entre drone da et drone db (batchee, stable)."""
-    bxa, bxb = da * 8, db * 8
-    dx = x[:, bxa+0] - x[:, bxb+0]
-    dy = x[:, bxa+1] - x[:, bxb+1]
-    # sqrt(.. + eps) : evite gradient infini quand les drones coincident
-    return torch.sqrt(dx**2 + dy**2 + DIST_EPS**2)
-
-
-def h(x):
-    """Modele d'observation (batche). x : [batch, M, 1] -> [batch, N, 1].
-
-    n = 8 :
-      0,1 : GPS position drone1 (x1, y1)
-      2,3 : accelero biaise drone2 (ax2+bx2, ay2+by2)
-      4   : distance d12
-      5   : distance d23
-      6   : distance d13
-      7   : distance d23 redondante (mesuree par drone3)
-    """
-    batch = x.shape[0]
-    y = torch.zeros(batch, N, 1, device=x.device)
-
-    # GPS drone1 (indices 0,1)
-    y[:, 0, 0] = x[:, 0, 0]
-    y[:, 1, 0] = x[:, 1, 0]
-
-    # Accelero biaise drone2 : a + biais (indices ax2=12+4=16, bx2=12+6=18)
-    y[:, 2, 0] = x[:, 12, 0] + x[:, 14, 0]   # ax2 + bx2
-    y[:, 3, 0] = x[:, 13, 0] + x[:, 15, 0]   # ay2 + by2
-
-    # Distances inter-drones
-    y[:, 4, 0] = _dist(x, 0, 1)[:, 0]        # d12
-    y[:, 5, 0] = _dist(x, 1, 2)[:, 0]        # d23
-    y[:, 6, 0] = _dist(x, 0, 2)[:, 0]        # d13
-    y[:, 7, 0] = _dist(x, 1, 2)[:, 0]        # d23 redondant
-
-    return y
-
-
-def jacobian_h(x):
-    """Jacobien de h evalue en x. Retourne [batch, N, M].
-
-    [À COMPLÉTER] : porter ton Jacobien analytique NumPy. Les lignes GPS
-    et accelero sont triviales (lineaires) ; les lignes distances sont
-    non lineaires et fournies ci-dessous.
-    """
-    batch = x.shape[0]
-    H = torch.zeros(batch, N, M, device=x.device)
-
-    # GPS drone1 (lineaire)
-    H[:, 0, 0] = 1.0
-    H[:, 1, 1] = 1.0
-
-    # Accelero drone2 (lineaire)
-    H[:, 2, 12] = 1.0   # d(ax2+bx2)/d ax2
-    H[:, 2, 14] = 1.0   # d(ax2+bx2)/d bx2
-    H[:, 3, 13] = 1.0
-    H[:, 3, 15] = 1.0
-
-    # --- Lignes distances (non lineaires) ---
-    def fill_dist_row(row, da, db):
-        bxa, bxb = da * 8, db * 8
-        dx = x[:, bxa+0, 0] - x[:, bxb+0, 0]
-        dy = x[:, bxa+1, 0] - x[:, bxb+1, 0]
-        dist = torch.sqrt(dx**2 + dy**2 + DIST_EPS**2)
-        H[:, row, bxa+0] = dx / dist
-        H[:, row, bxa+1] = dy / dist
-        H[:, row, bxb+0] = -dx / dist
-        H[:, row, bxb+1] = -dy / dist
-
-    fill_dist_row(4, 0, 1)   # d12
-    fill_dist_row(5, 1, 2)   # d23
-    fill_dist_row(6, 0, 2)   # d13
-    fill_dist_row(7, 1, 2)   # d23 redondant
-
-    return H
-
-
-def get_Q(q2=1e-3):
-    Q = torch.eye(M) * q2
+    Q = np.eye(N) * 1e-3
     for b in (0, 8, 16):
         Q[b+4, b+4] = Q[b+5, b+5] = 0.5**2
         Q[b+6, b+6] = Q[b+7, b+7] = 1e-5**2
     Q[10, 10] = Q[11, 11] = 0.1**2
     Q[12, 12] = Q[13, 13] = 1e-2**2
-    return Q
+
+    if not compenser_biais:
+        X_est[6:8]   = 0.0
+        X_est[14:16] = 0.0
+        X_est[22:24] = 0.0
+        for i in (6, 7, 14, 15, 22, 23):
+            P_est[i, i] = 1e-8
+            Q[i, i]     = 1e-8
+
+    traj_vrai   = np.zeros((n_steps + 1, N))
+    traj_kalman = np.zeros((n_steps + 1, N))
+    P_hist      = np.zeros((n_steps + 1, N, N))
+    temps       = np.zeros(n_steps + 1)
+
+    traj_vrai[0]   = X_vrai
+    traj_kalman[0] = X_est
+    P_hist[0]      = P_est
+
+    mes_gps  = []
+    mes_imu  = []
+    mes_gpsv = []
+
+    phi_x = phi_y = 0.0
+
+    for k in range(1, n_steps + 1):
+        step = k - 1
+        t    = k * dt
+
+        # Commande
+        if step < n_steps / 3:
+            u_vrai = np.array([1., 0., 1., 0., 1., 0.])
+        elif step < 2 * n_steps / 3:
+            phi_x += 5 * dt
+            phi_y += 1 * dt
+            u_vrai = np.array([np.cos(phi_x), np.sin(phi_y),
+                               np.cos(phi_x), np.sin(phi_y),
+                               np.cos(phi_x), np.sin(phi_y)])
+        else:
+            u_vrai = np.array([1., 0., 1., 0., 1., 0.])
+
+        err_cmd = np.random.normal(0, 0.1, size=6)
+        err_cmd[0:2] = 0.0
+        u_kalman = u_vrai + err_cmd
+
+        # Propagation de la vérité
+        X_vrai = F_vrai @ X_vrai + B_vrai @ u_vrai + np.random.normal(0, 1, N) * w_sigma
+
+        # Prédiction du filtre
+        Xc = F_kalman @ X_est + B_kalman @ u_kalman
+        Pc = F_kalman @ P_est @ F_kalman.T + Q
+
+        # ---- Correction IMU (drone 2) ------------------------------------
+        if use_imu and step % ratio_imu == 0:
+            mes = np.array([X_vrai[12] + X_vrai[14] + np.random.normal(0, sigma_acc),
+                            X_vrai[13] + X_vrai[15] + np.random.normal(0, sigma_acc)])
+            H = np.zeros((2, N))
+            H[0, 12] = H[0, 14] = 1.0
+            H[1, 13] = H[1, 15] = 1.0
+            innov = mes - H @ Xc
+            Xc, Pc = maj_kalman(Xc, Pc, H, innov, np.diag([sigma_R_acc**2]*2))
+            mes_imu.append((t, mes[0], mes[1], X_vrai[12], X_vrai[13]))
+
+        # ---- Correction GPS + distances (construction dynamique) ---------
+        if step % ratio_gps == 0:
+
+            d12 = np.hypot(Xc[0]-Xc[8],  Xc[1]-Xc[9])
+            d23 = np.hypot(Xc[8]-Xc[16], Xc[9]-Xc[17])
+            d13 = np.hypot(Xc[0]-Xc[16], Xc[1]-Xc[17])
+
+            d12v = np.hypot(X_vrai[0]-X_vrai[8],  X_vrai[1]-X_vrai[9])
+            d23v = np.hypot(X_vrai[8]-X_vrai[16], X_vrai[9]-X_vrai[17])
+            d13v = np.hypot(X_vrai[0]-X_vrai[16], X_vrai[1]-X_vrai[17])
+
+            meas_vals = []
+            h_vals    = []
+            H_rows    = []
+            R_diag    = []
+
+            if use_gps:
+                meas_vals += [X_vrai[0] + np.random.normal(0, sigma_gps),
+                              X_vrai[1] + np.random.normal(0, sigma_gps)]
+                h_vals    += [Xc[0], Xc[1]]
+                H_gps = np.zeros((2, N))
+                H_gps[0, 0] = 1.0
+                H_gps[1, 1] = 1.0
+                H_rows.append(H_gps)
+                R_diag += [sigma_R_gps**2, sigma_R_gps**2]
+                mes_gps.append((t, meas_vals[0], meas_vals[1]))
+                mes_gpsv.append((X_vrai[0], X_vrai[1]))
+
+            if use_distances:
+                meas_vals += [d12v + np.random.normal(0, sigma_d),
+                              d23v + np.random.normal(0, sigma_d),
+                              d13v + np.random.normal(0, sigma_d)]
+                h_vals += [d12, d23, d13]
+                H_dist = np.zeros((3, N))
+                H_dist[0, 0] =  (Xc[0]-Xc[8])  / d12;  H_dist[0, 1] =  (Xc[1]-Xc[9])  / d12
+                H_dist[0, 8] = -H_dist[0, 0];           H_dist[0, 9] = -H_dist[0, 1]
+                H_dist[1, 8] =  (Xc[8]-Xc[16]) / d23;  H_dist[1, 9] =  (Xc[9]-Xc[17]) / d23
+                H_dist[1,16] = -H_dist[1, 8];           H_dist[1,17] = -H_dist[1, 9]
+                H_dist[2, 0] =  (Xc[0]-Xc[16]) / d13;  H_dist[2, 1] =  (Xc[1]-Xc[17]) / d13
+                H_dist[2,16] = -H_dist[2, 0];           H_dist[2,17] = -H_dist[2, 1]
+                H_rows.append(H_dist)
+                R_diag += [sigma_R_d**2, sigma_R_d**2, sigma_R_d**2]
+
+            if H_rows:
+                mes    = np.array(meas_vals)
+                h_pred = np.array(h_vals)
+                H      = np.vstack(H_rows)
+                R      = np.diag(R_diag)
+                innov  = mes - h_pred
+                Xc, Pc = maj_kalman(Xc, Pc, H, innov, R)
+
+        #Sauvegarde des données
+        X_est, P_est = Xc, Pc
+        traj_vrai[k]   = X_vrai
+        traj_kalman[k] = X_est
+        P_hist[k]      = P_est
+        temps[k]       = t
+
+    mes_gps  = np.array(mes_gps)  if mes_gps  else np.empty((0, 3))
+    mes_imu  = np.array(mes_imu)  if mes_imu  else np.empty((0, 5))
+    mes_gpsv = np.array(mes_gpsv) if mes_gpsv else np.empty((0, 2))
+
+    if show_corridors:
+        titre = f"({'biais estimé' if compenser_biais else 'biais non estimé'}, " \
+                f"GPS={'on' if use_gps else 'off'}, " \
+                f"IMU={'on' if use_imu else 'off'}, " \
+                f"dist={'on' if use_distances else 'off'})"
+        for d, base in [(1, 0), (2, 8), (3, 16)]:
+            figure_drone(nom_scenario, d, base, traj_vrai, traj_kalman, P_hist, temps,
+                         mes_gps, mes_imu, mes_gpsv, titre_suffix=titre)
+
+    return traj_vrai, traj_kalman, P_hist, temps, mes_gps, mes_imu, mes_gpsv
+
+def run_monte_carlo(n_mc=50, base_seed=1000, nom_scenario="", **kwargs):
+
+    kwargs.pop('show_corridors', None)
+    kwargs.pop('seed', None)
+    kwargs.pop('nom_scenario', None)
+
+    tk_all  = np.zeros((n_mc, n_steps + 1, N))
+    err_all = np.zeros((n_mc, n_steps + 1, N))
+    P_ref   = None
+    tv_ref  = None
+    temps   = None
+
+    for i in range(n_mc):
+        tv, tk, Ph, temps, *_ = run_ekf(
+            seed=base_seed + i, show_corridors=False, **kwargs)
+        tk_all[i]  = tk
+        err_all[i] = tk - tv
+        if P_ref is None:.
+            P_ref  = Ph
+            tv_ref = tv
+
+    return tk_all, err_all, P_ref, tv_ref, temps
 
 
-def get_R(r2=1e-2):
-    R = torch.eye(N)
-    sigma_R_gps = 0.5
-    sigma_R_acc = 0.1
-    sigma_R_d   = 0.5
-    R[0,0] = sigma_R_gps**2
-    R[1,1] = sigma_R_gps**2
-    R[2,2] = sigma_R_acc**2
-    R[3,3] = sigma_R_acc**2
-    R[4,4] = sigma_R_d**2
-    R[5,5] = sigma_R_d**2
-    R[6,6] = sigma_R_d**2
-    R[7,7] = sigma_R_d**2
-    return R
+def figure_mc_consistance(err_all, P_ref, temps, base, nom="", drone=2):
 
-def get_x0_true(batch=1):
-    x0 = torch.zeros(batch, M, 1)
-    #drone1
-    x0[:,0,0] = 0
-    x0[:,1,0] = 10
-    x0[:,2,0] = 0
-    x0[:,3,0] = 0
-    x0[:,4,0] = 0
-    x0[:,5,0] = 0
-    x0[:,6,0] = 0
-    x0[:,7,0] = 0
-    #drone2
-    x0[:,8,0] = 10
-    x0[:,9,0] = 0
-    x0[:,10,0] = 1
-    x0[:,11,0] = 0
-    x0[:,12,0] = 0
-    x0[:,13,0] = 0
-    x0[:,14,0] = 0.5
-    x0[:,15,0] = -0.2
-    #drone3
-    x0[:,16,0] = 0
-    x0[:,17,0] = -10
-    x0[:,18,0] = 1
-    x0[:,19,0] = 0
-    x0[:,20,0] = 0
-    x0[:,21,0] = 0
-    x0[:,22,0] = 0
-    x0[:,23,0] = 0
-
-    return x0
-# =========================================================================
-# GENERATION DE DONNEES
-# =========================================================================
-def generate(T, batch=1, x0=None, q2=1e-3, r2=1e-2, seed=None):
-    """Genere (X, Y) : trajectoires etat + observations bruitees.
-
-    X : [batch, M, T+1]   (etats ground-truth, x0 inclus)
-    Y : [batch, N, T]     (observations bruitees)
-
-    Replaye la sequence de commandes via set_command_sequence -> garantit
-    que la generation et le filtrage utilisent la MEME commande.
-    """
-    if seed is not None:
-        torch.manual_seed(seed)
-
-    # Sequence de commandes partagee
-    u_seq = build_command_sequence(T)
-    set_command_sequence(u_seq)
-
-    if x0 is None:
-        x0 = get_x0_true(batch)        
-
-    X = torch.zeros(batch, M, T + 1)
-    Y = torch.zeros(batch, N, T)
-    X[:, :, 0] = x0[:, :, 0]
-
-    Q = get_Q(q2)
-
-    Lq = torch.linalg.cholesky(get_Q(q2))
-    Lr = torch.linalg.cholesky(get_R(r2))
-
-    x = x0
-    for t in range(T):
-        # Bruit d'etat
-        w = (Lq @ torch.randn(batch, M, 1))
-        x = f(x, t) + w
-        X[:, :, t + 1] = x[:, :, 0]
-        # Bruit d'observation
-        v = (Lr @ torch.randn(batch, N, 1))
-        y = h(x) + v
-        Y[:, :, t] = y[:, :, 0]
-
-    reset_command()
-    return X, Y
+    n_mc = err_all.shape[0]
+    fig, axs = plt.subplots(4, 2, figsize=(12, 8), sharex=True)
+    fig.suptitle(f"{nom} — Drone {drone} — {n_mc} runs Monte-Carlo",
+                 fontsize=13, fontweight='bold')
+    axs = axs.flatten()
+    for i in range(8):
+        idx   = base + i
+        sigma = np.sqrt(P_ref[:, idx, idx])
+        rmse  = np.sqrt(np.mean(err_all[:, :, idx]**2, axis=0))
+        for r in range(n_mc):
+            axs[i].plot(temps, err_all[r, :, idx],
+                        color='green', alpha=0.08, lw=0.6)
+        axs[i].fill_between(temps, -3*sigma, 3*sigma, color='blue', alpha=0.15,
+                            label=r'Couloir $\pm 3\sigma$ prédit')
+        axs[i].plot(temps,  rmse, 'r-', lw=1.5, label='RMSE empirique')
+        axs[i].plot(temps, -rmse, 'r-', lw=1.5)
+        axs[i].axhline(0, color='k', lw=0.6)
+        axs[i].set_title(f"{labels[i]} : estimé − vrai", fontsize=10)
+        axs[i].grid(True, linestyle=':', alpha=0.7)
+    axs[6].set_xlabel("Temps (s)"); axs[7].set_xlabel("Temps (s)")
+    h, l = axs[0].get_legend_handles_labels()
+    fig.legend(h, l, loc='upper center', ncol=3, bbox_to_anchor=(0.5, 0.97))
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    return fig
 
 
-if __name__ == "__main__":
-    # Test rapide de coherence (analogue a ta validation NumPy)
-    print(f"Dimensions : M={M}, N={N}, N_DRONES={N_DRONES}")
-    X, Y = generate(T=50, batch=2, seed=0)
-    print(f"X shape : {tuple(X.shape)}  (attendu [2, {M}, 51])")
-    print(f"Y shape : {tuple(Y.shape)}  (attendu [2, {N}, 50])")
-    print(f"X fini : {torch.isfinite(X).all().item()}")
-    print(f"Y fini : {torch.isfinite(Y).all().item()}")
+def figure_mc_rmse_position(scenarios_mc, temps, drone=2):
 
-    # Verif Jacobien f par differences finies (1 echantillon)
-    SM.set_command_sequence(SM.build_command_sequence(T=10))
-    x_test = torch.randn(1, M, 1)
-    Fa = jacobian_f(x_test, t=0)[0]
-    eps = 1e-5
-    Fn = torch.zeros(M, M)
-    f0 = f(x_test, t=0)[0, :, 0]
-    for j in range(M):
-        xp = x_test.clone(); xp[0, j, 0] += eps
-        Fn[:, j] = (f(xp, t=0)[0, :, 0] - f0) / eps
-    err = (Fa - Fn).abs().max().item()
-    print(f"Erreur max Jacobien f (analytique vs diff. finies) : {err:.2e}")
+    base = {1: 0, 2: 8, 3: 16}[drone]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for err_all, label, color in scenarios_mc:
+        # erreur de position euclidienne, par run, à chaque instant
+        err_pos = np.sqrt(err_all[:, :, base]**2 + err_all[:, :, base+1]**2)
+        rmse    = np.sqrt(np.mean(err_pos**2, axis=0))   # RMSE inter-runs
+        lo      = err_pos.min(axis=0)
+        hi      = err_pos.max(axis=0)
+        ax.fill_between(temps, lo, hi, color=color, alpha=0.12)
+        ax.plot(temps, rmse, color=color, lw=1.8, label=label)
+    ax.set_title(f"RMSE de position — Drone {drone} (bande = min/max des runs)",
+                 fontsize=12)
+    ax.set_xlabel("Temps (s)"); ax.set_ylabel("RMSE (m)")
+    ax.legend(fontsize=9); ax.grid(True, linestyle=':', alpha=0.7)
+    fig.tight_layout()
+    return fig
 
-    """
-Simulation.py
-=============
-Pipeline d'EVALUATION FINALE (jeu de TEST uniquement).
+MODE_MONTE_CARLO = True 
+N_MC             = 50 
+BASE_SEED_MC     = 1000
 
-Compare sur EXACTEMENT la meme trajectoire de test :
-  - EKF classique (baseline model-based)
-  - KalmanNet entraine (poids charges depuis knet_best.pt)
+DRONES_A_TRACER  = [(1, 0), (2, 8), (3, 16)]
 
-Produit : MSE [dB] global et par composante, couverture ±3sigma (EKF),
-et figures comparatives.
+CONFIGS = [
+    ("Scénario A", dict(compenser_biais=True,  use_gps=True, use_imu=True, use_distances=True)),
+    ("Scénario B", dict(compenser_biais=False, use_gps=True, use_imu=True, use_distances=True)),
+    ("Scénario C", dict(compenser_biais=False, use_gps=True, use_imu=True, use_distances=False)),
+    ("Scénario D", dict(compenser_biais=True,  use_gps=True, use_imu=True, use_distances=False)),
+]
 
-L'EKF et KalmanNet tirent leur f/h de SystemModel -> comparaison honnete,
-meme dynamique, meme sequence de commandes.
-"""
+if MODE_MONTE_CARLO:
 
-import torch
-import numpy as np
-import matplotlib
-import matplotlib.pyplot as plt
+    print(f"Mode Monte-Carlo : {N_MC} runs par scénario...\n")
 
-import SystemModel as SM
-from KalmanNet import KalmanNet
+    err_mc   = {}
+    Pref_mc  = {}
+    tvref_mc = {}
+    temps    = None
 
+    for nom, cfg in CONFIGS:
+        print(f"  {nom} ...")
+        _, err_all, P_ref, tv_ref, temps = run_monte_carlo(
+            n_mc=N_MC, base_seed=BASE_SEED_MC, **cfg)
+        err_mc[nom]   = err_all
+        Pref_mc[nom]  = P_ref
+        tvref_mc[nom] = tv_ref
 
-# =========================================================================
-# EKF BASELINE (model-based, mono-trajectoire pour lisibilite)
-# =========================================================================
-def run_ekf(Y, x0, P0, q2=1e-3, r2=1e-2):
-    """EKF classique sur une trajectoire. Y : [N, T].
+    print("\n=== MSE position drone 2 (moyenne sur les runs) ===")
+    for nom, cfg in CONFIGS:
+        mse_runs = np.mean(err_mc[nom][:, :, 8:10]**2)
+        print(f"  {nom:<12} : {mse_runs:.4f}")
 
-    Retourne X_hat [M, T] et la covariance diagonale stockee P_diag [M, T]
-    (pour tracer les corridors ±3sigma).
-    """
-    T = Y.shape[1]
-    Q = SM.get_Q(q2).numpy()
-    R = SM.get_R(r2).numpy()
+    for nom, cfg in CONFIGS:
+        for drone, base in DRONES_A_TRACER:
+            figure_mc_consistance(err_mc[nom], Pref_mc[nom], temps,
+                                  base=base, nom=nom, drone=drone)
 
-    x = x0.copy().reshape(SM.M, 1)
-    P = P0.copy()
+    figure_mc_rmse_position([
+        (err_mc["Scénario A"], "A — Complet, biais estimé",            'green'),
+        (err_mc["Scénario B"], "B — Complet, biais non estimé",         'orange'),
+        (err_mc["Scénario C"], "C — Sans distances, biais non estimé",  'red'),
+        (err_mc["Scénario D"], "D — Sans distances, biais estimé",      'blue'),
+    ], temps, drone=2)
 
-    X_hat = np.zeros((SM.M, T))
-    P_diag = np.zeros((SM.M, T))
-
-    for t in range(T):
-        # --- Prediction ---
-        xt = torch.tensor(x.reshape(1, SM.M, 1), dtype=torch.float32)
-        x_prior = SM.f(xt, t).numpy().reshape(SM.M, 1)
-        F = SM.jacobian_f(xt, t).numpy()[0]
-        P_prior = F @ P @ F.T + Q
-
-        # --- Update ---
-        xp = torch.tensor(x_prior.reshape(1, SM.M, 1), dtype=torch.float32)
-        y_prior = SM.h(xp).numpy().reshape(SM.N, 1)
-        H = SM.jacobian_h(xp).numpy()[0]
-
-        S = H @ P_prior @ H.T + R
-        K = P_prior @ H.T @ np.linalg.inv(S)
-
-        innov = Y[:, t].reshape(SM.N, 1) - y_prior
-        x = x_prior + K @ innov
-        P = (np.eye(SM.M) - K @ H) @ P_prior
-
-        X_hat[:, t] = x[:, 0]
-        P_diag[:, t] = np.diag(P)
-
-    return X_hat, P_diag
-
-
-# =========================================================================
-# KALMANNET (charge les poids entraines)
-# =========================================================================
-def run_knet(Y, weights_path, gru_mult=2):
-    """Execute KalmanNet entraine sur une trajectoire. Y : [N, T] -> [M, T]."""
-    net = KalmanNet(gru_mult=gru_mult)
-    net.load_state_dict(torch.load(weights_path, map_location="cpu"))
-    net.eval()
-
-    SM.set_command_sequence(SM.build_command_sequence(Y.shape[1]))
-    with torch.no_grad():
-        Yb = torch.tensor(Y.reshape(1, SM.N, -1), dtype=torch.float32)
-        X_hat = net(Yb).numpy()[0]
-    SM.reset_command()
-    return X_hat
-
-
-# =========================================================================
-# METRIQUES
-# =========================================================================
-def mse_db(X_hat, X_true):
-    """MSE global en dB."""
-    err = X_hat - X_true
-    return 10.0 * np.log10(np.mean(err**2))
-
-
-def coverage_3sigma(X_hat, P_diag, X_true):
-    """Pourcentage de points dans le corridor ±3sigma (par composante)."""
-    sigma = np.sqrt(P_diag)
-    inside = np.abs(X_hat - X_true) <= 3.0 * sigma
-    return 100.0 * inside.mean(axis=1)   # [M]
-
-
-# =========================================================================
-# PIPELINE DE TEST
-# =========================================================================
-def main(weights_path="knet_best.pt", T_test=277, gru_mult=2,
-         q2=1e-3, r2=1e-2, seed=123):
-    print("=== Generation de la trajectoire de TEST ===")
-    X, Y = SM.generate(T=T_test, batch=1, q2=q2, r2=r2, seed=seed)
-    X_true = X[0, :, 1:].numpy()    # [M, T] : etats apres f
-    Y_np = Y[0].numpy()             # [N, T]
-
-    x0 = np.zeros(SM.M)
-    P0 = np.eye(SM.M) * 1.0
-
-    print("=== EKF baseline ===")
-    X_ekf, P_ekf = run_ekf(Y_np, x0, P0, q2=q2, r2=r2)
-    db_ekf = mse_db(X_ekf, X_true)
-    cov_ekf = coverage_3sigma(X_ekf, P_ekf, X_true)
-    print(f"MSE EKF       : {db_ekf:.2f} dB")
-    print(f"Couverture ±3σ EKF (moyenne) : {cov_ekf.mean():.1f} %")
-
-    # KalmanNet : seulement si les poids existent
-    import os
-    if os.path.exists(weights_path):
-        print("=== KalmanNet ===")
-        X_knet = run_knet(Y_np, weights_path, gru_mult=gru_mult)
-        db_knet = mse_db(X_knet, X_true)
-        print(f"MSE KalmanNet : {db_knet:.2f} dB")
-        print(f"\nGain KalmanNet vs EKF : {db_ekf - db_knet:+.2f} dB")
-    else:
-        print(f"(Poids '{weights_path}' introuvables -> EKF seul. "
-              f"Lance Train.py d'abord.)")
-        X_knet = None
-
-    # --- Figure : focus drone 2 (le drone a biais inconnu, ton objectif) ---
-    for drone in range(SM.N_DRONES):
-        plot_drone(drone, X_true, X_ekf, X_knet, P_ekf, Y_np)
     plt.show()
-    print("\nFigure sauvegardee : comparaison_drone2.png")
 
+else:
 
-def plot_drone(drone, X_true, X_ekf, X_knet, P_ekf, Y):
-    """Trace les 8 composantes d'un drone donne (0, 1 ou 2)."""
-    b = drone * 8          # debut du bloc de ce drone dans l'etat
-    d = drone + 1          # numero affiche (1, 2, 3)
-    labels = [f"x{d}", f"y{d}", f"vx{d}", f"vy{d}",
-              f"ax{d}", f"ay{d}", f"bx{d}", f"by{d}"]
+    # --- Scénario A : configuration complète, avec biais estimé (référence) ---
+    print("Scénario A : tous capteurs, biais estimé...")
+    tv, tk_A, Ph_A, temps, gps_A, imu_A, gpsv_A = run_ekf(
+        nom_scenario="Scénario A",
+        compenser_biais=True, seed=0,
+        use_gps=True, use_imu=True, use_distances=True,
+        show_corridors=True)
 
-    fig, axes = plt.subplots(4, 2, figsize=(12, 12))
-    sigma = np.sqrt(P_ekf)
-    T=X_ekf.shape[1]
-    tgrid = np.arange(T)
+    # --- Scénario B : tous capteurs, sans estimer le biais ---
+    print("Scénario B : tous capteurs, biais NON estimé...")
+    _, tk_B, Ph_B, _, gps_B, imu_B, gpsv_B = run_ekf(
+        nom_scenario="Scénario B",
+        compenser_biais=False, seed=0,
+        use_gps=True, use_imu=True, use_distances=True,
+        show_corridors=True)
 
-    for k, ax in enumerate(axes.flat):
-        idx = b + k
-        #ax.plot(X_true[idx], "k-", lw=1.5, label="vrai")
-        ax.plot(X_ekf[idx] - X_true[idx], "g--", lw=1, label="EKF")
-        ax.fill_between(np.arange(X_ekf.shape[1]),
-                        - 3*sigma[idx],
-                        3*sigma[idx],
-                        color="b", alpha=0.15, label=r'Couloir $\pm 3\sigma$')
-        if X_knet is not None:
-            ax.plot(X_knet[idx] - X_true[idx], "orange-", lw=1, label="KalmanNet")
-        if drone == 0 and k==0:
-            ax.scatter(tgrid, Y[0] - X_true[0], s=8, c="red", alpha=0.4, label="mesure GPS")
-        if drone == 0 and k==1:
-            ax.scatter(tgrid, Y[1] - X_true[1], s=8, c="red", alpha=0.4, label="mesure GPS")
-        if drone == 1 and k==4:
-            ax.scatter(tgrid, Y[2] - X_true[12], s=8, c="red", alpha=0.4, label="mesure IMU (biaisée)")
-        if drone == 1 and k==5:
-            ax.scatter(tgrid, Y[3] - X_true[13], s=8, c="red", alpha=0.4, label="mesure IMU (biaisée)")
-        ax.set_title(f"Drone {d} - {labels[k]}")
-        ax.legend(fontsize=8)
-        ax.grid(alpha=0.3)
+    # --- Scénario C : sans distances, sans estimer le biais (dérive parabolique) ---
+    print("Scénario C : sans distances, biais NON estimé...")
+    _, tk_C, Ph_C, _, gps_C, imu_C, gpsv_C = run_ekf(
+        nom_scenario="Scénario C",
+        compenser_biais=False, seed=0,
+        use_gps=True, use_imu=True, use_distances=False,
+        show_corridors=True)
 
-    fig.suptitle(f"Drone {d}", fontsize=14)
-    plt.tight_layout()
-    plt.savefig(f"comparaison_drone{d}.png", dpi=110)
-    
+    # --- Scénario D : sans distances, avec biais estimé ---
+    print("Scénario D : sans distances, biais estimé...")
+    _, tk_D, Ph_D, _, gps_D, imu_D, gpsv_D = run_ekf(
+        nom_scenario="Scénario D",
+        compenser_biais=True, seed=0,
+        use_gps=True, use_imu=True, use_distances=False,
+        show_corridors=True)
 
+        
+    mse = lambda a, b: np.square(a - b).mean()
+    print("\n=== MSE position drone 2 ===")
+    for label, tk in [("A - Complet + biais estimé",          tk_A),
+                      ("B - Complet, biais non estimé",        tk_B),
+                      ("C - Sans distances, biais non estimé", tk_C),
+                      ("D - Sans distances, biais estimé",     tk_D)]:
+        print(f"  {label:<40} : {mse(tv[:,8:10], tk[:,8:10]):.4f}")
 
-if __name__ == "__main__":
-    main()
+    # Figure — Comparaison B vs A : distances compensent le biais
+    f2 = figure_comparaison_biais(tv, tk_A, tk_B, temps,
+                                   label_avec="Biais estimé (A)",
+                                   label_sans="Biais non estimé (B)")
+    f2.suptitle("Scénario A vs B", fontsize=13, fontweight='bold')
+
+    # Figure — Comparaison C vs D : sans distances, la dérive parabolique apparaît
+    f3 = figure_comparaison_biais(tv, tk_D, tk_C, temps,
+                                   label_avec="Biais estimé (D)",
+                                   label_sans="Biais non estimé (C)")
+    f3.suptitle("Scénario C vs D", fontsize=13, fontweight='bold')
+
+    # Figure — 4 scénarios, erreur de position drone 2
+    fig4, ax = plt.subplots(figsize=(10, 5))
+    for tk, label, color, ls in [
+        (tk_A, "A — Complet, biais estimé",           'green',  '-'),
+        (tk_B, "B — Complet, biais non estimé",        'orange', '--'),
+        (tk_C, "C — Sans distances, biais non estimé", 'red',    '-.'),
+        (tk_D, "D — Sans distances, biais estimé",     'blue',   ':'),
+    ]:
+        err = np.sqrt((tv[:,8]-tk[:,8])**2 + (tv[:,9]-tk[:,9])**2)
+        ax.plot(temps, err, color=color, linestyle=ls, lw=1.8, label=label)
+    ax.set_title("Comparaison 4 scénarios", fontsize=12)
+    ax.set_xlabel("Temps (s)"); ax.set_ylabel("erreur (m)")
+    ax.legend(fontsize=9); ax.grid(True, linestyle=':', alpha=0.7)
+    fig4.tight_layout()
+
+    # Figure — Trajectoires scénario de référence
+    f5 = figure_trajectoires(tv, [
+        (tk_A, 'Scénario A', 'green', '-'),
+        (tk_B, 'Scénario B', 'orange', '--'),
+        (tk_C, 'Scénario C', 'red', '-.'),
+        (tk_D, 'Scénario D', 'blue', ':'),
+    ], temps, gps_A)
+
+    plt.show()
