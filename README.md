@@ -122,8 +122,8 @@ def jacobian_f(x, t=0):
         F[:, b+1, b+1] = 1.0; F[:, b+1, b+3] = DT
         F[:, b+2, b+2] = 1.0
         F[:, b+3, b+3] = 1.0
-        F[:, b+6, b+7] = 1.0
-        F[:, b+6, b+7] = 1.0
+        F[:, b+6, b+6] = 1.0
+        F[:, b+7, b+7] = 1.0
        
     b=8
     F[:, b+0, b+0] = 1.0; F[:, b+0, b+2] = DT; F[:, b+0, b+4] = 0.5*DT**2
@@ -132,8 +132,8 @@ def jacobian_f(x, t=0):
     F[:, b+3, b+3] = 1.0; F[:, b+3, b+5] = DT
     F[:, b+4, b+4] = 1.0
     F[:, b+5, b+5] = 1.0
-    F[:, b+6, b+7] = 1.0
-    F[:, b+6, b+7] = 1.0
+    F[:, b+6, b+6] = 1.0
+    F[:, b+7, b+7] = 1.0
 
     return F
 
@@ -332,6 +332,7 @@ if __name__ == "__main__":
     print(f"Y fini : {torch.isfinite(Y).all().item()}")
 
     # Verif Jacobien f par differences finies (1 echantillon)
+    SM.set_command_sequence(SM.build_command_sequence(T=10))
     x_test = torch.randn(1, M, 1)
     Fa = jacobian_f(x_test, t=0)[0]
     eps = 1e-5
