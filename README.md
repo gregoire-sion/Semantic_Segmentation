@@ -120,7 +120,7 @@ class SystemModel:
             Q[b + 4, b + 4] = Q[b + 5, b + 5] = 0.5**2
             Q[b + 6, b + 6] = Q[b + 7, b + 7] = 1e-5**2
         Q[10, 10] = Q[11, 11] = 0.1**2
-        Q[12, 12] = Q[13, 13] = 1e-2**2
+        Q[12, 12] = Q[13, 13] = 0.5**2
         self.Q = torch.tensor(Q, dtype=torch.float32, device=device)
 
         # --- Matrices F et B ----------------------------------------------
@@ -241,18 +241,22 @@ class SystemModel:
 # =============================================================================
 def build_command_sequence(T, dt, rng):
     """
-    Génère une séquence de commandes u zero-mean variées (amplitudes/phases/freq
-    aléatoires). Zero-mean impératif (sinon divergence position, cf. tes notes).
-    Retourne u_seq : [T, 6, 1]   (ax1,ay1, ax2,ay2, ax3,ay3)
+    Commande zero-mean reproduisant la dynamique de l'EKF original :
+    phi_x += 5*dt, phi_y += 1*dt, u = (cos(phi_x), sin(phi_y)) par drone.
+    Une légère variation d'amplitude et de phase initiale est ajoutée d'une
+    trajectoire à l'autre pour la généralisation, sans changer la vitesse
+    d'oscillation (sinon le filtre ne suit plus l'accel du drone 2).
     """
-    t = np.arange(1, T + 1) * dt
     u_seq = np.zeros((T, 6), dtype=np.float32)
-    for d in range(3):
-        Ax, Ay = rng.uniform(0.5, 1.5, size=2)
-        fx, fy = rng.uniform(0.3, 1.0, size=2)
-        px, py = rng.uniform(0, 2*np.pi, size=2)
-        u_seq[:, 2*d]   = Ax * np.cos(2*np.pi*fx*t + px)
-        u_seq[:, 2*d+1] = Ay * np.sin(2*np.pi*fy*t + py)
+    A   = rng.uniform(0.9, 1.1)
+    px0 = rng.uniform(0, 2*np.pi)
+    py0 = rng.uniform(0, 2*np.pi)
+    phi_x, phi_y = px0, py0
+    for k in range(T):
+        phi_x += 5 * dt
+        phi_y += 1 * dt
+        cx, sy = A*np.cos(phi_x), A*np.sin(phi_y)
+        u_seq[k] = [cx, sy, cx, sy, cx, sy]
     return torch.tensor(u_seq, dtype=torch.float32).unsqueeze(-1)
 
 
@@ -279,7 +283,7 @@ def generate_trajectory(sm: SystemModel, rng, init_perturb=True, r_scale=1.0):
     x = sm.x0.clone()
     if init_perturb:
         for b in (0, 8, 16):
-            x[b:b+2, 0] += torch.tensor(rng.normal(0, 1.0, size=2), dtype=torch.float32, device=dev)
+            x[b:b+2, 0] += torch.tensor(rng.normal(0, 2.0, size=2), dtype=torch.float32, device=dev)
     X[0] = x
 
     for k in range(1, T + 1):
@@ -691,11 +695,16 @@ def plot_drone(sm, drone, X, x_ekf, x_knet, P_ekf, temps, tag,
         axs[i].axhline(0, color='k', lw=0.6)
         axs[i].set_title(f"{LABELS[i]} : estimé − vrai", fontsize=10)
         axs[i].grid(True, ls=':', alpha=0.7)
-        both = np.concatenate([err_ekf, err_knet])
-        finite = both[np.isfinite(both)]
-        if finite.size:
-            lim = max(np.percentile(np.abs(finite), 99), 3*np.nanmax(sig_ekf), 1e-3)
-            axs[i].set_ylim(-1.15*lim, 1.15*lim)
+        lim = max(np.percentile(np.abs(err_ekf[np.isfinite(err_ekf)]), 99),
+                  3*np.nanmax(sig_ekf), 1e-3)
+        axs[i].set_ylim(-1.15*lim, 1.15*lim)
+        kmax = np.nanmax(np.abs(err_knet[np.isfinite(err_knet)])) if np.isfinite(err_knet).any() else np.inf
+        if not np.isfinite(err_knet).all() or kmax > 5*lim:
+            axs[i].text(0.5, 0.92,
+                        "KNet hors échelle (diverge / non entraîné)",
+                        transform=axs[i].transAxes, ha='center', va='top',
+                        fontsize=8, color='red',
+                        bbox=dict(fc='white', ec='red', alpha=0.7))
     axs[6].set_xlabel("Temps (s)"); axs[7].set_xlabel("Temps (s)")
     fig.suptitle(f"Drone {drone} — erreurs EKF vs KalmanNet ({tag})",
                  fontsize=13, fontweight='bold')
