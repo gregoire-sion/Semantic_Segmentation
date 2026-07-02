@@ -1,9 +1,10 @@
+
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 from numpy.linalg import inv, eigvalsh
 from scipy.linalg import block_diag
 from scipy.optimize import minimize_scalar
-from scipy.stats import chi2
 
 t_max      = 16.0
 dt         = 0.1
@@ -69,6 +70,7 @@ def make_Q_local(drone_id):
     if drone_id == 2:
         Q[2,2] = Q[3,3] = 0.1**2
         Q[4,4] = Q[5,5] = 1.0
+    if drone_id == 2:
     return Q
 
 def make_P_local(drone_id=None):
@@ -81,56 +83,73 @@ def make_P_local(drone_id=None):
         P[2,2] = P[3,3] = sigma_P_v**2 + 2
     return P
 
+
 class MethodeBloc2x2:
-    nom   = "M0 - Bloc 2x2 exact"
+    """M0 — Bloc exact 2x2 (référence)."""
+    nom   = "M0 — Bloc 2×2 exact"
     label = "M0"
     color = "black"
     ls    = "-"
     n_floats_cov = 3
+
     @staticmethod
     def build_paquet(drone):
         return {"pos": drone.x[0:2].copy(), "data": drone.P[0:2, 0:2].copy()}
+
     @staticmethod
     def var_voisin(paquet, Hj):
         return float(Hj @ paquet["data"] @ Hj.T)
 
+
 class MethodeIsotrope:
-    nom   = "M1 - Variance isotrope (trace/2)"
+    """M1 — Scalaire isotrope : trace(P)/2."""
+    nom   = "M1 — Variance isotrope (trace/2)"
     label = "M1"
     color = "royalblue"
     ls    = "--"
     n_floats_cov = 1
+
     @staticmethod
     def build_paquet(drone):
         Ppos = drone.P[0:2, 0:2]
         return {"pos": drone.x[0:2].copy(), "data": np.trace(Ppos) / 2.0}
+
     @staticmethod
     def var_voisin(paquet, Hj):
+        # Hj est unitaire (norme = 1) donc Hj·σ²I·HjT = σ²
         return float(paquet["data"])
 
+
 class MethodeProjetee:
-    nom   = "M2 - Variance projetee (Hj.P.Hj)"
+    """M2 — Variance projetée : Hj · P · HjT calculée par le voisin."""
+    nom   = "M2 — Variance projetée (Hj·P·Hj)"
     label = "M2"
     color = "darkorange"
     ls    = "-."
     n_floats_cov = 1
+
     @staticmethod
     def build_paquet(drone):
         return {"pos": drone.x[0:2].copy(), "data": drone.P[0:2, 0:2].copy()}
+
     @staticmethod
     def var_voisin(paquet, Hj):
         return float(Hj @ paquet["data"] @ Hj.T)
 
+
 class MethodeMax:
-    nom   = "M3 - Variance maximale (lmax)"
+    """M3 — Variance maximale : λmax(P[0:2, 0:2])."""
+    nom   = "M3 — Variance maximale (λmax)"
     label = "M3"
     color = "crimson"
     ls    = ":"
     n_floats_cov = 1
+
     @staticmethod
     def build_paquet(drone):
         Ppos = drone.P[0:2, 0:2]
         return {"pos": drone.x[0:2].copy(), "data": float(eigvalsh(Ppos).max())}
+
     @staticmethod
     def var_voisin(paquet, Hj):
         return float(paquet["data"])
@@ -162,35 +181,51 @@ class DroneDistribue:
         self.P = A @ self.P @ A.T + K @ R @ K.T
 
     def update_CI_batch(self, liens, R_scalaire, methode, diagnostics=None):
+        """
+        Fusion CI batch avec la méthode de communication passée en paramètre.
+        liens : liste de (d_mesure, paquet_voisin)
+        diagnostics : si fourni (liste), on y ajoute pour chaque lien un tuple
+                      (angle_lien_deg, var_utilisee, var_exacte) pour les
+                      métriques 'erreur de variance vs angle'. N'altère PAS
+                      le calcul du filtre.
+        """
         if not liens:
             return
         rows_Hi, innovs, R_diag = [], [], []
+
         for d_mesure, paquet in liens:
             xi, yi = self.x[0], self.x[1]
             xj, yj = paquet["pos"]
             d_pred = np.hypot(xi - xj, yi - yj)
             if d_pred < 1e-4:
                 d_pred = 1e-4
+
             Hi      = np.zeros(8)
             Hi[0]   = (xi - xj) / d_pred
             Hi[1]   = (yi - yj) / d_pred
             Hj      = np.array([-(xi - xj) / d_pred, -(yi - yj) / d_pred])
+
             var_j = methode.var_voisin(paquet, Hj)
+
             if diagnostics is not None and "Ppos_exact" in paquet:
                 angle = np.degrees(np.arctan2(Hj[1], Hj[0])) % 360.0
                 var_exacte = float(Hj @ paquet["Ppos_exact"] @ Hj.T)
                 diagnostics.append((angle, var_j, var_exacte))
+
             rows_Hi.append(Hi)
             innovs.append(d_mesure - d_pred)
             R_diag.append(R_scalaire + var_j)
+
         H = np.vstack(rows_Hi)
         innov = np.array(innovs)
         Rv = np.diag(R_diag)
+
         def cout_CI(omega):
             Pi = self.P / omega
             S = H @ Pi @ H.T + Rv / (1.0 - omega)
             K = Pi @ H.T @ inv(S)
             return np.trace(Pi - K @ H @ Pi)
+
         sol = minimize_scalar(cout_CI, bounds=(0.01, 0.99), method='bounded')
         omega = sol.x
         Pi = self.P / omega
@@ -199,27 +234,9 @@ class DroneDistribue:
         self.x = self.x + K @ innov
         self.P = Pi - K @ H @ Pi
 
-def commande_vraie(step, phi):
-    phi[0] += 5 * dt
-    phi[1] += 1 * dt
-    u = np.array([np.cos(phi[0]), np.sin(phi[1]),
-                  np.cos(phi[0]), np.sin(phi[1]),
-                  np.cos(phi[0]), np.sin(phi[1])])
-    if step < n_steps / 3:
-        u = np.array([1., 0., 1., 0., 1., 0.])
-    elif step < 2 * n_steps / 3:
-        phi[0] += 5 * dt
-        phi[1] += 1 * dt
-        u = np.array([np.cos(phi[0]), np.sin(phi[1]),
-                      np.cos(phi[0]), np.sin(phi[1]),
-                      np.cos(phi[0]), np.sin(phi[1])])
-    else:
-        u = np.array([1., 0., 1., 0., 1., 0.])
-    return u
-
-def run_une_methode(methode, seed, compenser_biais=True,
-                    use_gps=True, use_imu=True, use_distances=True):
+def run_une_methode(methode, seed):
     np.random.seed(seed)
+
     X_vrai = X_vrai_init.copy()
 
     erreur_init = np.zeros(N)
@@ -237,24 +254,30 @@ def run_une_methode(methode, seed, compenser_biais=True,
         for i in (1, 2, 3)
     }
 
-    if not compenser_biais:
-        for i, base in ((1,0),(2,8),(3,16)):
-            drones[i].x[6:8] = 0.0
-            drones[i].P[6,6] = drones[i].P[7,7] = 1e-8
-            drones[i].Q[6,6] = drones[i].Q[7,7] = 1e-8
-
-    err_pos  = np.zeros((n_steps+1, N_DRONES, 2))
-    P_pos_tr = np.zeros((n_steps+1, N_DRONES))
+    err_pos  = np.zeros((n_steps+1, N_DRONES, 2))   
+    P_pos_tr = np.zeros((n_steps+1, N_DRONES))      
     P_pos_m  = np.zeros((n_steps+1, N_DRONES, 2, 2))
     err8     = np.zeros((n_steps+1, N_DRONES, 8))
     Pdiag8   = np.zeros((n_steps+1, N_DRONES, 8))
+
+    # Diagnostic variance/angle : liste de (angle_deg, var_utilisee, var_exacte)
     diag_var = []
 
-    phi = [0.0, 0.0]
+    phi_x = phi_y = 0.0
 
     for k in range(1, n_steps+1):
         step = k - 1
-        u_vrai = commande_vraie(step, phi)
+        t    = k * dt
+
+        if step < n_steps / 3:
+            u_vrai = np.array([1., 0., 1., 0., 1., 0.])
+        elif step < 2 * n_steps / 3:
+            phi_x += 5 * dt; phi_y += 1 * dt
+            u_vrai = np.array([np.cos(phi_x), np.sin(phi_y),
+                               np.cos(phi_x), np.sin(phi_y),
+                               np.cos(phi_x), np.sin(phi_y)])
+        else:
+            u_vrai = np.array([1., 0., 1., 0., 1., 0.])
 
         err_cmd = np.random.normal(0, 0.1, size=6); err_cmd[0:2] = 0.0
         u_kalman = u_vrai + err_cmd
@@ -265,37 +288,38 @@ def run_une_methode(methode, seed, compenser_biais=True,
         drones[2].predict(np.zeros(2))
         drones[3].predict(u_kalman[4:6])
 
-        if use_imu and step % ratio_imu == 0:
+        # IMU drone 2
+        if step % ratio_imu == 0:
             mes = np.array([X_vrai[12] + X_vrai[14] + np.random.normal(0, sigma_acc),
                             X_vrai[13] + X_vrai[15] + np.random.normal(0, sigma_acc)])
             H = np.zeros((2, 8)); H[0,4]=H[0,6]=1.0; H[1,5]=H[1,7]=1.0
             drones[2].update_local(mes, H, np.diag([sigma_R_acc**2]*2))
 
+        # GPS drone 1 + distances
         if step % ratio_gps == 0:
-            if use_gps:
-                z = np.array([X_vrai[0] + np.random.normal(0, sigma_gps),
-                              X_vrai[1] + np.random.normal(0, sigma_gps)])
-                H = np.zeros((2, 8)); H[0,0]=1.0; H[1,1]=1.0
-                drones[1].update_local(z, H, np.diag([sigma_R_gps**2]*2))
+            z = np.array([X_vrai[0] + np.random.normal(0, sigma_gps),
+                          X_vrai[1] + np.random.normal(0, sigma_gps)])
+            H = np.zeros((2, 8)); H[0,0]=1.0; H[1,1]=1.0
+            drones[1].update_local(z, H, np.diag([sigma_R_gps**2]*2))
 
-            if use_distances:
-                d12v = np.hypot(X_vrai[0]-X_vrai[8],  X_vrai[1]-X_vrai[9])
-                d23v = np.hypot(X_vrai[8]-X_vrai[16], X_vrai[9]-X_vrai[17])
-                d13v = np.hypot(X_vrai[0]-X_vrai[16], X_vrai[1]-X_vrai[17])
-                z12  = d12v + np.random.normal(0, sigma_d)
-                z23  = d23v + np.random.normal(0, sigma_d)
-                z13  = d13v + np.random.normal(0, sigma_d)
+            d12v = np.hypot(X_vrai[0]-X_vrai[8],  X_vrai[1]-X_vrai[9])
+            d23v = np.hypot(X_vrai[8]-X_vrai[16], X_vrai[9]-X_vrai[17])
+            d13v = np.hypot(X_vrai[0]-X_vrai[16], X_vrai[1]-X_vrai[17])
+            z12  = d12v + np.random.normal(0, sigma_d)
+            z23  = d23v + np.random.normal(0, sigma_d)
+            z13  = d13v + np.random.normal(0, sigma_d)
 
-                paquets = {i: methode.build_paquet(drones[i]) for i in (1,2,3)}
-                for i in (1, 2, 3):
-                    paquets[i]["Ppos_exact"] = drones[i].P[0:2, 0:2].copy()
+            paquets = {i: methode.build_paquet(drones[i]) for i in (1,2,3)}
+            
+            for i in (1, 2, 3):
+                paquets[i]["Ppos_exact"] = drones[i].P[0:2, 0:2].copy()
 
-                drones[1].update_CI_batch([(z12, paquets[2]), (z13, paquets[3])],
-                                           sigma_R_d**2, methode, diagnostics=diag_var)
-                drones[2].update_CI_batch([(z12, paquets[1]), (z23, paquets[3])],
-                                           sigma_R_d**2, methode, diagnostics=diag_var)
-                drones[3].update_CI_batch([(z23, paquets[2]), (z13, paquets[1])],
-                                           sigma_R_d**2, methode, diagnostics=diag_var)
+            drones[1].update_CI_batch([(z12, paquets[2]), (z13, paquets[3])],
+                                       sigma_R_d**2, methode, diagnostics=diag_var)
+            drones[2].update_CI_batch([(z12, paquets[1]), (z23, paquets[3])],
+                                       sigma_R_d**2, methode, diagnostics=diag_var)
+            drones[3].update_CI_batch([(z23, paquets[2]), (z13, paquets[1])],
+                                       sigma_R_d**2, methode, diagnostics=diag_var)
 
         for j, (d, b) in enumerate([(1,0),(2,8),(3,16)]):
             err_pos[k, j]   = drones[d].x[0:2] - X_vrai[b:b+2]
@@ -306,15 +330,18 @@ def run_une_methode(methode, seed, compenser_biais=True,
 
     return err_pos, P_pos_tr, P_pos_m, np.array(diag_var) if diag_var else np.empty((0,3)), err8, Pdiag8
 
-SEUIL_3SIGMA = chi2.ppf(0.997, df=2)
-T_CONV = 4.0
-IDX_CONV = int(round(T_CONV / dt))
+from scipy.stats import chi2
+SEUIL_3SIGMA = chi2.ppf(0.997, df=2)   # ~11.6 : couverture cible 99.7%
 
-def calcule_metriques(methode, N_MC=30, seeds=None, cfg=None):
+# [AJOUT] Fenêtre convergée : MSE calculée pour t >= T_CONV (transitoire exclu).
+# Doit être identique à T_CONV du fichier centralisé pour une comparaison juste.
+T_CONV = 4.0
+IDX_CONV = int(round(T_CONV / dt))   # premier indice temporel >= T_CONV
+
+def calcule_metriques(methode, N_MC=30, seeds=None):
+
     if seeds is None:
         seeds = range(N_MC)
-    if cfg is None:
-        cfg = {}
 
     all_mse    = np.zeros((N_MC, N_DRONES))
     all_nci    = np.zeros((N_MC, N_DRONES))
@@ -324,20 +351,27 @@ def calcule_metriques(methode, N_MC=30, seeds=None, cfg=None):
     n_dans_3s  = np.zeros(N_DRONES)
     n_total    = np.zeros(N_DRONES)
     diag_all   = []
+
+    # [AJOUT] Historique complet (tous runs) pour tracer les couloirs ±3σ.
+    # err_hist : (N_MC, n_steps+1, N_DRONES, 2) ; P_hist : (..., 2, 2)
     err_hist = np.zeros((N_MC, n_steps+1, N_DRONES, 8))
     P_hist   = np.zeros((N_MC, n_steps+1, N_DRONES, 8))
 
     for run, seed in enumerate(seeds):
-        err_pos, P_pos_tr, P_pos_m, diag_var, err8, Pdiag8 = run_une_methode(
-            methode, seed, **cfg)
+        err_pos, P_pos_tr, P_pos_m, diag_var, err8, Pdiag8 = run_une_methode(methode, seed)
         if diag_var.size:
             diag_all.append(diag_var)
         err_hist[run] = err8
         P_hist[run]   = Pdiag8
 
         for j in range(N_DRONES):
+            # [MODIF] MSE de position sur la fenêtre convergée [T_CONV, t_max]
+            # au lieu de toute la trajectoire, pour séparer qualité asymptotique
+            # et transitoire de convergence.
             all_mse[run, j] = np.mean(np.sum(err_pos[IDX_CONV:, j, :]**2, axis=1))
+
             all_rmse_t[run, :, j] = np.sqrt(np.sum(err_pos[:, j, :]**2, axis=1))
+
             nci_vals = []
             for k in range(1, n_steps+1):
                 e   = err_pos[k, j]
@@ -358,7 +392,9 @@ def calcule_metriques(methode, N_MC=30, seeds=None, cfg=None):
     trace_std  = np.std(all_trace,  axis=0)
     rmse_t     = np.mean(all_rmse_t, axis=0)
     couverture = n_dans_3s / np.maximum(n_total, 1)
+
     diag_var = np.vstack(diag_all) if diag_all else np.empty((0, 3))
+    
     if diag_var.size:
         ecart = diag_var[:, 1] - diag_var[:, 2]
         var_err_var = float(np.var(ecart))
@@ -366,45 +402,201 @@ def calcule_metriques(methode, N_MC=30, seeds=None, cfg=None):
         var_err_var = 0.0
 
     return {
-        "mse": all_mse, "rmse_t": rmse_t, "nci": all_nci, "nci_min": nci_min,
-        "couverture": couverture, "trace_mean": trace_mean, "trace_std": trace_std,
-        "diag_var": diag_var, "var_err_var": var_err_var,
-        "err_hist": err_hist, "P_hist": P_hist,
+        "mse"        : all_mse,
+        "rmse_t"     : rmse_t,
+        "nci"        : all_nci,
+        "nci_min"    : nci_min,
+        "couverture" : couverture,
+        "trace_mean" : trace_mean,
+        "trace_std"  : trace_std,
+        "diag_var"   : diag_var,
+        "var_err_var": var_err_var,
+        "err_hist"   : err_hist,    # [AJOUT] pour les couloirs ±3σ
+        "P_hist"     : P_hist,      # [AJOUT]
     }
 
-CONFIGS = [
-    ("Scenario D", dict(compenser_biais=True,  use_gps=True, use_imu=True, use_distances=True)),
-    ("Scenario C", dict(compenser_biais=False, use_gps=True, use_imu=True, use_distances=True)),
-    ("Scenario A", dict(compenser_biais=False, use_gps=True, use_imu=True, use_distances=False)),
-    ("Scenario B", dict(compenser_biais=True,  use_gps=True, use_imu=True, use_distances=False)),
-]
+N_MC  = 40
+seeds = list(range(N_MC))
+temps = np.arange(n_steps+1) * dt
 
-if __name__ == "__main__":
-    N_MC  = 40
-    seeds = list(range(N_MC))
-    temps = np.arange(n_steps+1) * dt
+print(f"Étude sur {N_MC} runs Monte Carlo, {n_steps} pas de simulation chacun.")
+print("─" * 60)
 
-    labels_drone = ["Drone 1 (GPS)", "Drone 2 (IMU)", "Drone 3 (sans capteur)"]
+resultats = {}
+for m in METHODES:
+    print(f"  Calcul {m.nom} ...", flush=True)
+    R = calcule_metriques(m, N_MC=N_MC, seeds=seeds)
+    R["methode"] = m
+    R["cout"]    = cout_floats(m)
+    resultats[m.label] = R
 
-    for nom_cfg, cfg in CONFIGS:
-        print("\n" + "="*74)
-        print(f"  {nom_cfg}  |  cfg = {cfg}")
-        print("="*74)
-        resultats = {}
-        for m in METHODES:
-            R = calcule_metriques(m, N_MC=N_MC, seeds=seeds, cfg=cfg)
-            R["methode"] = m
-            R["cout"] = cout_floats(m)
-            resultats[m.label] = R
+def moy3(metrique, drone):
+    """Moyenne sur les 3 drones d'une métrique (N_MC,3) ou (3,)."""
+    arr = metrique[drone]
+    if arr.ndim == 2:
+        return arr.mean()
+    return arr.mean()
 
-        print(f"{'Meth':<6}{'Cout':>6}{'MSE':>10}{'NCI':>8}{'Couv%':>8}")
-        for label, r in resultats.items():
-            print(f"{r['methode'].label:<6}{r['cout']:>6d}"
-                  f"{r['mse'].mean():>10.3f}{r['nci'].mean():>8.2f}"
-                  f"{r['couverture'].mean()*100:>7.1f}")
+print("\n" + "═"*92)
+print(f"{'Méthode':<30} {'Coût':>5} {'MSE':>8} {'NCI moy':>9} {'NCI min':>9} "
+      f"{'Couv.3σ':>9} {'Var(err)':>10}")
+print(f"{'':30} {'flt':>5} {'(m²)':>8} {'(≈2)':>9} {'(pire)':>9} "
+      f"{'(≈99.7%)':>9} {'var (F3)':>10}")
+print("─"*92)
+for label, r in resultats.items():
+    m = r["methode"]
+    mse_m  = r["mse"].mean()
+    nci_m  = r["nci"].mean()
+    nci_mn = r["nci_min"].min()
+    couv   = r["couverture"].mean() * 100
+    vev    = r["var_err_var"]
+    print(f"  {m.nom:<28} {r['cout']:>5d} {mse_m:>8.3f} {nci_m:>9.3f} "
+          f"{nci_mn:>9.3f} {couv:>8.1f}% {vev:>10.4f}")
+print("═"*92)
+print("  Familles : F1 précision (MSE) | F2 cohérence (NCI, couverture) | "
+      "F3 géométrie (Var(err))")
+print("  NCI ≈ 2 : cohérent | NCI min très bas : sur-confiance ponctuelle | "
+      "Couv. < 99% : risque")
+print("  Var(err) = 0 : insensible à l'angle (M0/M2) | > 0 : sensible (M1/M3)")
 
-        print(f"\n  MSE position par drone (t >= {T_CONV}s)")
-        print(f"{'Meth':<6}" + "".join(f"{d:>24}" for d in labels_drone))
-        for label, r in resultats.items():
-            mpd = r["mse"].mean(axis=0)
-            print(f"{r['methode'].label:<6}" + "".join(f"{v:>24.3f}" for v in mpd))
+labels_drone = ["Drone 1 (GPS)", "Drone 2 (IMU)", "Drone 3 (sans capteur)"]
+
+print("\n\n┌" + "─"*70 + "┐")
+print(f"│  TABLEAU MSE (m²) — position, fenêtre convergée t >= {T_CONV:.1f}s"
+      + " "*17 + "│")
+print("└" + "─"*70 + "┘")
+print(f"{'Méthode':<8}" + "".join(f"{d:>24}" for d in labels_drone))
+print("-"*80)
+for label, r in resultats.items():
+    mse_par_drone = r["mse"].mean(axis=0)
+    std_par_drone = r["mse"].std(axis=0)
+    ligne = f"{r['methode'].label:<8}"
+    ligne += "".join(f"{m:>14.3f}" for m in mse_par_drone)
+    print(ligne)
+print("(valeurs = MSE_moy ± écart-type inter-runs)")
+
+print("\n┌" + "─"*70 + "┐")
+print("│  TABLEAU NCI — cohérence (cible ≈ 2 ; < 2 conservateur ; > 2 risqué)" + " "*1 + "│")
+print("└" + "─"*70 + "┘")
+print(f"{'Méthode':<6}" + "".join(f"{d:>17}" for d in labels_drone))
+print("-"*73)
+for label, r in resultats.items():
+    nci_par_drone = r["nci"].mean(axis=0)
+    ligne = f"{r['methode'].label:<6}"
+    ligne += "".join(f"{v:>17.3f}" for v in nci_par_drone)
+    print(ligne)
+print()
+
+labels8 = ['x', 'y', 'vx', 'vy', 'ax', 'ay', 'bx', 'by']
+
+def figure_couloirs_methode(r, temps, drone_idx):
+    err_hist = r["err_hist"]
+    P_hist   = r["P_hist"]
+    n_mc     = err_hist.shape[0]
+    m        = r["methode"]
+    labels_drone_ = ["Drone 1 (GPS)", "Drone 2 (IMU)", "Drone 3 (sans capteur)"]
+
+    fig, axs = plt.subplots(4, 2, figsize=(12, 8), sharex=True)
+    fig.suptitle(f"{m.nom} — {labels_drone_[drone_idx]} — {n_mc} runs Monte-Carlo",
+                 fontsize=13, fontweight='bold')
+    axs = axs.flatten()
+    for i in range(8):
+        sigma = np.sqrt(P_hist[0, :, drone_idx, i])
+        for run in range(n_mc):
+            axs[i].plot(temps, err_hist[run, :, drone_idx, i],
+                        color='green', alpha=0.15, lw=0.6,
+                        label='Runs Monte-Carlo' if run == 0 else '_nolegend_')
+        axs[i].fill_between(temps, -3*sigma, 3*sigma, color='blue', alpha=0.15,
+                            label=r'Couloir $\pm 3\sigma$ prédit')
+        axs[i].axhline(0, color='k', lw=0.6)
+        axs[i].set_title(f"{labels8[i]} : estimé − vrai", fontsize=10)
+        axs[i].grid(True, linestyle=':', alpha=0.7)
+    axs[6].set_xlabel("Temps (s)"); axs[7].set_xlabel("Temps (s)")
+    h, l = axs[0].get_legend_handles_labels()
+    fig.legend(h, l, loc='upper center', ncol=3, bbox_to_anchor=(0.5, 0.97))
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    return fig
+
+for m in METHODES:
+    for drone_idx in range(N_DRONES):
+        figure_couloirs_methode(resultats[m.label], temps, drone_idx)
+
+fig1, axes1 = plt.subplots(1, 4, figsize=(16, 4), sharey=True)
+fig1.suptitle("Erreur de variance selon l'orientation du lien",
+              fontsize=12, fontweight='bold')
+
+ecarts_tous = np.concatenate([resultats[m.label]["diag_var"][:, 1]
+                              - resultats[m.label]["diag_var"][:, 2]
+                              for m in METHODES])
+y_lim = np.percentile(np.abs(ecarts_tous), 98)
+
+bins = np.arange(0, 361, 15)
+mids = (bins[:-1] + bins[1:]) / 2
+
+for ax, m in zip(axes1, METHODES):
+    dv    = resultats[m.label]["diag_var"]
+    angle = dv[:, 0]
+    ecart = dv[:, 1] - dv[:, 2]
+
+    med, q1, q3 = [], [], []
+    for k in range(len(bins) - 1):
+        sel = (angle >= bins[k]) & (angle < bins[k+1])
+        if np.any(sel):
+            med.append(np.median(ecart[sel]))
+            q1.append(np.percentile(ecart[sel], 25))
+            q3.append(np.percentile(ecart[sel], 75))
+        else:
+            med.append(np.nan); q1.append(np.nan); q3.append(np.nan)
+    med, q1, q3 = np.array(med), np.array(q1), np.array(q3)
+
+    ax.fill_between(mids, q1, q3, color=m.color, alpha=0.20,
+                    label='Écart inter-quartiles')
+    ax.plot(mids, med, color=m.color, lw=2.5, marker='o', ms=3,
+            zorder=5, label='Médiane')
+
+    ax.axhline(0, color='black', lw=1)
+    ax.set_xlim(0, 360); ax.set_xticks([0, 90, 180, 270, 360])
+    ax.set_ylim(-y_lim, y_lim)
+    ax.set_title(m.label, fontsize=12, color=m.color, fontweight='bold')
+    ax.set_xlabel("Angle du lien (°)")
+    ax.grid(True, linestyle=':', alpha=0.4)
+
+axes1[0].set_ylabel("Variance utilisée − exacte")
+axes1[0].legend(fontsize=7, loc='upper left')
+fig1.tight_layout()
+
+def normalise(vals):
+    arr = np.array(vals, dtype=float)
+    return (arr - arr.min()) / (arr.max() - arr.min() + 1e-12)
+
+crit_mse  = normalise([resultats[m.label]["mse"].mean() for m in METHODES])
+crit_nci  = normalise([abs(resultats[m.label]["nci"].mean() - 2) for m in METHODES])
+crit_geo  = normalise([resultats[m.label]["var_err_var"] for m in METHODES])
+crit_cout = normalise([resultats[m.label]["cout"] for m in METHODES])
+
+scores = (crit_mse + crit_nci + crit_geo + crit_cout) / 4.0
+
+ordre = np.argsort(scores)
+methodes_triees = [METHODES[i] for i in ordre]
+scores_tries    = scores[ordre]
+
+fig2, ax2 = plt.subplots(figsize=(9, 4.5))
+y_pos = np.arange(len(methodes_triees))
+barres = ax2.barh(y_pos, scores_tries,
+                  color=[m.color for m in methodes_triees], alpha=0.85)
+ax2.set_yticks(y_pos)
+ax2.set_yticklabels([m.nom for m in methodes_triees], fontsize=10)
+ax2.invert_yaxis()
+ax2.set_xlabel("Score global  (0 = meilleur, 1 = pire)", fontsize=11)
+ax2.set_title("Classement global des méthodes\n"
+              "moyenne de 4 critères : précision, cohérence, géométrie, coût radio",
+              fontsize=12, fontweight='bold')
+ax2.grid(True, axis='x', linestyle=':', alpha=0.5)
+
+for bar, sc in zip(barres, scores_tries):
+    ax2.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height()/2,
+             f"{sc:.2f}", va='center', fontsize=9, fontweight='bold')
+ax2.set_xlim(0, 1.1)
+fig2.tight_layout()
+
+plt.show()
