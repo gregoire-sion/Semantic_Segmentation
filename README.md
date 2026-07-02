@@ -1,493 +1,799 @@
-# -*- coding: utf-8 -*-
-"""
-EKF DÉCENTRALISÉ — fusion Covariance Intersection (CI)
-4 méthodes de communication (M0 bloc 2x2 exact, M1 isotrope, M2 projetée, M3 lambda_max)
-
-Modèle ALIGNÉ sur le centralisé "Scénario D" (biais estimé, GPS+IMU+distances) :
-  - mêmes Q, P0, tirage d'erreur initiale, commandes, bruits
-  - drone 2 en modèle "accélération constante" (n'observe pas sa commande)
-
-Sorties :
-  - MSE de position par méthode et par drone (fenêtre convergée t >= T_CONV)
-  - NCI (cohérence), couverture 3-sigma, taux de divergence
-  - Figures : 8 variables d'état en colonnes (4x2) + couloir ±3σ + runs MC
-"""
+import os
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')                      # backend fichier ; retirer pour affichage interactif
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from numpy.linalg import inv, eigvalsh
-from scipy.linalg import block_diag
-from scipy.optimize import minimize_scalar
-from scipy.stats import chi2
 
-# =========================================================================
-# 1. Paramètres (identiques au centralisé)
-# =========================================================================
-t_max      = 16.0
-dt         = 0.1
-dt_capteur = 0.5
-dt_imu     = 0.1
-N_DRONES   = 3
-N_VAR      = 8
-N          = N_DRONES * N_VAR
-n_steps    = int(round(t_max / dt))
-ratio_imu  = int(round(dt_imu / dt))
-ratio_gps  = int(round(dt_capteur / dt))
+torch.set_default_dtype(torch.float32)
 
-sigma_w_accel = 5e-2
-sigma_w_autre = 1e-6
-sigma_gps  = 0.5
-sigma_acc  = 0.01
-sigma_d    = 0.5
-sigma_R_gps = 0.5
-sigma_R_acc = 0.1
-sigma_R_d   = 0.5
-sigma_P_x, sigma_P_v, sigma_P_a, sigma_P_b = 2.0, 0.5, 0.5, 1.0
+# =============================================================================
+# 0. CONFIGURATION GLOBALE  (tout ce que tu touches au quotidien est ici)
+# =============================================================================
+class CFG:
 
-T_CONV   = 4.0                              # début de la fenêtre convergée
-IDX_CONV = int(round(T_CONV / dt))
+    ARCHI_TO_TRAIN = "archi1"
 
-# =========================================================================
-# 2. Modèles dynamiques
-# =========================================================================
-def Fmat(accel_constante):
-    a = 1.0 if accel_constante else 0.0
-    return np.array([
-        [1, 0, dt, 0, 0.5*dt**2, 0,         0, 0],
-        [0, 1, 0,  dt, 0,        0.5*dt**2, 0, 0],
-        [0, 0, 1,  0,  dt,       0,          0, 0],
-        [0, 0, 0,  1,  0,        dt,         0, 0],
-        [0, 0, 0,  0,  a,        0,          0, 0],
-        [0, 0, 0,  0,  0,        a,          0, 0],
-        [0, 0, 0,  0,  0,        0,          1, 0],
-        [0, 0, 0,  0,  0,        0,          0, 1]], dtype=float)
+    MODE_MONTE_CARLO = False
+    N_MC             = 50
 
-def Bmat_global(cols):
-    M = np.zeros((8, 6)); M[4, cols[0]] = 1.0; M[5, cols[1]] = 1.0
-    return M
+    PLOT_MSE_DB = True
+    R_SWEEP_DB = [-10, -5, 0, 5, 10, 20, 30]
+    N_MC_DB = 30
+    PLOT_NCI = True
+    TRAIN_NOISE_SWEEP = True
+    TRAIN_NOISE_DB = (-10, 30)
 
-def Bmat_local():
-    M = np.zeros((8, 2)); M[4, 0] = 1.0; M[5, 1] = 1.0
-    return M
+    USE_SAVED_DATASET = False
+    DATASET_PATH = "Dataset/small_dataset/dataset.npz"
 
-# Vérité : les 3 drones ont un modèle à accélération commandée (a=0 dans F, commande via B)
-F_vrai = block_diag(Fmat(False), Fmat(False), Fmat(False))
-B_vrai = np.concatenate((Bmat_global([0, 1]), Bmat_global([2, 3]), Bmat_global([4, 5])), axis=0)
+    N_TRAIN   = 100
+    N_VAL     = 20
+    N_TEST    = 1
+    T         = 160
+    SEED      = 42
 
-# Filtres locaux : drone 2 en "accélération constante" (a=1), sans commande (B nul)
-F_loc = {1: Fmat(False), 2: Fmat(True),  3: Fmat(False)}
-B_loc = {1: Bmat_local(), 2: np.zeros((8, 2)), 3: Bmat_local()}
+    N_EPOCHS   = 40
+    N_BATCH    = 32
+    LR         = 3e-4
+    WD         = 1e-4
+    GRAD_CLIP  = 1.0
+    TBPTT      = 20
 
-w_sigma = np.full(N, sigma_w_autre)
-for b in (0, 8, 16):
-    w_sigma[b+4] = w_sigma[b+5] = sigma_w_accel
+    IN_MULT   = 5
+    OUT_MULT  = 40
 
-X_vrai_init = np.concatenate(([0,  10, 1, 0, 0, 0,  0,    0],
-                               [10,  0, 1, 0, 0, 0,  0.5, -0.2],
-                               [0, -10, 1, 0, 0, 0,  0,    0])).astype(float)
+    OUT_DIR   = "./Dataset"
+    DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-I8 = np.eye(8)
 
-# =========================================================================
-# 3. Q et P0 locaux — ALIGNÉS SUR LE CENTRALISÉ "D"
-# =========================================================================
-def make_Q_local(drone_id):
-    """
-    Centralisé D :
-       drones 1,3 : Q[accel]=0.5**2 ; Q[biais]=1e-9**2
-       drone 2    : Q[vitesse]=0.1**2 ; Q[accel]=1.0 (=1**2) ; Q[biais]=1e-9**2
-    """
-    Q = np.eye(8) * 1e-3
-    Q[4, 4] = Q[5, 5] = 0.5**2          # accélération (drones 1 et 3)
-    Q[6, 6] = Q[7, 7] = 1e-9**2         # biais
-    if drone_id == 2:
-        Q[2, 2] = Q[3, 3] = 0.1**2      # vitesse (comme Q[10,11] centralisé)
-        Q[4, 4] = Q[5, 5] = 1.0         # accélération (comme Q[12,13] centralisé)
-    return Q
+class SystemModel:
+    def __init__(self, device=CFG.DEVICE):
+        self.device = device
+        self.dt        = 0.1
+        self.n_drone   = 3
+        self.n_var     = 8
+        self.m         = self.n_drone * self.n_var
+        self.n         = 7
+        self.ratio_imu = 1
+        self.ratio_gps = 5
 
-def make_P_local(drone_id=None):
-    """
-    Centralisé D : P0 diagonale standard, sauf drone 2 dont la vitesse
-    est gonflée (P[10,11] = sigma_P_v**2 + 2).
-    """
-    P = np.eye(8)
-    P[0, 0] = P[1, 1] = sigma_P_x**2
-    P[2, 2] = P[3, 3] = sigma_P_v**2
-    P[4, 4] = P[5, 5] = sigma_P_a**2
-    P[6, 6] = P[7, 7] = sigma_P_b**2
-    if drone_id == 2:
-        P[2, 2] = P[3, 3] = sigma_P_v**2 + 2
-    return P
+        sig_accel = 5e-2
+        sig_autre = 1e-6
+        w = np.full(self.m, sig_autre)
+        for b in (0, 8, 16):
+            w[b + 4] = w[b + 5] = sig_accel
+        self.w_sigma = torch.tensor(w, dtype=torch.float32, device=device)
 
-# =========================================================================
-# 4. Méthodes de communication (contenu du paquet + variance vue du voisin)
-# =========================================================================
-class MethodeBloc2x2:
-    """M0 — Bloc exact 2x2 (référence)."""
-    nom = "M0 - Bloc 2x2 exact"; label = "M0"; color = "black"; ls = "-"; n_floats_cov = 3
-    @staticmethod
-    def build_paquet(drone):
-        return {"pos": drone.x[0:2].copy(), "data": drone.P[0:2, 0:2].copy()}
-    @staticmethod
-    def var_voisin(paquet, Hj):
-        return float(Hj @ paquet["data"] @ Hj.T)
+        self.sig_gps = 0.5
+        self.sig_acc = 0.01
+        self.sig_d   = 0.5
+        sig_R_gps, sig_R_acc, sig_R_d = 0.5, 0.1, 0.5
+        R_diag = [sig_R_gps**2, sig_R_gps**2,
+                  sig_R_acc**2, sig_R_acc**2,
+                  sig_R_d**2,  sig_R_d**2, sig_R_d**2]
+        self.R = torch.diag(torch.tensor(R_diag, dtype=torch.float32, device=device))
+        Rgen_diag = [self.sig_gps**2, self.sig_gps**2,
+                     self.sig_acc**2, self.sig_acc**2,
+                     self.sig_d**2,  self.sig_d**2, self.sig_d**2]
+        self.R_gen = torch.diag(torch.tensor(Rgen_diag, dtype=torch.float32, device=device))
 
-class MethodeIsotrope:
-    """M1 — Scalaire isotrope : trace(P)/2."""
-    nom = "M1 - Variance isotrope (trace/2)"; label = "M1"; color = "royalblue"; ls = "--"; n_floats_cov = 1
-    @staticmethod
-    def build_paquet(drone):
-        Ppos = drone.P[0:2, 0:2]
-        return {"pos": drone.x[0:2].copy(), "data": np.trace(Ppos) / 2.0}
-    @staticmethod
-    def var_voisin(paquet, Hj):
-        return float(paquet["data"])           # Hj unitaire => Hj·σ²I·HjT = σ²
+        Q = np.eye(self.m) * 1e-3
+        for b in (0, 8, 16):
+            Q[b + 4, b + 4] = Q[b + 5, b + 5] = 0.5**2
+            Q[b + 6, b + 6] = Q[b + 7, b + 7] = 1e-5**2
+        Q[10, 10] = Q[11, 11] = 0.1**2
+        Q[12, 12] = Q[13, 13] = 0.5**2
+        self.Q = torch.tensor(Q, dtype=torch.float32, device=device)
 
-class MethodeProjetee:
-    """M2 — Variance projetée : Hj·P·HjT."""
-    nom = "M2 - Variance projetee (Hj.P.Hj)"; label = "M2"; color = "darkorange"; ls = "-."; n_floats_cov = 1
-    @staticmethod
-    def build_paquet(drone):
-        return {"pos": drone.x[0:2].copy(), "data": drone.P[0:2, 0:2].copy()}
-    @staticmethod
-    def var_voisin(paquet, Hj):
-        return float(Hj @ paquet["data"] @ Hj.T)
+        self.F_true   = self._block_F(accel_const=(False, False, False))
+        self.B_true   = self._build_B(estim_d2=True)
+        self.F_filter = self._block_F(accel_const=(False, True, False))
+        self.B_filter = self._build_B(estim_d2=False)
 
-class MethodeMax:
-    """M3 — Variance maximale : lambda_max(P[0:2,0:2])."""
-    nom = "M3 - Variance maximale (lmax)"; label = "M3"; color = "crimson"; ls = ":"; n_floats_cov = 1
-    @staticmethod
-    def build_paquet(drone):
-        Ppos = drone.P[0:2, 0:2]
-        return {"pos": drone.x[0:2].copy(), "data": float(eigvalsh(Ppos).max())}
-    @staticmethod
-    def var_voisin(paquet, Hj):
-        return float(paquet["data"])
+        sP_x, sP_v, sP_a, sP_b = 2.0, 0.5, 0.5, 1.0
+        P0 = np.eye(self.m)
+        for b in (0, 8, 16):
+            P0[b, b]     = P0[b+1, b+1] = sP_x**2
+            P0[b+2, b+2] = P0[b+3, b+3] = sP_v**2
+            P0[b+4, b+4] = P0[b+5, b+5] = sP_a**2
+            P0[b+6, b+6] = P0[b+7, b+7] = sP_b**2
+        self.P0 = torch.tensor(P0, dtype=torch.float32, device=device)
 
-METHODES = [MethodeBloc2x2, MethodeIsotrope, MethodeProjetee, MethodeMax]
+        x0 = np.concatenate(([0,  10, 1, 0, 0, 0, 0,    0],
+                             [10,  0, 1, 0, 0, 0, 0.5, -0.2],
+                             [0, -10, 1, 0, 0, 0, 0,    0])).astype(np.float32)
+        self.x0 = torch.tensor(x0, dtype=torch.float32, device=device).reshape(self.m, 1)
 
-def cout_floats(methode):
-    return 3 * (2 + methode.n_floats_cov)
+        self.prior_Q     = self.Q.clone()
+        self.prior_Sigma = self.P0.clone()
+        self.prior_S     = self.R.clone()
 
-# =========================================================================
-# 5. Drone distribué
-# =========================================================================
-class DroneDistribue:
-    def __init__(self, drone_id, x_init, P_init, Q_local):
-        self.id = drone_id
-        self.x  = x_init.copy()
-        self.P  = P_init.copy()
-        self.Q  = Q_local.copy()
-        self.F  = F_loc[drone_id]
-        self.B  = B_loc[drone_id]
+        scale = np.array([5.0, 5.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.5])
+        w_loss = np.tile(1.0 / scale**2, 3).astype(np.float32)
+        self.loss_w = torch.tensor(w_loss, dtype=torch.float32, device=device).reshape(1, self.m, 1)
 
-    def predict(self, u):
-        self.x = self.F @ self.x + self.B @ u
-        self.P = self.F @ self.P @ self.F.T + self.Q
+    def _Fmat(self, accel_const):
+        dt = self.dt
+        a = 1.0 if accel_const else 0.0
+        return np.array([
+            [1, 0, dt, 0, 0.5*dt*dt, 0,         0, 0],
+            [0, 1, 0, dt, 0,         0.5*dt*dt, 0, 0],
+            [0, 0, 1, 0,  dt,        0,         0, 0],
+            [0, 0, 0, 1,  0,         dt,        0, 0],
+            [0, 0, 0, 0,  a,         0,         0, 0],
+            [0, 0, 0, 0,  0,         a,         0, 0],
+            [0, 0, 0, 0,  0,         0,         1, 0],
+            [0, 0, 0, 0,  0,         0,         0, 1]], dtype=np.float32)
 
-    def update_local(self, mes, H, R):
-        S = H @ self.P @ H.T + R
-        K = self.P @ H.T @ inv(S)
-        innov = mes - H @ self.x
-        self.x = self.x + K @ innov
-        A = I8 - K @ H
-        self.P = A @ self.P @ A.T + K @ R @ K.T
+    def _block_F(self, accel_const):
+        from scipy.linalg import block_diag
+        F = block_diag(self._Fmat(accel_const[0]),
+                       self._Fmat(accel_const[1]),
+                       self._Fmat(accel_const[2]))
+        return torch.tensor(F, dtype=torch.float32, device=self.device)
 
-    def update_CI_batch(self, liens, R_scalaire, methode, diagnostics=None):
-        """
-        Fusion CI batch. liens : liste de (distance_mesurée, paquet_voisin).
-        diagnostics : liste optionnelle pour la métrique variance/angle.
-        """
-        if not liens:
-            return
-        rows_Hi, innovs, R_diag = [], [], []
-        for d_mesure, paquet in liens:
-            xi, yi = self.x[0], self.x[1]
-            xj, yj = paquet["pos"]
-            d_pred = np.hypot(xi - xj, yi - yj)
-            if d_pred < 1e-4:
-                d_pred = 1e-4
-            Hi = np.zeros(8)
-            Hi[0] = (xi - xj) / d_pred
-            Hi[1] = (yi - yj) / d_pred
-            Hj = np.array([-(xi - xj) / d_pred, -(yi - yj) / d_pred])
-            var_j = methode.var_voisin(paquet, Hj)
-            if diagnostics is not None and "Ppos_exact" in paquet:
-                angle = np.degrees(np.arctan2(Hj[1], Hj[0])) % 360.0
-                var_exacte = float(Hj @ paquet["Ppos_exact"] @ Hj.T)
-                diagnostics.append((angle, var_j, var_exacte))
-            rows_Hi.append(Hi)
-            innovs.append(d_mesure - d_pred)
-            R_diag.append(R_scalaire + var_j)
+    def _Bmat(self, cols):
+        M = np.zeros((8, 6), dtype=np.float32)
+        M[4, cols[0]] = 1.0
+        M[5, cols[1]] = 1.0
+        return M
 
-        H     = np.vstack(rows_Hi)
-        innov = np.array(innovs)
-        Rv    = np.diag(R_diag)
+    def _build_B(self, estim_d2):
+        b1 = self._Bmat([0, 1])
+        b2 = self._Bmat([2, 3]) if estim_d2 else np.zeros((8, 6), np.float32)
+        b3 = self._Bmat([4, 5])
+        B = np.concatenate((b1, b2, b3), axis=0)
+        return torch.tensor(B, dtype=torch.float32, device=self.device)
 
-        def cout_CI(omega):
-            Pi = self.P / omega
-            S  = H @ Pi @ H.T + Rv / (1.0 - omega)
-            K  = Pi @ H.T @ inv(S)
-            return np.trace(Pi - K @ H @ Pi)
+    def f(self, x, u, true=False):
+        Fm = self.F_true if true else self.F_filter
+        Bm = self.B_true if true else self.B_filter
+        return torch.matmul(Fm, x) + torch.matmul(Bm, u)
 
-        sol   = minimize_scalar(cout_CI, bounds=(0.01, 0.99), method='bounded')
-        omega = sol.x
-        Pi = self.P / omega
-        S  = H @ Pi @ H.T + Rv / (1.0 - omega)
-        K  = Pi @ H.T @ inv(S)
-        self.x = self.x + K @ innov
-        self.P = Pi - K @ H @ Pi
+    def h(self, x):
+        b = x.shape[0]
+        xs = x.squeeze(-1)
+        x1, y1 = xs[:, 0],  xs[:, 1]
+        x2, y2 = xs[:, 8],  xs[:, 9]
+        x3, y3 = xs[:, 16], xs[:, 17]
+        imu_x = xs[:, 12] + xs[:, 14]
+        imu_y = xs[:, 13] + xs[:, 15]
+        eps = 1e-6
+        d12 = torch.sqrt((x1 - x2)**2 + (y1 - y2)**2 + eps)
+        d23 = torch.sqrt((x2 - x3)**2 + (y2 - y3)**2 + eps)
+        d13 = torch.sqrt((x1 - x3)**2 + (y1 - y3)**2 + eps)
+        y = torch.stack([x1, y1, imu_x, imu_y, d12, d23, d13], dim=1)
+        return y.unsqueeze(-1)
 
-# =========================================================================
-# 6. Un run complet pour une méthode donnée
-# =========================================================================
-def run_une_methode(methode, seed):
-    np.random.seed(seed)
-    X_vrai = X_vrai_init.copy()
+    def obs_mask(self, step):
+        m = torch.zeros(self.n, device=self.device)
+        if step % self.ratio_imu == 0:
+            m[2] = m[3] = 1.0
+        if step % self.ratio_gps == 0:
+            m[0] = m[1] = 1.0
+            m[4] = m[5] = m[6] = 1.0
+        return m
 
-    # erreur initiale : MÊME tirage/ordre que le centralisé
-    erreur_init = np.zeros(N)
-    for b in (0, 8, 16):
-        erreur_init[b:b+2]   = np.random.normal(0, sigma_P_x, size=2)
-        erreur_init[b+2:b+4] = np.random.normal(0, sigma_P_v, size=2)
-        erreur_init[b+4:b+6] = np.random.normal(0, sigma_P_a, size=2)
-        erreur_init[b+6:b+8] = np.random.normal(0, sigma_P_b, size=2)
-    erreur_init[6:8]   = [0, 0]
-    erreur_init[22:24] = [0, 0]
-    X_est0 = X_vrai + erreur_init
 
-    drones = {i: DroneDistribue(i, X_est0[(i-1)*8:i*8], make_P_local(i), make_Q_local(i))
-              for i in (1, 2, 3)}
-
-    err_pos  = np.zeros((n_steps+1, N_DRONES, 2))
-    P_pos_m  = np.zeros((n_steps+1, N_DRONES, 2, 2))
-    err8     = np.zeros((n_steps+1, N_DRONES, 8))
-    Pdiag8   = np.zeros((n_steps+1, N_DRONES, 8))
-    diag_var = []
-
-    # enregistrement t=0
-    for j, (d, b) in enumerate([(1, 0), (2, 8), (3, 16)]):
-        err_pos[0, j] = drones[d].x[0:2] - X_vrai[b:b+2]
-        P_pos_m[0, j] = drones[d].P[0:2, 0:2]
-        err8[0, j]    = drones[d].x[0:8] - X_vrai[b:b+8]
-        Pdiag8[0, j]  = np.diag(drones[d].P)[0:8]
-
-    phi_x = phi_y = 0.0
-    for k in range(1, n_steps+1):
-        step = k - 1
-        # --- commande vraie ---
-        if step < n_steps / 3:
-            u_vrai = np.array([1., 0., 1., 0., 1., 0.])
-        elif step < 2 * n_steps / 3:
-            phi_x += 5 * dt; phi_y += 1 * dt
-            u_vrai = np.array([np.cos(phi_x), np.sin(phi_y),
-                               np.cos(phi_x), np.sin(phi_y),
-                               np.cos(phi_x), np.sin(phi_y)])
+def build_command_sequence(T, dt, rng):
+    u_seq = np.zeros((T, 6), dtype=np.float32)
+    A   = rng.uniform(0.9, 1.1)
+    px0 = rng.uniform(0, 2*np.pi)
+    py0 = rng.uniform(0, 2*np.pi)
+    phi_x, phi_y = px0, py0
+    for k in range(T):
+        if k < T / 3:
+            u_seq[k] = [A, 0., A, 0., A, 0.]
+        elif k < 2 * T / 3:
+            phi_x += 5 * dt
+            phi_y += 1 * dt
+            cx, sy = A*np.cos(phi_x), A*np.sin(phi_y)
+            u_seq[k] = [cx, sy, cx, sy, cx, sy]
         else:
-            u_vrai = np.array([1., 0., 1., 0., 1., 0.])
+            u_seq[k] = [A, 0., A, 0., A, 0.]
+    return torch.tensor(u_seq, dtype=torch.float32).unsqueeze(-1)
 
-        err_cmd = np.random.normal(0, 0.1, size=6); err_cmd[0:2] = 0.0
-        u_kalman = u_vrai + err_cmd
 
-        # --- propagation vérité ---
-        X_vrai = F_vrai @ X_vrai + B_vrai @ u_vrai + np.random.normal(0, 1, N) * w_sigma
+def build_command_ood(T, dt, rng, kind="3phases"):
+    u_seq = np.zeros((T, 6), dtype=np.float32)
+    if kind == "3phases":
+        phi_x = phi_y = 0.0
+        for k in range(T):
+            if k < T / 3:
+                u_seq[k] = [1., 0., 1., 0., 1., 0.]
+            elif k < 2 * T / 3:
+                phi_x += 5 * dt; phi_y += 1 * dt
+                cx, sy = np.cos(phi_x), np.sin(phi_y)
+                u_seq[k] = [cx, sy, cx, sy, cx, sy]
+            else:
+                u_seq[k] = [1., 0., 1., 0., 1., 0.]
+    elif kind == "brutal":
+        seg = max(1, T // 5)
+        for k in range(T):
+            s = (k // seg) % 4
+            amp = rng.uniform(1.5, 2.5)
+            table = {0: [amp, 0], 1: [0, amp], 2: [-amp, 0], 3: [0, -amp]}
+            ax, ay = table[s]
+            u_seq[k] = [ax, ay, ax, ay, ax, ay]
+    return torch.tensor(u_seq, dtype=torch.float32).unsqueeze(-1)
 
-        # --- prédiction locale (drone 2 sans commande) ---
-        drones[1].predict(u_kalman[0:2])
-        drones[2].predict(np.zeros(2))
-        drones[3].predict(u_kalman[4:6])
 
-        # --- IMU drone 2 ---
-        if step % ratio_imu == 0:
-            mes = np.array([X_vrai[12] + X_vrai[14] + np.random.normal(0, sigma_acc),
-                            X_vrai[13] + X_vrai[15] + np.random.normal(0, sigma_acc)])
-            H = np.zeros((2, 8)); H[0, 4] = H[0, 6] = 1.0; H[1, 5] = H[1, 7] = 1.0
-            drones[2].update_local(mes, H, np.diag([sigma_R_acc**2]*2))
+def generate_trajectory(sm: SystemModel, rng, init_perturb=True, r_scale=1.0, u_seq=None):
+    T, m, n = CFG.T, sm.m, sm.n
+    dev = sm.device
+    if u_seq is None:
+        U = build_command_sequence(T, sm.dt, rng).to(dev)
+    else:
+        U = u_seq.to(dev) if hasattr(u_seq, "to") else torch.tensor(u_seq, dtype=torch.float32, device=dev)
+    sqrtR = torch.linalg.cholesky(sm.R_gen) * r_scale
 
-        # --- GPS drone 1 + distances (fusion CI) ---
-        if step % ratio_gps == 0:
-            z = np.array([X_vrai[0] + np.random.normal(0, sigma_gps),
-                          X_vrai[1] + np.random.normal(0, sigma_gps)])
-            H = np.zeros((2, 8)); H[0, 0] = 1.0; H[1, 1] = 1.0
-            drones[1].update_local(z, H, np.diag([sigma_R_gps**2]*2))
+    X = torch.zeros(T + 1, m, 1, device=dev)
+    Y = torch.zeros(T + 1, n, 1, device=dev)
+    M = torch.zeros(T + 1, n, device=dev)
 
-            d12v = np.hypot(X_vrai[0]-X_vrai[8],  X_vrai[1]-X_vrai[9])
-            d23v = np.hypot(X_vrai[8]-X_vrai[16], X_vrai[9]-X_vrai[17])
-            d13v = np.hypot(X_vrai[0]-X_vrai[16], X_vrai[1]-X_vrai[17])
-            z12 = d12v + np.random.normal(0, sigma_d)
-            z23 = d23v + np.random.normal(0, sigma_d)
-            z13 = d13v + np.random.normal(0, sigma_d)
+    x = sm.x0.clone()
+    if init_perturb:
+        for b in (0, 8, 16):
+            x[b:b+2, 0] += torch.tensor(rng.normal(0, 2.0, size=2), dtype=torch.float32, device=dev)
+    X[0] = x
 
-            paquets = {i: methode.build_paquet(drones[i]) for i in (1, 2, 3)}
-            for i in (1, 2, 3):
-                paquets[i]["Ppos_exact"] = drones[i].P[0:2, 0:2].copy()
+    for k in range(1, T + 1):
+        u = U[k-1].unsqueeze(0)
+        w = (torch.randn(m, 1, device=dev) * sm.w_sigma.reshape(m, 1))
+        x = sm.f(x.unsqueeze(0), u, true=True).squeeze(0) + w
+        X[k] = x
+        y_clean = sm.h(x.unsqueeze(0)).squeeze(0)
+        v = torch.matmul(sqrtR, torch.randn(n, 1, device=dev))
+        Y[k] = y_clean + v
+        M[k] = sm.obs_mask(k)
+    return X, Y, U, M
 
-            drones[1].update_CI_batch([(z12, paquets[2]), (z13, paquets[3])],
-                                       sigma_R_d**2, methode, diagnostics=diag_var)
-            drones[2].update_CI_batch([(z12, paquets[1]), (z23, paquets[3])],
-                                       sigma_R_d**2, methode, diagnostics=diag_var)
-            drones[3].update_CI_batch([(z23, paquets[2]), (z13, paquets[1])],
-                                       sigma_R_d**2, methode, diagnostics=diag_var)
 
-        # --- enregistrement ---
-        for j, (d, b) in enumerate([(1, 0), (2, 8), (3, 16)]):
-            err_pos[k, j] = drones[d].x[0:2] - X_vrai[b:b+2]
-            P_pos_m[k, j] = drones[d].P[0:2, 0:2]
-            err8[k, j]    = drones[d].x[0:8] - X_vrai[b:b+8]
-            Pdiag8[k, j]  = np.diag(drones[d].P)[0:8]
+def generate_dataset(sm, n_traj, seed, noise_sweep=False):
+    rng = np.random.default_rng(seed)
+    Xs, Ys, Us, Ms = [], [], [], []
+    lo, hi = CFG.TRAIN_NOISE_DB
+    for _ in range(n_traj):
+        if noise_sweep:
+            r_db = rng.uniform(lo,hi)
+            r_scale = 10**(-r_db/20.0)
+        else:
+            r_scale = 1.0
+        X, Y, U, Mk = generate_trajectory(sm, rng, r_scale=r_scale)
+        Xs.append(X); Ys.append(Y); Us.append(U); Ms.append(Mk)
+    return (torch.stack(Xs), torch.stack(Ys),
+            torch.stack(Us), torch.stack(Ms))
 
-    diag_arr = np.array(diag_var) if diag_var else np.empty((0, 3))
-    return err_pos, P_pos_m, diag_arr, err8, Pdiag8
 
-# =========================================================================
-# 7. Métriques Monte-Carlo (MSE fenêtrée, NCI, couverture, divergence)
-# =========================================================================
-SEUIL_3SIGMA = chi2.ppf(0.997, df=2)       # ~11.83 : couverture cible 99.7% (2 DDL)
-SEUIL_DIVERG = 50.0                         # MSE (m²) au-delà duquel un run est jugé "divergent"
-                                            # (choisi bien au-dessus des médianes ~8-22 m² pour
-                                            #  n'attraper que les vrais outliers ; ajuste si besoin)
+def load_dataset(sm, path=None):
+    if path is None:
+        path = CFG.DATASET_PATH or os.path.join(CFG.OUT_DIR, "dataset.npz")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"{path} introuvable. Lance d'abord make_dataset.py.")
+    d = np.load(path)
+    X, Y, U, M = d["X"], d["Y"], d["U"], d["M"]
+    itr, iva, ite = d["idx_train"], d["idx_val"], d["idx_test"]
 
-def calcule_metriques(methode, N_MC, seeds):
-    all_mse   = np.zeros((N_MC, N_DRONES))
-    all_nci   = np.zeros((N_MC, N_DRONES))
-    n_dans_3s = np.zeros(N_DRONES)
-    n_total   = np.zeros(N_DRONES)
-    err_hist  = np.zeros((N_MC, n_steps+1, N_DRONES, 8))
-    P_hist    = np.zeros((N_MC, n_steps+1, N_DRONES, 8))
+    def pack(idx):
+        return (torch.tensor(X[idx], dtype=torch.float32, device=sm.device),
+                torch.tensor(Y[idx], dtype=torch.float32, device=sm.device),
+                torch.tensor(U[idx], dtype=torch.float32, device=sm.device),
+                torch.tensor(M[idx], dtype=torch.float32, device=sm.device))
 
-    for run, seed in enumerate(seeds):
-        err_pos, P_pos_m, _, err8, Pdiag8 = run_une_methode(methode, seed)
-        err_hist[run] = err8
-        P_hist[run]   = Pdiag8
-        for j in range(N_DRONES):
-            all_mse[run, j] = np.mean(np.sum(err_pos[IDX_CONV:, j, :]**2, axis=1))
-            nci_vals = []
-            for k in range(1, n_steps+1):
-                e   = err_pos[k, j]
-                Pij = P_pos_m[k, j]
-                try:
-                    d2 = float(e @ inv(Pij) @ e)
-                except Exception:
-                    continue
-                nci_vals.append(d2)
-                n_total[j] += 1
-                if d2 <= SEUIL_3SIGMA:
-                    n_dans_3s[j] += 1
-            all_nci[run, j] = np.mean(nci_vals) if nci_vals else np.nan
+    data_train = pack(itr)
+    data_val   = pack(iva)
+    j = ite[0]
+    Xte = torch.tensor(X[j], dtype=torch.float32, device=sm.device)
+    Yte = torch.tensor(Y[j], dtype=torch.float32, device=sm.device)
+    Ute = torch.tensor(U[j], dtype=torch.float32, device=sm.device)
+    Mte = torch.tensor(M[j], dtype=torch.float32, device=sm.device)
+    print(f">> Dataset chargé : {path}")
+    print(f"   train={len(itr)}  val={len(iva)}  test={len(ite)}")
+    return data_train, data_val, (Xte, Yte, Ute, Mte)
 
-    couverture   = n_dans_3s / np.maximum(n_total, 1)
-    taux_diverg  = np.mean(all_mse > SEUIL_DIVERG, axis=0)   # fraction de runs divergents par drone
-    return {
-        "mse"         : all_mse,
-        "mse_median"  : np.median(all_mse, axis=0),
-        "nci"         : all_nci,
-        "couverture"  : couverture,
-        "taux_diverg" : taux_diverg,
-        "err_hist"    : err_hist,
-        "P_hist"      : P_hist,
-        "methode"     : methode,
-        "cout"        : cout_floats(methode),
-    }
 
-# =========================================================================
-# 8. Figure : 8 variables d'état en colonnes + couloir ±3σ + runs MC
-# =========================================================================
-labels8 = ['x', 'y', 'vx', 'vy', 'ax', 'ay', 'bx', 'by']
-labels_drone = ["Drone 1 (GPS)", "Drone 2 (IMU)", "Drone 3 (sans capteur absolu)"]
+class EKF:
 
-def figure_couloirs_methode(r, temps, drone_idx, save_path=None):
-    err_hist = r["err_hist"]; P_hist = r["P_hist"]
-    n_mc = err_hist.shape[0]; m = r["methode"]
-    fig, axs = plt.subplots(4, 2, figsize=(12, 8), sharex=True)
-    fig.suptitle(f"{m.nom} — {labels_drone[drone_idx]} — {n_mc} runs Monte-Carlo",
-                 fontsize=13, fontweight='bold')
+    def __init__(self, sm: SystemModel):
+        self.sm = sm
+        self.m, self.n = sm.m, sm.n
+        self.dev = sm.device
+
+    def _jac_h(self, x):
+        sm = self.sm
+        xs = x.squeeze(-1).squeeze(0)
+        H = torch.zeros(self.n, self.m, device=self.dev)
+        H[0, 0] = 1.0
+        H[1, 1] = 1.0
+        H[2, 12] = 1.0; H[2, 14] = 1.0
+        H[3, 13] = 1.0; H[3, 15] = 1.0
+        def fill(row, i, j):
+            dx = xs[i] - xs[j]; dy = xs[i+1] - xs[j+1]
+            d = torch.sqrt(dx**2 + dy**2 + 1e-9)
+            H[row, i]   =  dx/d; H[row, i+1] =  dy/d
+            H[row, j]   = -dx/d; H[row, j+1] = -dy/d
+        fill(4, 0, 8)
+        fill(5, 8, 16)
+        fill(6, 0, 16)
+        return H
+
+    def run(self, Y, U, M, x0=None, P0=None):
+        sm = self.sm
+        T = U.shape[0]
+        x = (x0 if x0 is not None else sm.x0).clone().reshape(1, self.m, 1)
+        P = (P0 if P0 is not None else sm.P0).clone()
+        I = torch.eye(self.m, device=self.dev)
+
+        x_hist = torch.zeros(T + 1, self.m, 1, device=self.dev)
+        P_hist = torch.zeros(T + 1, self.m, self.m, device=self.dev)
+        x_hist[0] = x.squeeze(0); P_hist[0] = P
+
+        for k in range(1, T + 1):
+            u = U[k-1].unsqueeze(0)
+
+            x = sm.f(x, u, true=False)
+            F = sm.F_filter
+            P = F @ P @ F.T + sm.Q
+
+            mask = M[k]
+            idx = torch.nonzero(mask > 0).squeeze(-1)
+            if idx.numel() > 0:
+                Hf = self._jac_h(x)[idx]
+                yhat = sm.h(x).squeeze(0)[idx]
+                ymeas = Y[k][idx]
+                Rk = sm.R[idx][:, idx]
+                innov = ymeas - yhat
+                S = Hf @ P @ Hf.T + Rk
+                K = P @ Hf.T @ torch.linalg.inv(S)
+                x = x + (K @ innov).reshape(1, self.m, 1)
+                A = I - K @ Hf
+                P = A @ P @ A.T + K @ Rk @ K.T
+            x_hist[k] = x.squeeze(0); P_hist[k] = P
+        return x_hist, P_hist
+
+
+class KalmanNetNN(nn.Module):
+
+    def __init__(self, sm: SystemModel, archi="archi2",
+                 in_mult=CFG.IN_MULT, out_mult=CFG.OUT_MULT):
+        super().__init__()
+        self.sm = sm
+        self.archi = archi
+        self.m, self.n = sm.m, sm.n
+        self.dev = sm.device
+        self.in_mult, self.out_mult = in_mult, out_mult
+        self.f = sm.f
+        self.h = sm.h
+        self.prior_Q     = sm.prior_Q
+        self.prior_Sigma = sm.prior_Sigma
+        self.prior_S     = sm.prior_S
+        if archi == "archi1":
+            self._build_archi1()
+        else:
+            self._build_archi2()
+        self.to(self.dev)
+
+    def _build_archi1(self):
+        m, n = self.m, self.n
+        d_in  = n + m
+        self.h_dim = 10 * (m**2 + n**2)
+        self.fc_in = nn.Sequential(nn.Linear(d_in, d_in * self.in_mult), nn.ReLU())
+        self.gru   = nn.GRU(d_in * self.in_mult, self.h_dim)
+        self.fc_out = nn.Sequential(
+            nn.Linear(self.h_dim, (m * n) * 4), nn.ReLU(),
+            nn.Linear((m * n) * 4, m * n))
+
+    def _build_archi2(self):
+        m, n, im, om = self.m, self.n, self.in_mult, self.out_mult
+        self.d_hidden_Q     = m * m
+        self.d_hidden_Sigma = m * m
+        self.d_hidden_S     = n * n
+        self.FC5   = nn.Sequential(nn.Linear(m, m * im), nn.ReLU())
+        self.GRU_Q = nn.GRU(m * im, self.d_hidden_Q)
+        self.FC6   = nn.Sequential(nn.Linear(m, m * im), nn.ReLU())
+        self.GRU_Sigma = nn.GRU(self.d_hidden_Q + m * im, self.d_hidden_Sigma)
+        self.FC1   = nn.Sequential(nn.Linear(self.d_hidden_Sigma, n*n), nn.ReLU())
+        self.FC7   = nn.Sequential(nn.Linear(2*n, 2*n*im), nn.ReLU())
+        self.GRU_S = nn.GRU(n*n + 2*n*im, self.d_hidden_S)
+        self.FC2 = nn.Sequential(
+            nn.Linear(self.d_hidden_S + self.d_hidden_Sigma,
+                      (self.d_hidden_S + self.d_hidden_Sigma) * om), nn.ReLU(),
+            nn.Linear((self.d_hidden_S + self.d_hidden_Sigma) * om, n * m))
+        self.FC3 = nn.Sequential(nn.Linear(self.d_hidden_S + n*m, m*m), nn.ReLU())
+        self.FC4 = nn.Sequential(nn.Linear(self.d_hidden_Sigma + m*m,
+                                           self.d_hidden_Sigma), nn.ReLU())
+
+    def init_sequence(self, x0, batch):
+        self.batch = batch
+        x0 = x0.to(self.dev)
+        if x0.dim() == 2:
+            self.m1x_post = x0.reshape(1, self.m, 1).repeat(batch, 1, 1)
+        else:
+            self.m1x_post = x0.clone()
+        self.m1x_post_prev = self.m1x_post.clone()
+        self.m1x_prior_prev = self.m1x_post.clone()
+        self.y_prev = self.h(self.m1x_post)
+        self._init_hidden()
+
+    def _init_hidden(self):
+        b = self.batch
+        if self.archi == "archi1":
+            self.hid = torch.zeros(1, b, self.h_dim, device=self.dev)
+        else:
+            self.h_Q     = self.prior_Q.flatten().reshape(1,1,-1).repeat(1,b,1).to(self.dev)
+            self.h_Sigma = self.prior_Sigma.flatten().reshape(1,1,-1).repeat(1,b,1).to(self.dev)
+            self.h_S     = self.prior_S.flatten().reshape(1,1,-1).repeat(1,b,1).to(self.dev)
+
+    def step_prior(self, u):
+        self.m1x_prior = self.f(self.m1x_post, u, true=False)
+        self.m1y       = self.h(self.m1x_prior)
+
+    def detach_state(self):
+        self.m1x_post       = self.m1x_post.detach()
+        self.m1x_post_prev  = self.m1x_post_prev.detach()
+        self.m1x_prior_prev = self.m1x_prior_prev.detach()
+        self.y_prev         = self.y_prev.detach()
+        if self.archi == "archi1":
+            self.hid = self.hid.detach()
+        else:
+            self.h_Q     = self.h_Q.detach()
+            self.h_Sigma = self.h_Sigma.detach()
+            self.h_S     = self.h_S.detach()
+
+    def _features(self, y):
+        f2 = (y - self.m1y).squeeze(-1)
+        f4 = (self.m1x_post - self.m1x_prior_prev).squeeze(-1)
+        f1 = (y - self.y_prev).squeeze(-1)
+        f3 = (self.m1x_post - self.m1x_post_prev).squeeze(-1)
+        norm = lambda v: F.normalize(v, p=2, dim=1, eps=1e-12)
+        return norm(f1), norm(f2), norm(f3), norm(f4)
+
+    def _kgain_archi1(self, f2, f4):
+        x = torch.cat([f2, f4], dim=1).unsqueeze(0)
+        x = self.fc_in(x)
+        out, self.hid = self.gru(x, self.hid)
+        kg = self.fc_out(out)
+        return kg.reshape(self.batch, self.m, self.n)
+
+    def _kgain_archi2(self, f1, f2, f3, f4):
+        f1=f1.unsqueeze(0); f2=f2.unsqueeze(0); f3=f3.unsqueeze(0); f4=f4.unsqueeze(0)
+        out_FC5 = self.FC5(f4)
+        out_Q, self.h_Q = self.GRU_Q(out_FC5, self.h_Q)
+        out_FC6 = self.FC6(f3)
+        in_Sigma = torch.cat([out_Q, out_FC6], dim=2)
+        out_Sigma, self.h_Sigma = self.GRU_Sigma(in_Sigma, self.h_Sigma)
+        out_FC1 = self.FC1(out_Sigma)
+        out_FC7 = self.FC7(torch.cat([f1, f2], dim=2))
+        in_S = torch.cat([out_FC1, out_FC7], dim=2)
+        out_S, self.h_S = self.GRU_S(in_S, self.h_S)
+        out_FC2 = self.FC2(torch.cat([out_Sigma, out_S], dim=2))
+        out_FC3 = self.FC3(torch.cat([out_S, out_FC2], dim=2))
+        out_FC4 = self.FC4(torch.cat([out_Sigma, out_FC3], dim=2))
+        self.h_Sigma = out_FC4
+        return out_FC2.reshape(self.batch, self.m, self.n)
+
+    def step(self, y, u, mask):
+        self.step_prior(u)
+        f1, f2, f3, f4 = self._features(y)
+        if self.archi == "archi1":
+            KG = self._kgain_archi1(f2, f4)
+        else:
+            KG = self._kgain_archi2(f1, f2, f3, f4)
+        self.KGain = KG
+        dy = (y - self.m1y) * mask.reshape(1, self.n, 1)
+        inov = torch.bmm(KG, dy)
+        self.m1x_post_prev  = self.m1x_post
+        self.m1x_post       = self.m1x_prior + inov
+        self.m1x_prior_prev = self.m1x_prior
+        self.y_prev = y
+        return self.m1x_post
+
+    def forward(self, y, u, mask):
+        return self.step(y, u, mask)
+
+
+def train(sm, model, data_train, data_val, tag="archi2"):
+    Xtr, Ytr, Utr, Mtr = data_train
+    Xva, Yva, Uva, Mva = data_val
+    N, Tp1 = Xtr.shape[0], Xtr.shape[1]
+    T = Tp1 - 1
+
+    opt = torch.optim.Adam(model.parameters(), lr=CFG.LR, weight_decay=CFG.WD)
+
+    def weighted_mse(xhat, xtrue):
+        return ((xhat - xtrue)**2 * sm.loss_w).mean()
+
+    hist_train, hist_val = [], []
+    best_val = float('inf')
+    best_path = os.path.join(CFG.OUT_DIR, f"knet_{tag}.pt")
+    tbptt = getattr(CFG, "TBPTT", 20)
+
+    for epoch in range(CFG.N_EPOCHS):
+        model.train()
+        perm = torch.randperm(N)
+        epoch_loss = 0.0
+        n_skip = 0
+        n_batches = N // CFG.N_BATCH
+        for bi in range(n_batches):
+            idx = perm[bi*CFG.N_BATCH:(bi+1)*CFG.N_BATCH]
+            Xb, Yb, Ub, Mb = Xtr[idx], Ytr[idx], Utr[idx], Mtr[idx]
+            b = Xb.shape[0]
+            model.init_sequence(Xb[:, 0], b)
+            opt.zero_grad()
+            window_loss = 0.0
+            n_win = 0
+            for k in range(1, T + 1):
+                xhat = model(Yb[:, k], Ub[:, k-1], Mb[0, k])
+                window_loss = window_loss + weighted_mse(xhat, Xb[:, k])
+                n_win += 1
+                if (k % tbptt == 0) or (k == T):
+                    wl = window_loss / n_win
+                    wl.backward()
+                    gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.GRAD_CLIP)
+                    if torch.isfinite(gnorm) and torch.isfinite(wl).all():
+                        opt.step()
+                    else:
+                        n_skip += 1
+                    opt.zero_grad()
+                    epoch_loss += wl.item() if torch.isfinite(wl).all() else 0.0
+                    model.detach_state()
+                    window_loss = 0.0; n_win = 0
+        if n_skip > 0:
+            print(f"    [{tag}] epoch {epoch}: {n_skip} pas sautés (gradient non-fini)")
+        hist_train.append(epoch_loss / max(n_batches, 1))
+
+        model.eval()
+        with torch.no_grad():
+            b = Xva.shape[0]
+            model.init_sequence(Xva[:, 0], b)
+            vloss = 0.0
+            for k in range(1, T + 1):
+                xhat = model(Yva[:, k], Uva[:, k-1], Mva[0, k])
+                vloss = vloss + weighted_mse(xhat, Xva[:, k]).item()
+            vloss /= T
+        hist_val.append(vloss)
+
+        if vloss < best_val:
+            best_val = vloss
+            torch.save({'state_dict': model.state_dict(),
+                        'archi': model.archi}, best_path)
+
+        if epoch % 5 == 0 or epoch == CFG.N_EPOCHS - 1:
+            print(f"[{tag}] epoch {epoch:3d} | train {hist_train[-1]:.4e} "
+                  f"| val {vloss:.4e} | best {best_val:.4e}")
+
+    print(f"[{tag}] modèle sauvé -> {best_path}")
+    return hist_train, hist_val, best_path
+
+
+@torch.no_grad()
+def run_knet(sm, model, Y, U, M):
+    T = U.shape[0]
+    model.eval()
+    model.init_sequence(sm.x0, 1)
+    xh = torch.zeros(T + 1, sm.m, 1, device=sm.device)
+    xh[0] = sm.x0
+    for k in range(1, T + 1):
+        y = Y[k].unsqueeze(0)
+        u = U[k-1].unsqueeze(0)
+        xh[k] = model(y, u, M[k]).squeeze(0)
+    return xh
+
+
+def monte_carlo_knet(sm, model, seed=777, n_mc=CFG.N_MC):
+    rng = np.random.default_rng(seed)
+    errs = []
+    for _ in range(n_mc):
+        X, Y, U, Mk = generate_trajectory(sm, rng)
+        xh = run_knet(sm, model, Y, U, Mk)
+        errs.append((xh - X).squeeze(-1).cpu().numpy())
+    errs = np.stack(errs)
+    sigma_emp = errs.std(axis=0)
+    return sigma_emp
+
+
+LABELS = ['x', 'y', 'vx', 'vy', 'ax', 'ay', 'bx', 'by']
+BASES  = {1: 0, 2: 8, 3: 16}
+
+
+def plot_loss(hist_train, hist_val, tag, outdir):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(hist_train, label="Loss entraînement", lw=2)
+    ax.plot(hist_val,   label="Loss validation", lw=2)
+    ax.set_yscale('log')
+    ax.set_xlabel("Epoch"); ax.set_ylabel("MSE (log)")
+    ax.set_title(f"Courbe d'apprentissage KalmanNet — {tag}")
+    ax.grid(True, ls=':', alpha=0.7); ax.legend()
+    fig.tight_layout()
+    p = os.path.join(outdir, f"loss_{tag}.png")
+    fig.savefig(p, dpi=130); plt.close(fig)
+    return p
+
+
+def plot_drone(sm, drone, X, x_ekf, x_knet, P_ekf, temps, tag,
+               sigma_mc=None, outdir=CFG.OUT_DIR):
+    base = BASES[drone]
+    fig, axs = plt.subplots(4, 2, figsize=(13, 9), sharex=True)
     axs = axs.flatten()
     for i in range(8):
-        sigma = np.sqrt(P_hist[0, :, drone_idx, i])         # couloir du 1er run (représentatif)
-        for run in range(n_mc):
-            axs[i].plot(temps, err_hist[run, :, drone_idx, i],
-                        color='green', alpha=0.15, lw=0.6,
-                        label='Runs Monte-Carlo' if run == 0 else '_nolegend_')
-        axs[i].fill_between(temps, -3*sigma, 3*sigma, color='blue', alpha=0.15,
-                            label=r'Couloir $\pm 3\sigma$ prédit')
+        idx = base + i
+        err_ekf  = (x_ekf[:, idx, 0]  - X[:, idx, 0]).cpu().numpy()
+        err_knet = (x_knet[:, idx, 0] - X[:, idx, 0]).cpu().numpy()
+        sig_ekf  = np.sqrt(P_ekf[:, idx, idx].cpu().numpy())
+        axs[i].fill_between(temps, -3*sig_ekf, 3*sig_ekf, color='blue', alpha=0.15,
+                            label=r'$\pm 3\sigma$ EKF')
+        if sigma_mc is not None:
+            s = sigma_mc[:, idx]
+            axs[i].plot(temps,  3*s, color='purple', ls='--', lw=1, alpha=0.8,
+                        label=r'$\pm 3\sigma$ KNet (MC)')
+            axs[i].plot(temps, -3*s, color='purple', ls='--', lw=1, alpha=0.8)
+        axs[i].plot(temps, err_ekf,  color='green', lw=1.3, label='Erreur EKF')
+        axs[i].plot(temps, err_knet, color='red',   lw=1.3, label='Erreur KalmanNet')
         axs[i].axhline(0, color='k', lw=0.6)
-        axs[i].set_title(f"{labels8[i]} : estimé − vrai", fontsize=10)
-        axs[i].grid(True, linestyle=':', alpha=0.7)
+        axs[i].set_title(f"{LABELS[i]} : estimé − vrai", fontsize=10)
+        axs[i].grid(True, ls=':', alpha=0.7)
+        lim = max(np.percentile(np.abs(err_ekf[np.isfinite(err_ekf)]), 99),
+                  3*np.nanmax(sig_ekf), 1e-3)
+        axs[i].set_ylim(-1.15*lim, 1.15*lim)
+        kmax = np.nanmax(np.abs(err_knet[np.isfinite(err_knet)])) if np.isfinite(err_knet).any() else np.inf
+        if not np.isfinite(err_knet).all() or kmax > 5*lim:
+            axs[i].text(0.5, 0.92,
+                        "KNet hors échelle (diverge / non entraîné)",
+                        transform=axs[i].transAxes, ha='center', va='top',
+                        fontsize=8, color='red',
+                        bbox=dict(fc='white', ec='red', alpha=0.7))
     axs[6].set_xlabel("Temps (s)"); axs[7].set_xlabel("Temps (s)")
+    fig.suptitle(f"Drone {drone} — erreurs EKF vs KalmanNet ({tag})",
+                 fontsize=13, fontweight='bold')
     h, l = axs[0].get_legend_handles_labels()
-    fig.legend(h, l, loc='upper center', ncol=3, bbox_to_anchor=(0.5, 0.97))
+    fig.legend(h, l, loc='upper center', ncol=4, bbox_to_anchor=(0.5, 0.965))
     fig.tight_layout(rect=[0, 0, 1, 0.93])
-    if save_path:
-        fig.savefig(save_path, dpi=110)
-    return fig
+    p = os.path.join(outdir, f"drone{drone}_{tag}.png")
+    fig.savefig(p, dpi=130); plt.close(fig)
+    return p
 
-# =========================================================================
-# 9. Programme principal
-# =========================================================================
+
+def mse_db_curve(sm, model, r_levels_db, n_mc, seed=2024, ekf=None):
+    knet_db, ekf_db = [], []
+    for r_db in r_levels_db:
+        r_scale = 10 ** (-r_db / 20.0)
+        rng = np.random.default_rng(seed + int(r_db))
+        mse_k, mse_e = [], []
+        for _ in range(n_mc):
+            X, Y, U, Mk = generate_trajectory(sm, rng, r_scale=r_scale)
+            xh = run_knet(sm, model, Y, U, Mk)
+            mse_k.append(((xh - X)**2).mean().item())
+            if ekf is not None:
+                xe, _ = ekf.run(Y, U, Mk)
+                mse_e.append(((xe - X)**2).mean().item())
+        knet_db.append(10*np.log10(np.mean(mse_k)))
+        if ekf is not None:
+            ekf_db.append(10*np.log10(np.mean(mse_e)))
+    return np.array(r_levels_db), np.array(knet_db), (np.array(ekf_db) if ekf else None)
+
+
+def plot_mse_db(r_db, knet_db, ekf_db, tag, outdir):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(r_db, knet_db, 'o-', color='red', lw=2, label='KalmanNet')
+    if ekf_db is not None:
+        ax.plot(r_db, ekf_db, 's--', color='green', lw=2, label='EKF (MMSE réf.)')
+    ax.set_xlabel(r'$1/r^2$ [dB]'); ax.set_ylabel('MSE [dB]')
+    ax.set_title(f"MSE[dB] vs niveau de bruit — {tag}")
+    ax.grid(True, ls=':', alpha=.7); ax.legend()
+    fig.tight_layout()
+    p = os.path.join(outdir, f"mse_db_{tag}.png")
+    fig.savefig(p, dpi=130); plt.close(fig)
+    return p
+
+
+def nci_coverage(sm, model, P_ekf, seed=3030, n_mc=CFG.N_MC):
+    rng = np.random.default_rng(seed)
+    errs = []
+    for _ in range(n_mc):
+        X, Y, U, Mk = generate_trajectory(sm, rng)
+        xh = run_knet(sm, model, Y, U, Mk)
+        errs.append((xh - X).squeeze(-1).cpu().numpy())
+    errs = np.stack(errs)
+    Pnp = P_ekf.cpu().numpy()
+    Tp1, m = errs.shape[1], errs.shape[2]
+    nci = np.zeros(Tp1); cover = np.zeros(Tp1)
+    for k in range(Tp1):
+        Pk = Pnp[k] + 1e-9*np.eye(m)
+        Pinv = np.linalg.inv(Pk)
+        sig = np.sqrt(np.diag(Pk))
+        ek = errs[:, k, :]
+        nci[k]   = np.mean(np.einsum('ij,jk,ik->i', ek, Pinv, ek)) / m
+        cover[k] = np.mean(np.all(np.abs(ek) <= 3*sig, axis=1))
+    return nci, cover
+
+
+def plot_nci(temps, nci, cover, tag, outdir):
+    fig, axs = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
+    axs[0].plot(temps, nci, color='purple', lw=1.6)
+    axs[0].axhline(1.0, color='k', ls='--', lw=1, label='NCI idéal = 1')
+    axs[0].axhline(2.0, color='r', ls=':', lw=1, label='seuil 2 (overconfidence)')
+    axs[0].set_ylabel('NCI moyen'); axs[0].set_title(f"Cohérence statistique — {tag}")
+    axs[0].grid(True, ls=':', alpha=.7); axs[0].legend()
+    axs[1].plot(temps, 100*cover, color='teal', lw=1.6)
+    axs[1].axhline(99.7, color='k', ls='--', lw=1, label='cible 99.7% (3σ)')
+    axs[1].set_ylabel('Couverture 3σ [%]'); axs[1].set_xlabel('Temps (s)')
+    axs[1].grid(True, ls=':', alpha=.7); axs[1].legend()
+    fig.tight_layout()
+    p = os.path.join(outdir, f"nci_{tag}.png")
+    fig.savefig(p, dpi=130); plt.close(fig)
+    return p
+
+
+def main():
+    os.makedirs(CFG.OUT_DIR, exist_ok=True)
+    torch.manual_seed(CFG.SEED); np.random.seed(CFG.SEED)
+    sm = SystemModel()
+
+    print(f">> Device : {CFG.DEVICE} | CUDA dispo : {torch.cuda.is_available()}")
+    if CFG.DEVICE.type =="cuda":
+        print(f">> GPU : {torch.cuda.get_device_name(0)}")
+
+    print("== Préparation des données ==")
+    if CFG.USE_SAVED_DATASET:
+        data_train, data_val, (Xte, Yte, Ute, Mte) = load_dataset(sm)
+    else:
+        data_train = generate_dataset(sm, CFG.N_TRAIN, seed=CFG.SEED, noise_sweep=CFG.TRAIN_NOISE_SWEEP)
+        data_val   = generate_dataset(sm, CFG.N_VAL,   seed=CFG.SEED + 1, noise_sweep=CFG.TRAIN_NOISE_SWEEP)
+        if CFG.TRAIN_NOISE_SWEEP:
+            print(f">> Entrainement avec variation de bruit 1/r2 dans {CFG.TRAIN_NOISE_DB} dB")
+        rng_test = np.random.default_rng(CFG.SEED + 99)
+        Xte, Yte, Ute, Mte = generate_trajectory(sm, rng_test)
+    temps = (np.arange(CFG.T + 1) * sm.dt)
+
+    print("== EKF baseline ==")
+    ekf = EKF(sm)
+    x_ekf, P_ekf = ekf.run(Yte, Ute, Mte)
+
+    archis = (["archi1", "archi2"] if CFG.ARCHI_TO_TRAIN == "both"
+              else [CFG.ARCHI_TO_TRAIN])
+    produced = []
+
+    for archi in archis:
+        print(f"\n===== ENTRAÎNEMENT {archi} =====")
+        model = KalmanNetNN(sm, archi=archi)
+        ht, hv, ckpt = train(sm, model, data_train, data_val, tag=archi)
+        produced.append(plot_loss(ht, hv, archi, CFG.OUT_DIR))
+
+        state = torch.load(ckpt, map_location=sm.device)
+        model.load_state_dict(state['state_dict'])
+
+        x_knet = run_knet(sm, model, Yte, Ute, Mte)
+
+        sigma_mc = None
+        if CFG.MODE_MONTE_CARLO:
+            print(f"  Monte-Carlo {CFG.N_MC} runs ({archi})...")
+            sigma_mc = monte_carlo_knet(sm, model)
+
+        for d in (1, 2, 3):
+            produced.append(plot_drone(sm, d, Xte, x_ekf, x_knet, P_ekf,
+                                       temps, archi, sigma_mc=sigma_mc))
+
+        mse_pos = ((x_knet[:, 8:10, 0] - Xte[:, 8:10, 0])**2).mean().item()
+        mse_ekf = ((x_ekf[:, 8:10, 0]  - Xte[:, 8:10, 0])**2).mean().item()
+        print(f"  MSE pos drone2 : KNet={mse_pos:.4f} | EKF={mse_ekf:.4f}")
+
+        if CFG.PLOT_MSE_DB:
+            print(f"  Courbe MSE[dB] ({archi})...")
+            r_db, k_db, e_db = mse_db_curve(sm, model, CFG.R_SWEEP_DB,
+                                            CFG.N_MC_DB, ekf=ekf)
+            produced.append(plot_mse_db(r_db, k_db, e_db, archi, CFG.OUT_DIR))
+
+        if CFG.PLOT_NCI:
+            print(f"  NCI / couverture 3σ ({archi})...")
+            nci, cover = nci_coverage(sm, model, P_ekf)
+            produced.append(plot_nci(temps, nci, cover, archi, CFG.OUT_DIR))
+
+    print("\n== Figures générées ==")
+    for p in produced:
+        print("  ", p)
+    return produced
+
+
 if __name__ == "__main__":
-    N_MC  = 40
-    seeds = list(range(N_MC))
-    temps = np.arange(n_steps+1) * dt
-
-    print(f"Étude sur {N_MC} runs Monte-Carlo, {n_steps} pas chacun.")
-    print("─" * 60)
-
-    resultats = {}
-    for m in METHODES:
-        print(f"  Calcul {m.nom} ...", flush=True)
-        resultats[m.label] = calcule_metriques(m, N_MC, seeds)
-
-    # ---- Tableau MSE par drone (moyenne, médiane) ----
-    print("\n" + "═"*86)
-    print(f"MSE position (m²) — fenêtre convergée t >= {T_CONV:.1f}s — {N_MC} runs")
-    print("═"*86)
-    print(f"{'Méthode':<8}" + "".join(f"{d:>26}" for d in labels_drone))
-    print("-"*86)
-    for lab in ["M0", "M1", "M2", "M3"]:
-        r = resultats[lab]
-        moy = r["mse"].mean(axis=0); med = r["mse_median"]
-        ligne = f"{lab:<8}"
-        for j in range(3):
-            ligne += f"   moy={moy[j]:7.2f} med={med[j]:6.2f}"
-        print(ligne)
-    print("(moy = moyenne inter-runs, sensible aux divergences ; med = médiane, robuste)")
-
-    # ---- Tableau NCI + couverture + taux de divergence ----
-    print("\n" + "═"*86)
-    print("COHÉRENCE — NCI (cible ≈ 2), couverture 3σ (cible ≈ 99.7%), taux de divergence")
-    print("═"*86)
-    print(f"{'Méthode':<8}{'Drone':<28}{'NCI':>8}{'Couv.3σ':>10}{'Diverg.':>10}")
-    print("-"*86)
-    for lab in ["M0", "M1", "M2", "M3"]:
-        r = resultats[lab]
-        nci = r["nci"].mean(axis=0); couv = r["couverture"]; div = r["taux_diverg"]
-        for j in range(3):
-            tag = lab if j == 0 else ""
-            print(f"{tag:<8}{labels_drone[j]:<28}{nci[j]:>8.2f}{couv[j]*100:>9.1f}%{div[j]*100:>9.1f}%")
-        print("-"*86)
-
-    # ---- Figures couloirs : 8 variables x chaque méthode x chaque drone ----
-    print("\nGénération des figures de couloirs ±3σ ...")
-    for m in METHODES:
-        for drone_idx in range(N_DRONES):
-            fpath = f"couloirs_{m.label}_drone{drone_idx+1}.png"
-            figure_couloirs_methode(resultats[m.label], temps, drone_idx, save_path=fpath)
-            plt.close('all')
-            print(f"  {fpath}")
-
-    # ---- Boxplot MSE par run (illustre les divergences) ----
-    fig, axs = plt.subplots(1, 3, figsize=(14, 4.5))
-    for j in range(3):
-        data = [resultats[lab]["mse"][:, j] for lab in ["M0", "M1", "M2", "M3"]]
-        axs[j].boxplot(data, tick_labels=["M0", "M1", "M2", "M3"], showfliers=True)
-        axs[j].set_title(labels_drone[j], fontsize=11)
-        axs[j].set_ylabel("MSE position (m²)")
-        axs[j].grid(True, axis='y', linestyle=':', alpha=0.6)
-    fig.suptitle("Distribution des MSE par run — les points isolés = runs divergents",
-                 fontsize=12, fontweight='bold')
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig("boxplot_mse_par_run.png", dpi=110)
-    print("  boxplot_mse_par_run.png")
-
-    print("\nTerminé.")
+    main()
