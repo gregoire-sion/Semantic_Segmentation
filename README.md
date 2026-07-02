@@ -24,6 +24,9 @@ class CFG:
     TRAIN_NOISE_SWEEP = True
     TRAIN_NOISE_DB = (-10, 30)
 
+    USE_SAVED_DATASET = False
+    DATASET_PATH = None
+
     N_TRAIN   = 100
     N_VAL     = 20
     N_TEST    = 1
@@ -144,13 +147,11 @@ class SystemModel:
         return torch.tensor(B, dtype=torch.float32, device=self.device)
 
     def f(self, x, u, true=False):
-
         Fm = self.F_true if true else self.F_filter
         Bm = self.B_true if true else self.B_filter
         return torch.matmul(Fm, x) + torch.matmul(Bm, u)
 
     def h(self, x):
-
         b = x.shape[0]
         xs = x.squeeze(-1)
         x1, y1 = xs[:, 0],  xs[:, 1]
@@ -174,8 +175,8 @@ class SystemModel:
             m[4] = m[5] = m[6] = 1.0
         return m
 
-def build_command_sequence(T, dt, rng):
 
+def build_command_sequence(T, dt, rng):
     u_seq = np.zeros((T, 6), dtype=np.float32)
     A   = rng.uniform(0.9, 1.1)
     px0 = rng.uniform(0, 2*np.pi)
@@ -189,11 +190,37 @@ def build_command_sequence(T, dt, rng):
     return torch.tensor(u_seq, dtype=torch.float32).unsqueeze(-1)
 
 
-def generate_trajectory(sm: SystemModel, rng, init_perturb=True, r_scale=1.0):
+def build_command_ood(T, dt, rng, kind="3phases"):
+    u_seq = np.zeros((T, 6), dtype=np.float32)
+    if kind == "3phases":
+        phi_x = phi_y = 0.0
+        for k in range(T):
+            if k < T / 3:
+                u_seq[k] = [1., 0., 1., 0., 1., 0.]
+            elif k < 2 * T / 3:
+                phi_x += 5 * dt; phi_y += 1 * dt
+                cx, sy = np.cos(phi_x), np.sin(phi_y)
+                u_seq[k] = [cx, sy, cx, sy, cx, sy]
+            else:
+                u_seq[k] = [1., 0., 1., 0., 1., 0.]
+    elif kind == "brutal":
+        seg = max(1, T // 5)
+        for k in range(T):
+            s = (k // seg) % 4
+            amp = rng.uniform(1.5, 2.5)
+            table = {0: [amp, 0], 1: [0, amp], 2: [-amp, 0], 3: [0, -amp]}
+            ax, ay = table[s]
+            u_seq[k] = [ax, ay, ax, ay, ax, ay]
+    return torch.tensor(u_seq, dtype=torch.float32).unsqueeze(-1)
 
+
+def generate_trajectory(sm: SystemModel, rng, init_perturb=True, r_scale=1.0, u_seq=None):
     T, m, n = CFG.T, sm.m, sm.n
     dev = sm.device
-    U = build_command_sequence(T, sm.dt, rng).to(dev)
+    if u_seq is None:
+        U = build_command_sequence(T, sm.dt, rng).to(dev)
+    else:
+        U = u_seq.to(dev) if hasattr(u_seq, "to") else torch.tensor(u_seq, dtype=torch.float32, device=dev)
     sqrtR = torch.linalg.cholesky(sm.R_gen) * r_scale
 
     X = torch.zeros(T + 1, m, 1, device=dev)
@@ -233,8 +260,35 @@ def generate_dataset(sm, n_traj, seed, noise_sweep=False):
     return (torch.stack(Xs), torch.stack(Ys),
             torch.stack(Us), torch.stack(Ms))
 
-class EKF:
 
+def load_dataset(sm, path=None):
+    if path is None:
+        path = CFG.DATASET_PATH or os.path.join(CFG.OUT_DIR, "dataset.npz")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"{path} introuvable. Lance d'abord make_dataset.py.")
+    d = np.load(path)
+    X, Y, U, M = d["X"], d["Y"], d["U"], d["M"]
+    itr, iva, ite = d["idx_train"], d["idx_val"], d["idx_test"]
+
+    def pack(idx):
+        return (torch.tensor(X[idx], dtype=torch.float32, device=sm.device),
+                torch.tensor(Y[idx], dtype=torch.float32, device=sm.device),
+                torch.tensor(U[idx], dtype=torch.float32, device=sm.device),
+                torch.tensor(M[idx], dtype=torch.float32, device=sm.device))
+
+    data_train = pack(itr)
+    data_val   = pack(iva)
+    j = ite[0]
+    Xte = torch.tensor(X[j], dtype=torch.float32, device=sm.device)
+    Yte = torch.tensor(Y[j], dtype=torch.float32, device=sm.device)
+    Ute = torch.tensor(U[j], dtype=torch.float32, device=sm.device)
+    Mte = torch.tensor(M[j], dtype=torch.float32, device=sm.device)
+    print(f">> Dataset chargé : {path}")
+    print(f"   train={len(itr)}  val={len(iva)}  test={len(ite)}")
+    return data_train, data_val, (Xte, Yte, Ute, Mte)
+
+
+class EKF:
 
     def __init__(self, sm: SystemModel):
         self.sm = sm
@@ -242,7 +296,6 @@ class EKF:
         self.dev = sm.device
 
     def _jac_h(self, x):
-
         sm = self.sm
         xs = x.squeeze(-1).squeeze(0)
         H = torch.zeros(self.n, self.m, device=self.dev)
@@ -261,7 +314,6 @@ class EKF:
         return H
 
     def run(self, Y, U, M, x0=None, P0=None):
-
         sm = self.sm
         T = U.shape[0]
         x = (x0 if x0 is not None else sm.x0).clone().reshape(1, self.m, 1)
@@ -297,7 +349,6 @@ class EKF:
 
 
 class KalmanNetNN(nn.Module):
-
 
     def __init__(self, sm: SystemModel, archi="archi2",
                  in_mult=CFG.IN_MULT, out_mult=CFG.OUT_MULT):
@@ -418,7 +469,6 @@ class KalmanNetNN(nn.Module):
         return out_FC2.reshape(self.batch, self.m, self.n)
 
     def step(self, y, u, mask):
-
         self.step_prior(u)
         f1, f2, f3, f4 = self._features(y)
         if self.archi == "archi1":
@@ -458,6 +508,7 @@ def train(sm, model, data_train, data_val, tag="archi2"):
         model.train()
         perm = torch.randperm(N)
         epoch_loss = 0.0
+        n_skip = 0
         n_batches = N // CFG.N_BATCH
         for bi in range(n_batches):
             idx = perm[bi*CFG.N_BATCH:(bi+1)*CFG.N_BATCH]
@@ -472,12 +523,19 @@ def train(sm, model, data_train, data_val, tag="archi2"):
                 window_loss = window_loss + weighted_mse(xhat, Xb[:, k])
                 n_win += 1
                 if (k % tbptt == 0) or (k == T):
-                    (window_loss / n_win).backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.GRAD_CLIP)
-                    opt.step(); opt.zero_grad()
-                    epoch_loss += (window_loss / n_win).item()
+                    wl = window_loss / n_win
+                    wl.backward()
+                    gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.GRAD_CLIP)
+                    if torch.isfinite(gnorm) and torch.isfinite(wl).all():
+                        opt.step()
+                    else:
+                        n_skip += 1
+                    opt.zero_grad()
+                    epoch_loss += wl.item() if torch.isfinite(wl).all() else 0.0
                     model.detach_state()
                     window_loss = 0.0; n_win = 0
+        if n_skip > 0:
+            print(f"    [{tag}] epoch {epoch}: {n_skip} pas sautés (gradient non-fini)")
         hist_train.append(epoch_loss / max(n_batches, 1))
 
         model.eval()
@@ -519,7 +577,6 @@ def run_knet(sm, model, Y, U, M):
 
 
 def monte_carlo_knet(sm, model, seed=777, n_mc=CFG.N_MC):
-
     rng = np.random.default_rng(seed)
     errs = []
     for _ in range(n_mc):
@@ -529,6 +586,7 @@ def monte_carlo_knet(sm, model, seed=777, n_mc=CFG.N_MC):
     errs = np.stack(errs)
     sigma_emp = errs.std(axis=0)
     return sigma_emp
+
 
 LABELS = ['x', 'y', 'vx', 'vy', 'ax', 'ay', 'bx', 'by']
 BASES  = {1: 0, 2: 8, 3: 16}
@@ -550,7 +608,6 @@ def plot_loss(hist_train, hist_val, tag, outdir):
 
 def plot_drone(sm, drone, X, x_ekf, x_knet, P_ekf, temps, tag,
                sigma_mc=None, outdir=CFG.OUT_DIR):
-
     base = BASES[drone]
     fig, axs = plt.subplots(4, 2, figsize=(13, 9), sharex=True)
     axs = axs.flatten()
@@ -591,13 +648,8 @@ def plot_drone(sm, drone, X, x_ekf, x_knet, P_ekf, temps, tag,
     fig.savefig(p, dpi=130); plt.close(fig)
     return p
 
+
 def mse_db_curve(sm, model, r_levels_db, n_mc, seed=2024, ekf=None):
-    """
-    Courbe MSE[dB] vs 1/r^2[dB] (Fig.5-9 du papier). Pour chaque niveau de bruit
-    mesure, génère n_mc trajectoires, filtre avec KalmanNet (et EKF si fourni),
-    et renvoie la MSE moyenne (sur l'état complet) en dB.
-    1/r^2 [dB] = -20*log10(r_scale)  (r_scale=1 -> 0 dB de référence).
-    """
     knet_db, ekf_db = [], []
     for r_db in r_levels_db:
         r_scale = 10 ** (-r_db / 20.0)
@@ -631,7 +683,6 @@ def plot_mse_db(r_db, knet_db, ekf_db, tag, outdir):
 
 
 def nci_coverage(sm, model, P_ekf, seed=3030, n_mc=CFG.N_MC):
-
     rng = np.random.default_rng(seed)
     errs = []
     for _ in range(n_mc):
@@ -678,14 +729,16 @@ def main():
     if CFG.DEVICE.type =="cuda":
         print(f">> GPU : {torch.cuda.get_device_name(0)}")
 
-    print("== Génération des données ==")
-    data_train = generate_dataset(sm, CFG.N_TRAIN, seed=CFG.SEED, noise_sweep=CFG.TRAIN_NOISE_SWEEP)
-    data_val   = generate_dataset(sm, CFG.N_VAL,   seed=CFG.SEED + 1, noise_sweep=CFG.TRAIN_NOISE_SWEEP)
-
-    if CFG.TRAIN_NOISE_SWEEP:
-        print(f">> Entrainement avec variation de bruit 1/r2 dans {CFG.TRAIN_NOISE_DB} dB")
-    rng_test = np.random.default_rng(CFG.SEED + 99)
-    Xte, Yte, Ute, Mte = generate_trajectory(sm, rng_test)
+    print("== Préparation des données ==")
+    if CFG.USE_SAVED_DATASET:
+        data_train, data_val, (Xte, Yte, Ute, Mte) = load_dataset(sm)
+    else:
+        data_train = generate_dataset(sm, CFG.N_TRAIN, seed=CFG.SEED, noise_sweep=CFG.TRAIN_NOISE_SWEEP)
+        data_val   = generate_dataset(sm, CFG.N_VAL,   seed=CFG.SEED + 1, noise_sweep=CFG.TRAIN_NOISE_SWEEP)
+        if CFG.TRAIN_NOISE_SWEEP:
+            print(f">> Entrainement avec variation de bruit 1/r2 dans {CFG.TRAIN_NOISE_DB} dB")
+        rng_test = np.random.default_rng(CFG.SEED + 99)
+        Xte, Yte, Ute, Mte = generate_trajectory(sm, rng_test)
     temps = (np.arange(CFG.T + 1) * sm.dt)
 
     print("== EKF baseline ==")
