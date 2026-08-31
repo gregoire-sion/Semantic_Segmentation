@@ -1,4 +1,3 @@
-
 import os
 import numpy as np
 import torch
@@ -16,10 +15,10 @@ class CFG:
     MODE_MONTE_CARLO = False
     N_MC             = 50
 
-    PLOT_MSE_DB = True
+    PLOT_MSE_DB = False
     R_SWEEP_DB = [-10, -5, 0, 5, 10, 20, 30]
     N_MC_DB = 30
-    PLOT_NCI = True
+    PLOT_NCI = False
     TRAIN_NOISE_SWEEP = True
     TRAIN_NOISE_DB = (-10, 30)
 
@@ -27,10 +26,10 @@ class CFG:
     INIT_OFFSET_SCALE = 1.0
 
     USE_SAVED_DATASET = False
-    DATASET_PATH = "./Entrainement_avec_perturbation_initiale/dataset.npz"
 
-    N_TRAIN   = 200
-    N_VAL     = 40
+
+    N_TRAIN   = 400
+    N_VAL     = 80
     N_TEST    = 10
     T         = 160
     SEED      = 42
@@ -45,7 +44,12 @@ class CFG:
     IN_MULT   = 5
     OUT_MULT  = 40
 
-    OUT_DIR   = "./Dataset"
+    TRAIN_CMD_RANDOMIZE = True
+    TRAIN_CMD_FAMILIES  = ("phases3_rand", "ou")
+
+    DATASET_PATH = "./Entrainement_avec_perturbation_initiale/dataset_ood.npz" if TRAIN_CMD_RANDOMIZE else "./Entrainement_avec_perturbation_initiale/dataset.npz"
+
+    OUT_DIR   = "./Dataset_ood" if TRAIN_CMD_RANDOMIZE else "./Dataset"
     DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -179,6 +183,11 @@ class SystemModel:
 
 
 def build_command_sequence(T, dt, rng):
+    if getattr(CFG, "TRAIN_CMD_RANDOMIZE", False):
+        from ood_commands import build_command, sample_train_family
+        return build_command(T, dt, rng,
+                             kind=sample_train_family(rng, CFG.TRAIN_CMD_FAMILIES))
+
     u_seq = np.zeros((T, 6), dtype=np.float32)
     A   = rng.uniform(0.9, 1.1)
     px0 = rng.uniform(0, 2*np.pi)
