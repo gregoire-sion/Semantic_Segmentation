@@ -41,8 +41,12 @@ CONFIGS = {
 
 def entraine(nom, conf, archis=ARCHIS, n_train=None, n_val=None,
              n_epochs=None, n_batch=None, T=None, sauver_dataset=True):
-    """Entraine un modele et renvoie {archi: chemin_checkpoint}."""
-    # CFG est un etat global : on le regle avant toute generation ou
+    """Entraine un modele et renvoie {archi: chemin_checkpoint}.
+
+    Les arguments n_train ... T valent None par defaut : dans ce cas on garde
+    la valeur inscrite dans CFG. Ils ne servent qu'au mode fumee.
+    """
+    # CFG est un etat global : on le regle avant toute generation de donnees ou
     # construction de modele. Les deux modeles ne different que par les trois
     # champs familles / noise_sweep / dossier.
     CFG.OUT_DIR = conf["dossier"]
@@ -50,10 +54,16 @@ def entraine(nom, conf, archis=ARCHIS, n_train=None, n_val=None,
     CFG.TRAIN_CMD_FAMILIES = conf["familles"]
     CFG.TRAIN_NOISE_SWEEP = conf["noise_sweep"]
     CFG.DATASET_PATH = os.path.join(conf["dossier"], "dataset.npz")
-    for champ, val in (("N_TRAIN", n_train), ("N_VAL", n_val),
-                       ("N_EPOCHS", n_epochs), ("N_BATCH", n_batch), ("T", T)):
-        if val is not None:
-            setattr(CFG, champ, val)
+    if n_train is not None:
+        CFG.N_TRAIN = n_train
+    if n_val is not None:
+        CFG.N_VAL = n_val
+    if n_epochs is not None:
+        CFG.N_EPOCHS = n_epochs
+    if n_batch is not None:
+        CFG.N_BATCH = n_batch
+    if T is not None:
+        CFG.T = T
     os.makedirs(CFG.OUT_DIR, exist_ok=True)
 
     barre = "=" * 70
@@ -92,23 +102,24 @@ def entraine(nom, conf, archis=ARCHIS, n_train=None, n_val=None,
 
 def main(fumee=False):
     if fumee:
-        reglages = dict(n_train=8, n_val=4, n_epochs=2, n_batch=4, T=40,
-                        sauver_dataset=False)
         CFG.N_TEST = 2
         print(">> MODE FUMEE : config jouet, les checkpoints produits n'ont "
               "aucune valeur scientifique.")
-    else:
-        reglages = {}
 
     tous = {}
-    for nom, conf in CONFIGS.items():
-        tous[nom] = entraine(nom, conf, **reglages)
+    for nom in CONFIGS:
+        conf = CONFIGS[nom]
+        if fumee:
+            tous[nom] = entraine(nom, conf, n_train=8, n_val=4, n_epochs=2,
+                                 n_batch=4, T=40, sauver_dataset=False)
+        else:
+            tous[nom] = entraine(nom, conf)
 
     print("\n== Checkpoints produits ==")
-    for nom, chemins in tous.items():
-        for archi, p in sorted(chemins.items()):
-            print(f"   {nom:16s} {archi} -> {p}")
-    print("\nEtape suivante : python eval_generalization.py")
+    for nom in tous:
+        for archi in sorted(tous[nom]):
+            print(f"   {nom:16s} {archi} -> {tous[nom][archi]}")
+    print("\nEtape suivante : python etude_generalisation.py")
     return tous
 
 

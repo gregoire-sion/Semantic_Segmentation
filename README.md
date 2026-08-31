@@ -69,10 +69,20 @@ ce qui rend les axes comparables entre eux.
 | **géométrie** | formation `triangle` (réf), `colinéaire` (jacobienne de `h` déficiente en rang), `serrée`, `large` |
 | **condition initiale** | perturbation de l'état initial `× {0, 0.5, 1, 2, 3, 5}` ; les filtres partent toujours du `x0` nominal |
 
-Deux métriques fines complètent le Δ_dB global : **par blocs de 160 pas**
-(révèle la dérive sur l'axe horizon, qu'une moyenne globale masque) et
-**transitoire / établi** (quantifie la reconvergence après une panne GPS ou une
-erreur d'état initial).
+Le Δ_dB est calculé sur cinq fenêtres temporelles, pour voir ce qu'une moyenne
+globale masquerait :
+
+| fenêtre | ce qu'elle mesure |
+|---|---|
+| `total` | toute la trajectoire — c'est le Δ_dB rapporté dans le tableau |
+| `transitoire` | les 2 premières secondes : reconvergence après une erreur d'état initial |
+| `etabli` | les 2 dernières secondes : régime permanent |
+| `bloc_debut` | les 160 premiers pas |
+| `bloc_fin` | les 160 derniers pas |
+
+Le rapport entre `bloc_fin` et `bloc_debut` mesure la **dérive** quand `T` dépasse
+l'horizon vu à l'entraînement : si le réseau décroche au-delà de 160 pas, l'écart
+entre ces deux fenêtres le montre directement.
 
 ## Utilisation
 
@@ -81,7 +91,7 @@ pip install -r requirements.txt
 
 python tests_generalisation.py       # vérifie l'outillage (~1 min)
 python train_models.py               # entraîne A et B × 2 architectures
-python eval_generalization.py        # cartographie les 51 scénarios
+python etude_generalisation.py       # cartographie les 51 scénarios
 ```
 
 Ajouter `--fumee` à l'un des deux derniers pour une version jouet qui valide le
@@ -98,11 +108,11 @@ séries temporelles sur les cas les plus parlants.
 |---|---|
 | `KalmanNet_Drones.py` | modèle système, EKF, KalmanNet, entraînement, tracés |
 | `ood_commands.py` | 7 familles de commandes (`build_command`) |
-| `scenarios.py` | description déclarative des 51 scénarios |
+| `etude_generalisation.py` | l'étude complète : scénarios, évaluation, figures |
 | `train_models.py` | entraîne les modèles A et B |
-| `eval_generalization.py` | banc d'essai des 6 axes |
 | `eval_ood.py` | banc d'essai historique, axe commandes seul (référence de non-régression) |
 | `tests_generalisation.py` | tests, dont la non-régression bit-à-bit de `generate_trajectory` |
+| `KalmanNet_Drones_origine.py` | copie figée d'avant modification, servant de référence aux tests — ne pas modifier |
 | `generate_dataset.py` | génération hors ligne d'un dataset avec split disjoint |
 | `test.py` | évaluation sur une trajectoire à état initial décalé |
 
@@ -120,6 +130,15 @@ séries temporelles sur les cas les plus parlants.
   `CFG.OUT_MULT` et `CFG.N_MC` comme **valeurs par défaut d'arguments, évaluées
   à l'import** : muter `CFG` après coup ne les change pas. Tout balayage
   d'architecture doit passer ces valeurs explicitement.
+- Chaque scénario tire ses trajectoires avec la graine `SEED_EVAL + numero`, où
+  `numero` est son rang dans la liste. Surtout pas `hash(nom)` : Python randomise
+  le hachage des chaînes à chaque lancement, deux exécutions ne donneraient pas
+  les mêmes chiffres.
+- `etude_generalisation.py` est volontairement écrit sans `dataclass`, sans
+  générateur et sans compréhension imbriquée : il se lit de haut en bas, dans le
+  même style que `KalmanNet_Drones.py`. Un scénario est un simple dictionnaire,
+  et les valeurs par défaut de la fonction `scenario()` **sont** les conditions
+  d'entraînement — un scénario ne mentionne que ce qu'il fait varier.
 - Le README a servi de bloc-notes de code pendant 38 révisions avant d'être
   vidé. `ood_commands.py` et `eval_ood.py` ont été restaurés depuis le commit
   `f438312`. Les sources ne reviennent pas ici.
