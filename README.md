@@ -102,6 +102,174 @@ Sorties dans `./eval_generalisation/` : `tableau.md` (Δ_dB prêt à coller dans
 rapport), `resultats.json`, une figure par axe, une figure de synthèse, et des
 séries temporelles sur les cas les plus parlants.
 
+## Résultats
+
+Étude complète : 51 scénarios, `N_MC = 20`, quatre estimateurs appris
+(A/B × archi1/archi2) comparés à l'EKF sur les mêmes trajectoires.
+
+### Le plancher de bruit, à lire avant tout le reste
+
+Les 9 scénarios *nominaux* décrivent la même condition d'entraînement. Ils en
+donnent donc 9 estimations indépendantes, et leur dispersion mesure directement
+la précision de l'étude :
+
+| modèle | Δ_dB min | Δ_dB max | étendue | écart-type |
+|---|---|---|---|---|
+| A / archi1 | +1.18 | +13.76 | 12.6 dB | 4.9 dB |
+| A / archi2 | −2.06 | +2.90 | 5.0 dB | 1.7 dB |
+| B / archi1 | +1.92 | +15.47 | 13.6 dB | 4.3 dB |
+| B / archi2 | −2.31 | +4.60 | 6.9 dB | 2.2 dB |
+
+La MSE de l'EKF elle-même varie d'un facteur 2,4 sur ces conditions identiques.
+
+**Conséquence : avec `N_MC = 20`, un écart inférieur à ~5 dB (archi2) ou ~10 dB
+(archi1) n'est pas interprétable.** Les effets rapportés ci-dessous dépassent
+tous ce seuil. Pour conclure sur des différences plus fines, il faut augmenter
+`N_MC`.
+
+Second avertissement : quand `div_rate` est élevé, la moyenne des MSE est
+dominée par quelques trajectoires qui explosent, et le Δ_dB perd son sens. Au
+delà de ~30 % de divergence, c'est le taux lui-même qu'il faut lire, pas le Δ_dB.
+
+### Synthèse — pire Δ_dB de chaque groupe
+
+| groupe | A/archi1 | A/archi2 | B/archi1 | B/archi2 |
+|---|---|---|---|---|
+| commandes | +27.8 | +61.9 | +6.7 | **+4.6** |
+| horizon | +308.7 | +114.0 | +162.1 | +289.0 |
+| capteurs | +148.4 | +17.2 | +92.0 | +42.6 |
+| bruit | +40.8 | +96.3 | +23.2 | +65.3 |
+| géométrie | +39.9 | +28.5 | +22.2 | +55.5 |
+| condition initiale | +21.9 | +3.3 | +13.4 | +35.9 |
+
+Divergences cumulées : A/archi1 29 scénarios sur 51, A/archi2 17, B/archi1 19,
+**B/archi2 8**.
+
+### 1. L'horizon est le point de rupture, et c'est une dérive pure
+
+C'est le résultat principal. Les fenêtres `bloc_debut` et `bloc_fin` le
+tranchent sans ambiguïté :
+
+| | A/archi1 | | A/archi2 | | B/archi1 | | B/archi2 | |
+|---|---|---|---|---|---|---|---|---|
+| | début | fin | début | fin | début | fin | début | fin |
+| T = 160 | +3.2 | +3.2 | −1.3 | −1.3 | +2.5 | +2.5 | −1.1 | −1.1 |
+| T = 320 | +3.6 | +37.7 | +0.7 | +4.2 | +1.9 | +13.1 | +1.1 | +4.4 |
+| T = 480 | +3.4 | +159.2 | −7.0 | +1.3 | +3.6 | +54.8 | −3.2 | +95.0 |
+| T = 960 | **−0.0** | **+312.0** | **+0.2** | **+117.3** | **+2.6** | **+165.4** | **−1.1** | **+292.3** |
+
+À T = 960, sur les 160 **premiers** pas les quatre modèles sont exactement au
+niveau de leur performance nominale. Sur les 160 **derniers**, ils sont à
++117 dB au mieux. Le transitoire reste à ~0 dB partout, donc ce n'est pas un
+problème d'initialisation.
+
+**Le réseau reste aussi bon qu'à l'entraînement dans l'horizon qu'il a vu, et
+diverge au-delà.** Aucun des quatre n'y échappe, y compris le meilleur.
+
+### 2. La diversité d'entraînement ne se transfère pas d'un axe à l'autre
+
+Écart médian B − A (négatif = le modèle randomisé est meilleur) :
+
+| axe | archi1 | archi2 |
+|---|---|---|
+| commandes | **−14.0** | **−3.3** |
+| amplitude | **−18.1** | **−17.6** |
+| cadence | +0.7 | +0.0 |
+| panne | −0.0 | +1.7 |
+| aberrations | +1.3 | −0.1 |
+| bruit (mesure) | −1.9 | −3.1 |
+| bruit (process) | −0.7 | −0.9 |
+| géométrie | +1.0 | +1.2 |
+| condition initiale | −0.0 | +0.2 |
+
+Le modèle B écrase le modèle A sur l'axe des commandes — jusqu'à −61 dB sur la
+famille `virage`, où A/archi2 atteint +61.9 dB. C'est la confirmation nette de
+l'intérêt de la randomisation.
+
+Mais ce bénéfice **ne dépasse pas l'axe sur lequel la diversité a été
+introduite**. Sur les cinq autres groupes, l'écart médian est compris entre
+−1.9 et +1.7 dB, c'est-à-dire dans le bruit. Sur la géométrie colinéaire,
+B/archi2 (+55.5) est même nettement pire que A/archi2 (+28.5).
+
+### 3. Plus de mesures casse le réseau, moins de mesures ne le gêne pas
+
+Contre-intuitif, et net sur les quatre modèles :
+
+| ratio_gps | EKF | A/archi1 | A/archi2 | B/archi1 | B/archi2 | divergences |
+|---|---|---|---|---|---|---|
+| **1** (5× plus qu'à l'entraînement) | 6.59 | **+148.4** | **+17.2** | **+92.0** | **+42.6** | 15 % partout |
+| 2 | 9.86 | +45.2 | −2.2 | +13.3 | −0.7 | 0–5 % |
+| 5 *(entraînement)* | 15.32 | +1.3 | −0.7 | +2.0 | −0.6 | 0 % |
+| 10 | 12.70 | +2.0 | −1.4 | +8.3 | −2.5 | 0 % |
+| 20 | 16.19 | +8.5 | +3.3 | +10.7 | +2.1 | 0 % |
+
+Donner au réseau **plus** d'information qu'il n'en a vu le détruit, alors qu'il
+encaisse sans peine d'en recevoir quatre fois moins. Les statistiques
+d'innovation dépendent de la cadence de mesure, et le gain appris y est calé.
+
+### 4. Le bruit de mesure : effondrement d'un côté seulement
+
+Entraînement sur `1/r² ∈ [−10, 30] dB`.
+
+| 1/r² | EKF | A/archi2 | B/archi2 | divergences (B/archi2) |
+|---|---|---|---|---|
+| −30 dB *(hors plage)* | 536.6 | +96.3 | +65.3 | **100 %** |
+| −20 dB *(hors plage)* | 264.1 | +51.2 | +48.1 | 5 % |
+| −10 dB *(bord)* | 54.6 | −3.1 | **−6.1** | 0 % |
+| 0 dB *(nominal)* | 12.7 | +0.8 | +1.6 | 0 % |
+| +40 dB *(hors plage)* | 3.9 | +10.6 | +4.2 | 0 % |
+| +50 dB *(hors plage)* | 5.0 | +8.4 | +3.9 | 0 % |
+
+Des mesures **plus bruitées** que vues à l'entraînement provoquent un
+effondrement total (100 % de divergence à −30 dB). Des mesures **plus propres**
+ne coûtent que 4 à 10 dB, sans divergence. L'extrapolation n'est pas symétrique.
+
+### 5. Là où KalmanNet bat vraiment l'EKF
+
+Seuls les écarts au-delà du plancher de bruit sont retenus (Δ_dB < −4 dB) :
+
+| scénario | modèle | Δ_dB | MSE EKF | divergences |
+|---|---|---|---|---|
+| panne GPS de 10 s | A/archi2 | **−8.4** | 210.5 | 0 % |
+| panne GPS de 10 s | B/archi2 | −5.7 | 210.5 | 0 % |
+| 5 % de mesures aberrantes | A/archi2 | **−6.9** | 49.6 | 0 % |
+| 5 % de mesures aberrantes | B/archi2 | −5.1 | 49.6 | 0 % |
+| bruit de mesure −10 dB | B/archi2 | −6.1 | 54.6 | 0 % |
+| état initial exact (offset 0) | A/archi1 | −11.9 | 4.2 | 0 % |
+| état initial exact (offset 0) | B/archi2 | −10.4 | 4.2 | 0 % |
+
+Le point commun : ce sont les situations où les hypothèses figées de l'EKF
+coûtent le plus cher — une panne prolongée, des mesures aberrantes que son `R`
+constant ne sait pas rejeter. **KalmanNet gagne exactement là où le modèle de
+l'EKF est faux**, ce qui est sa promesse. Ces gains sont obtenus sans aucune
+divergence.
+
+### 6. La géométrie colinéaire met tout le monde en échec
+
+| formation | EKF | A/archi1 | A/archi2 | B/archi1 | B/archi2 |
+|---|---|---|---|---|---|
+| triangle *(entraînement)* | 10.5 | +12.2 | +2.4 | +15.5 | +2.1 |
+| **colinéaire** | 73.0 | +39.9 *(90 % div)* | +28.5 *(35 %)* | +22.2 *(65 %)* | +55.5 *(65 %)* |
+| serrée | 31.2 | +28.9 *(40 %)* | +1.8 | +13.4 | +3.1 |
+| large | 6.4 | −0.4 | +0.6 | +0.6 | +0.6 |
+
+Quand les trois drones sont alignés, la jacobienne de `h` perd son rang : les
+trois distances ne portent plus que deux informations indépendantes. L'EKF s'y
+dégrade d'un facteur 7 mais survit ; les réseaux divergent dans 35 à 90 % des
+cas.
+
+### Ce que ces résultats disent
+
+`archi2` domine `archi1` partout, et `B/archi2` est le seul des quatre à rester
+utilisable : 8 scénarios sur 51 avec au moins une divergence, contre 29 pour
+A/archi1. Dans son domaine d'entraînement — horizon de 160 pas, cadence de
+mesure connue, bruit dans la plage vue, formation triangulaire — il fait jeu
+égal avec l'EKF et le bat nettement sur les pannes et les aberrations.
+
+En dehors, il casse. Et les cinq modes de rupture identifiés (horizon, cadence
+plus rapide, bruit plus fort, géométrie dégénérée, offset initial important)
+ne sont pas corrigés par la randomisation des commandes.
+
 ## Fichiers
 
 | fichier | rôle |
