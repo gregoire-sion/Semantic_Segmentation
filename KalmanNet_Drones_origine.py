@@ -1,3 +1,17 @@
+# =====================================================================
+# COPIE FIGEE - NE JAMAIS MODIFIER CE FICHIER
+# =====================================================================
+# Version de KalmanNet_Drones.py telle qu'elle etait AVANT l'ajout des
+# parametres de l'etude de generalisation (commit 709a88b).
+#
+# Elle ne sert qu'a une chose : tests_generalisation.py compare la sortie de
+# generate_trajectory() entre cette version et la version actuelle, pour
+# prouver qu'elles produisent exactement les memes trajectoires. C'est ce qui
+# garantit que les checkpoints entraines avant la modification restent valides.
+#
+# Ce fichier n'est importe par rien d'autre. Ne pas l'utiliser pour entrainer.
+# =====================================================================
+
 import os
 import numpy as np
 import torch
@@ -53,41 +67,16 @@ class CFG:
     DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-FORMATIONS = {
-    "triangle": ((0.0, 10.0), (10.0, 0.0), (0.0, -10.0)),   # reference (x0 d'origine)
-    "ligne":    ((0.0,  0.0), (10.0, 0.0), (20.0,  0.0)),   # colineaire : d13 = d12 + d23
-    "serree":   ((0.0,  1.0), ( 1.0, 0.0), (0.0,  -1.0)),   # petites distances : h tres non lineaire
-    "large":    ((0.0, 40.0), (40.0, 0.0), (0.0, -40.0)),   # grandes distances : h quasi lineaire
-}
-
-
-def make_formation(kind="triangle", vx=1.0, bias_d2=(0.5, -0.2)):
-    """Construit un x0 (24,) pour une geometrie de formation donnee.
-
-    Seules les positions changent : vitesse initiale et biais IMU du drone 2
-    sont conserves, pour que la geometrie soit le SEUL facteur qui varie.
-    make_formation("triangle") reproduit exactement le x0 code en dur d'origine.
-    """
-    if kind not in FORMATIONS:
-        raise ValueError(f"formation inconnue : {kind!r}. "
-                         f"Disponibles : {sorted(FORMATIONS)}")
-    blocs = []
-    for i, (px, py) in enumerate(FORMATIONS[kind]):
-        bx, by = bias_d2 if i == 1 else (0.0, 0.0)
-        blocs.append([px, py, vx, 0.0, 0.0, 0.0, bx, by])
-    return np.concatenate(blocs).astype(np.float32)
-
-
 class SystemModel:
-    def __init__(self, device=CFG.DEVICE, x0=None, ratio_gps=None, ratio_imu=None):
+    def __init__(self, device=CFG.DEVICE):
         self.device = device
         self.dt = 0.1
         self.n_drone = 3
         self.n_var = 8
         self.m = self.n_drone * self.n_var
         self.n = 7
-        self.ratio_imu = 1 if ratio_imu is None else int(ratio_imu)
-        self.ratio_gps = 5 if ratio_gps is None else int(ratio_gps)
+        self.ratio_imu = 1
+        self.ratio_gps = 5
 
         sig_accel = 5e-2
         sig_autre = 1e-6
@@ -131,16 +120,9 @@ class SystemModel:
             P0[b+6, b+6] = P0[b+7, b+7] = sP_b**2
         self.P0 = torch.tensor(P0, dtype=torch.float32, device=device)
 
-        if x0 is None:
-            x0 = np.concatenate(([0,  10, 1, 0, 0, 0, 0,    0],
-                                 [10,  0, 1, 0, 0, 0, 0.5, -0.2],
-                                 [0, -10, 1, 0, 0, 0, 0,    0])).astype(np.float32)
-        elif isinstance(x0, str):
-            x0 = make_formation(x0)
-        else:
-            x0 = np.asarray(x0, dtype=np.float32).reshape(-1)
-            if x0.size != self.m:
-                raise ValueError(f"x0 doit avoir {self.m} composantes, recu {x0.size}")
+        x0 = np.concatenate(([0,  10, 1, 0, 0, 0, 0,    0],
+                             [10,  0, 1, 0, 0, 0, 0.5, -0.2],
+                             [0, -10, 1, 0, 0, 0, 0,    0])).astype(np.float32)
         self.x0 = torch.tensor(x0, dtype=torch.float32, device=device).reshape(self.m, 1)
 
         self.prior_Q     = self.Q.clone()
@@ -262,26 +244,13 @@ def build_command_ood(T, dt, rng, kind="3phases"):
     return torch.tensor(u_seq, dtype=torch.float32).unsqueeze(-1)
 
 
-def generate_trajectory(sm, rng, init_perturb=True, r_scale=1.0, u_seq=None,
-                        T=None, q_scale=1.0, offset_scale=None):
-    """Genere une trajectoire (X, Y, U, M).
-
-    Parametres ajoutes pour l'etude de generalisation. Leurs valeurs par defaut
-    reproduisent a l'identique (bit a bit) le comportement d'origine :
-      T            : horizon ; None -> CFG.T, ou la longueur de u_seq si fourni.
-      q_scale      : facteur multiplicatif sur l'ecart-type du bruit de process.
-      offset_scale : amplitude de la perturbation initiale ; None -> CFG.INIT_OFFSET_SCALE.
-    """
-    m, n = sm.m, sm.n
+def generate_trajectory(sm, rng, init_perturb=True, r_scale=1.0, u_seq=None):
+    T, m, n = CFG.T, sm.m, sm.n
     dev = sm.device
     if u_seq is None:
-        T = CFG.T if T is None else int(T)
         U = build_command_sequence(T, sm.dt, rng).to(dev)
     else:
         U = u_seq.to(dev) if hasattr(u_seq, "to") else torch.tensor(u_seq, dtype=torch.float32, device=dev)
-        T = U.shape[0] if T is None else int(T)
-        if U.shape[0] != T:
-            raise ValueError(f"u_seq fournit {U.shape[0]} pas de commande mais T={T}")
     sqrtR = torch.linalg.cholesky(sm.R_gen) * r_scale
 
     X = torch.zeros(T + 1, m, 1, device=dev)
@@ -290,19 +259,18 @@ def generate_trajectory(sm, rng, init_perturb=True, r_scale=1.0, u_seq=None,
 
     x = sm.x0.clone()
     if init_perturb:
-        off = CFG.INIT_OFFSET_SCALE if offset_scale is None else float(offset_scale)
         if CFG.INIT_OFFSET_P0:
             L = torch.linalg.cholesky(sm.P0)
             xi = torch.tensor(rng.normal(0, 1, size=m), dtype=torch.float32, device=dev).reshape(m, 1)
-            x = x + off * (L @ xi)
+            x = x + CFG.INIT_OFFSET_SCALE * (L @ xi)
         else:
             for b in (0, 8, 16):
-                x[b:b+2, 0] += off * torch.tensor(rng.normal(0, 2.0, size=2), dtype=torch.float32, device=dev)
+                x[b:b+2, 0] += torch.tensor(rng.normal(0, 2.0, size=2), dtype=torch.float32, device=dev)
     X[0] = x
 
     for k in range(1, T + 1):
         u = U[k-1].unsqueeze(0)
-        w = (torch.randn(m, 1, device=dev) * (sm.w_sigma * q_scale).reshape(m, 1))
+        w = (torch.randn(m, 1, device=dev) * sm.w_sigma.reshape(m, 1))
         x = sm.f(x.unsqueeze(0), u, true=True).squeeze(0) + w
         X[k] = x
         y_clean = sm.h(x.unsqueeze(0)).squeeze(0)
@@ -310,46 +278,6 @@ def generate_trajectory(sm, rng, init_perturb=True, r_scale=1.0, u_seq=None,
         Y[k] = y_clean + v
         M[k] = sm.obs_mask(k)
     return X, Y, U, M
-
-
-# Raccourcis de groupes de capteurs, pour corrupt_observations().
-# Les indices sont ceux des 7 lignes de h() : [x1, y1, imu_x, imu_y, d12, d23, d13].
-# Couper CAPTEURS_GPS revient donc a supprimer le GPS du drone 1 ET les trois
-# distances inter-drones : il ne reste que l'accelerometre.
-CAPTEURS_GPS = [0, 1, 4, 5, 6]
-CAPTEURS_IMU = [2, 3]
-
-
-def corrupt_observations(Y, M, rng, sm, outages=(), outlier_rate=0.0,
-                         outlier_scale=10.0):
-    """Degrade des mesures deja generees : pannes capteur et valeurs aberrantes.
-
-    Post-traitement pur : inutile de regenerer la trajectoire, la verite X reste
-    la meme. Les entrees ne sont jamais mutees, des copies sont renvoyees.
-
-      outages       : iterable de (k_debut, k_fin, capteurs), bornes incluses.
-                      Met le masque a 0 -> le filtre ne recoit plus rien de ces
-                      capteurs, exactement comme une indisponibilite reelle.
-      outlier_rate  : probabilite, par mesure DISPONIBLE, d'etre corrompue par
-                      un bruit d'ecart-type outlier_scale * sqrt(diag(R_gen)).
-    """
-    Yc = Y.clone()
-    Mc = M.clone()
-    for k0, k1, capteurs in outages:
-        Mc[int(k0):int(k1) + 1, list(capteurs)] = 0.0
-    if outlier_rate > 0.0:
-        Tp1 = Mc.shape[0]
-        dev = Yc.device
-        sigma = torch.sqrt(torch.diag(sm.R_gen)).reshape(1, sm.n)
-        # touche est vrai sur les mesures a corrompre : disponibles (Mc > 0) et
-        # tirees au hasard. Multiplier le bruit par ce masque converti en 0/1
-        # ne laisse passer que celles-la.
-        touche = torch.tensor(rng.random((Tp1, sm.n)) < outlier_rate,
-                              device=dev) & (Mc > 0)
-        bruit = torch.tensor(rng.normal(0.0, 1.0, size=(Tp1, sm.n)),
-                             dtype=torch.float32, device=dev) * sigma * outlier_scale
-        Yc[:, :, 0] = Yc[:, :, 0] + bruit * touche.float()
-    return Yc, Mc
 
 
 def generate_dataset(sm, n_traj, seed, noise_sweep=False):
@@ -404,24 +332,6 @@ def load_dataset(sm, path=None):
     print(f">> Dataset chargé : {path}")
     print(f"   train={data_train[0].shape[0]}  val={data_val[0].shape[0]}  test={to('Xte').shape[0]} (1 utilisée)")
     return data_train, data_val, (Xte, Yte, Ute, Mte)
-
-
-def load_ood(sm, path=None):
-    """Charge les trajectoires OOD ecrites par generate_dataset.py.
-
-    Renvoie {famille: (X, Y, U, M)}. Ces trajectoires sont sauvegardees depuis
-    toujours mais n'etaient lues nulle part.
-    """
-    if path is None:
-        path = CFG.DATASET_PATH or os.path.join(CFG.OUT_DIR, "dataset.npz")
-    d = np.load(path)
-    familles = sorted(k[len("Xood_"):] for k in d.files if k.startswith("Xood_"))
-    out = {}
-    for kind in familles:
-        out[kind] = tuple(
-            torch.tensor(d[f"{p}ood_{kind}"], dtype=torch.float32, device=sm.device)
-            for p in ("X", "Y", "U", "M"))
-    return out
 
 
 class EKF:
@@ -622,24 +532,6 @@ class KalmanNetNN(nn.Module):
 
     def forward(self, y, u, mask):
         return self.step(y, u, mask)
-
-
-def rebind(model, sm):
-    """Rattache un modele deja entraine a un autre SystemModel.
-
-    KalmanNetNN capture sm a la construction (self.f, self.h, self.prior_*).
-    Un scenario qui change la geometrie ou la cadence des capteurs construit un
-    nouveau SystemModel : sans cette reattache, le modele continuerait d'utiliser
-    l'ancien x0 et l'ancien h. Q, P0 et R sont inchanges par ces deux axes, donc
-    les priors qui initialisent les GRU d'archi2 restent identiques.
-    """
-    model.sm = sm
-    model.f = sm.f
-    model.h = sm.h
-    model.prior_Q = sm.prior_Q
-    model.prior_Sigma = sm.prior_Sigma
-    model.prior_S = sm.prior_S
-    return model
 
 
 def train(sm, model, data_train, data_val, tag="archi2"):

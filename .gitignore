@@ -205,3 +205,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Sorties de l'etude de generalisation (checkpoints, datasets, figures)
+/Dataset/
+/Dataset_ood/
+/Entrainement_*/
+/eval_ood/
+/eval_generalisation/
+*.pt
+*.npz
