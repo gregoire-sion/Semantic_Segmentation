@@ -111,7 +111,8 @@ def test_formations():
 
     positions = {}
     for forme in ETUDE.LIBELLES_FORMATION:
-        positions[forme] = SystemModel(x0=forme).x0.reshape(3, 8)[:, :2].numpy()
+        # .cpu() avant .numpy() : indispensable sur GPU, sans effet en CPU.
+        positions[forme] = SystemModel(x0=forme).x0.reshape(3, 8)[:, :2].cpu().numpy()
         p = positions[forme]
         print(f"      {forme:9s} d12={distance(p, 0, 1):6.2f} "
               f"d23={distance(p, 1, 2):6.2f} d13={distance(p, 0, 2):6.2f}")
@@ -290,6 +291,7 @@ def test_scenarios():
 
 
 if __name__ == "__main__":
+    print(f">> Device : {CFG.DEVICE}  |  CUDA disponible : {torch.cuda.is_available()}")
     CFG.TRAIN_CMD_RANDOMIZE = False   # l'evaluation impose ses commandes via u_seq
     test_non_regression()
     test_formations()
