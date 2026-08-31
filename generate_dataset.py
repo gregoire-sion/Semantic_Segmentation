@@ -20,7 +20,11 @@ def _np(x):
 
 
 def main():
+    # Le dataset ne vit pas forcement dans OUT_DIR : creer les deux.
     os.makedirs(CFG.OUT_DIR, exist_ok=True)
+    parent = os.path.dirname(DATASET_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     sm = SystemModel()
     rng = np.random.default_rng(SEED)
 
@@ -69,15 +73,20 @@ def main():
         ood[f"Mood_{kind}"] = np.stack(Mo)
         print(f"   {kind} : {N_OOD} trajectoires")
 
+    # Schema aligne sur load_dataset() de KalmanNet_Drones.py : les splits sont
+    # materialises (Xtr/Xva/Xte...) et non plus laisses sous forme d'index sur
+    # un pool unique, sinon USE_SAVED_DATASET=True leve un KeyError.
     np.savez_compressed(
         DATASET_PATH,
-        X=X, Y=Y, U=U, M=M,
+        Xtr=X[idx_train], Ytr=Y[idx_train], Utr=U[idx_train], Mtr=M[idx_train],
+        Xva=X[idx_val],   Yva=Y[idx_val],   Uva=U[idx_val],   Mva=M[idx_val],
+        Xte=X[idx_test],  Yte=Y[idx_test],  Ute=U[idx_test],  Mte=M[idx_test],
         idx_train=idx_train, idx_val=idx_val, idx_test=idx_test,
         seed=SEED, noise_sweep=NOISE_SWEEP,
         **ood,
     )
     size_mb = os.path.getsize(DATASET_PATH) / 1e6
-    print(f"\n== Sauvegardé -> {DATASET_PATH}")
+    print(f"\n== Sauvegardé -> {DATASET_PATH}  ({size_mb:.1f} Mo)")
 
 
 if __name__ == "__main__":
