@@ -1,280 +1,120 @@
-"""
-Entraînement de la BASELINE A : archi2, configuration étroite.
+== Run : baseline_narrow_archi2_seed42 ==
+   sortie  : ./runs/baseline_narrow_archi2_seed42
+   device  : cuda
+   config  : noise_sweep=False cmd_randomize=False init_offset=0.3
+   graines : train=42 val=43 test=141
 
-Configuration étroite = un seul point de fonctionnement nominal :
-  - bruit de mesure fixe (pas de balayage)
-  - une seule famille de commande (les 3 phases historiques)
-  - perturbation initiale faible (0.3 x l'écart-type de P0)
+== Génération des données ==
+>> Dataset sauvegardé -> ./runs/baseline_narrow_archi2_seed42/dataset.npz
+   train=400  val=80  test=50
+   62.8 s
 
-Ce modèle sert de référence à toute l'étude de généralisation.
-Le modèle B (randomisation de domaine) s'entraîne avec le même script
-en mettant NARROW = False.
+== Entraînement archi2 ==
+   paramètres : 24107793
+[archi2] epoch   0 | train 4.5580e+07 | val 2.4723e-01 | best 2.4723e-01
+[archi2] epoch   5 | train 7.1317e-01 | val 9.1361e-02 | best 8.3679e-02
+[archi2] epoch  10 | train 6.7440e-01 | val 8.5288e-02 | best 8.3679e-02
+[archi2] epoch  15 | train 6.5094e-01 | val 8.8591e-02 | best 8.2391e-02
+[archi2] epoch  20 | train 6.2919e-01 | val 8.1348e-02 | best 7.9602e-02
+[archi2] epoch  25 | train 6.5406e-01 | val 7.7902e-02 | best 7.7902e-02
+[archi2] epoch  30 | train 5.7720e-01 | val 8.9756e-02 | best 7.7902e-02
+[archi2] epoch  35 | train 5.7812e-01 | val 8.4868e-02 | best 7.7902e-02
+[archi2] epoch  39 | train 5.6161e-01 | val 8.1408e-02 | best 7.7902e-02
+[archi2] modèle sauvé -> ./runs/baseline_narrow_archi2_seed42/knet_archi2.pt
+   loss train divisée par 8 (fenêtres TBPTT) pour l'affichage
 
-Lancer trois fois en changeant SEED (42, 1234, 7) pour mesurer la
-variabilité due à l'initialisation.
-"""
+== Évaluation en distribution ==
+groupe             MSE KNet      MSE EKF    gain dB
+position             0.9762       3.1387      -5.07
+vitesse              0.0275       0.0851      -4.90
+acceleration         0.0040       0.0140      -5.49
+biais                0.0598       0.0651      -0.38
 
-import os
-import json
-import math
-import time
+   Delta_dB (position) : -5.41 +/- 1.81 dB (IC95, n=50)
+   Delta_dB < 0  =>  KalmanNet meilleur que l'EKF
 
-import numpy as np
-import torch
-
-from KalmanNet_Drones import (
-    CFG, SystemModel, EKF, KalmanNetNN,
-    generate_dataset, save_dataset, train, run_knet, plot_loss,
-)
-
-
-# ==========================================================================
-# 1. RÉGLAGES DE L'EXPÉRIENCE
-#    Les seules lignes à modifier d'un run à l'autre.
-# ==========================================================================
-
-SEED = 42                     # changer ici : 42, puis 1234, puis 7
-NARROW = True                 # True = baseline A (étroite), False = modèle B
-ARCHI = "archi2"
-
-# Tailles des jeux de données
-N_TRAIN = 400
-N_VAL = 80
-N_TEST = 50                   # >= 50 pour avoir un intervalle de confiance utile
-
-# Point de fonctionnement de la configuration ÉTROITE
-NARROW_INIT_OFFSET_SCALE = 0.3
-
-# Réglages de la configuration LARGE (modèle B)
-WIDE_NOISE_DB = (-10, 30)
-WIDE_INIT_OFFSET_SCALE = 1.0
-
-# Où tout est écrit
-RUN_NAME = f"baseline_{'narrow' if NARROW else 'wide'}_{ARCHI}_seed{SEED}"
-OUT_DIR = os.path.join("./runs", RUN_NAME)
+== Manifeste  -> ./runs/baseline_narrow_archi2_seed42/manifest.json
+== Figure     -> ./runs/baseline_narrow_archi2_seed42/loss_archi2.png
+== Checkpoint -> ./runs/baseline_narrow_archi2_seed42/knet_archi2.pt
 
 
-# ==========================================================================
-# 2. DÉCOUPAGE DU VECTEUR D'ÉTAT
-#    24 composantes = 3 drones x 8 variables (x, y, vx, vy, ax, ay, bx, by).
-# ==========================================================================
+== Run : baseline_narrow_archi2_seed1234 ==
+   sortie  : ./runs/baseline_narrow_archi2_seed1234
+   device  : cuda
+   config  : noise_sweep=False cmd_randomize=False init_offset=0.3
+   graines : train=1234 val=1235 test=1333
 
-BASES = (0, 8, 16)            # indice de départ de chaque drone
+== Génération des données ==
+>> Dataset sauvegardé -> ./runs/baseline_narrow_archi2_seed1234/dataset.npz
+   train=400  val=80  test=50
+   112.7 s
 
-GROUPES = {
-    "position":     [b + i for b in BASES for i in (0, 1)],
-    "vitesse":      [b + i for b in BASES for i in (2, 3)],
-    "acceleration": [b + i for b in BASES for i in (4, 5)],
-    "biais":        [b + i for b in BASES for i in (6, 7)],
-}
+== Entraînement archi2 ==
+   paramètres : 24107793
+[archi2] epoch   0 | train 1.6840e+11 | val 1.5878e-01 | best 1.5878e-01
+[archi2] epoch   5 | train 7.3711e-01 | val 8.5678e-02 | best 8.5678e-02
+[archi2] epoch  10 | train 6.9540e-01 | val 8.8265e-02 | best 8.5678e-02
+[archi2] epoch  15 | train 6.6412e-01 | val 1.0087e-01 | best 8.5678e-02
+[archi2] epoch  20 | train 6.2068e-01 | val 7.9550e-02 | best 7.9550e-02
+[archi2] epoch  25 | train 6.1173e-01 | val 8.4831e-02 | best 7.9550e-02
+[archi2] epoch  30 | train 5.8578e-01 | val 8.5414e-02 | best 7.9550e-02
+[archi2] epoch  35 | train 5.8621e-01 | val 8.5340e-02 | best 7.9550e-02
+[archi2] epoch  39 | train 5.6991e-01 | val 9.3378e-02 | best 7.9550e-02
+[archi2] modèle sauvé -> ./runs/baseline_narrow_archi2_seed1234/knet_archi2.pt
+   loss train divisée par 8 (fenêtres TBPTT) pour l'affichage
 
+== Évaluation en distribution ==
+groupe             MSE KNet      MSE EKF    gain dB
+position             0.8801       3.2355      -5.65
+vitesse              0.0290       0.0888      -4.85
+acceleration         0.0039       0.0145      -5.71
+biais                0.0744       0.0771      -0.16
 
-# ==========================================================================
-# 3. APPLICATION DE LA CONFIGURATION
-# ==========================================================================
+   Delta_dB (position) : -5.51 +/- 1.70 dB (IC95, n=50)
+   Delta_dB < 0  =>  KalmanNet meilleur que l'EKF
 
-def apply_config():
-    """Écrase les réglages de CFG pour ce run.
+== Manifeste  -> ./runs/baseline_narrow_archi2_seed1234/manifest.json
+== Figure     -> ./runs/baseline_narrow_archi2_seed1234/loss_archi2.png
+== Checkpoint -> ./runs/baseline_narrow_archi2_seed1234/knet_archi2.pt
 
-    Attention : la plupart des attributs de CFG sont lus au moment de
-    l'exécution, donc les modifier ici suffit. Mais OUT_DIR et
-    DATASET_PATH sont calculés une seule fois, à l'import du module :
-    il faut donc les réécrire explicitement, sinon les sorties partent
-    dans les anciens dossiers et écrasent d'anciens résultats.
-    """
-    CFG.SEED = SEED
-    CFG.ARCHI_TO_TRAIN = ARCHI
-    CFG.N_TRAIN, CFG.N_VAL, CFG.N_TEST = N_TRAIN, N_VAL, N_TEST
-    CFG.USE_SAVED_DATASET = False
-    CFG.MODE_MONTE_CARLO = False
-    CFG.PLOT_MSE_DB = False
-    CFG.PLOT_NCI = False
+== Run : baseline_narrow_archi2_seed7 ==
+   sortie  : ./runs/baseline_narrow_archi2_seed7
+   device  : cuda
+   config  : noise_sweep=False cmd_randomize=False init_offset=0.3
+   graines : train=7 val=8 test=106
 
-    if NARROW:
-        CFG.TRAIN_NOISE_SWEEP = False          # bruit de mesure fixe
-        CFG.TRAIN_CMD_RANDOMIZE = False        # commande 3 phases uniquement
-        CFG.INIT_OFFSET_P0 = True
-        CFG.INIT_OFFSET_SCALE = NARROW_INIT_OFFSET_SCALE
-    else:
-        CFG.TRAIN_NOISE_SWEEP = True
-        CFG.TRAIN_NOISE_DB = WIDE_NOISE_DB
-        CFG.TRAIN_CMD_RANDOMIZE = True
-        CFG.TRAIN_CMD_FAMILIES = ("phases3_rand", "ou")
-        CFG.INIT_OFFSET_P0 = True
-        CFG.INIT_OFFSET_SCALE = WIDE_INIT_OFFSET_SCALE
+== Génération des données ==
+>> Dataset sauvegardé -> ./runs/baseline_narrow_archi2_seed7/dataset.npz
+   train=400  val=80  test=50
+   297.2 s
 
-    CFG.OUT_DIR = OUT_DIR
-    CFG.DATASET_PATH = os.path.join(OUT_DIR, "dataset.npz")
-    os.makedirs(OUT_DIR, exist_ok=True)
+== Entraînement archi2 ==
+   paramètres : 24107793
+[archi2] epoch   0 | train 2.2323e+10 | val 1.1605e-01 | best 1.1605e-01
+[archi2] epoch   5 | train 7.4734e-01 | val 9.4306e-02 | best 9.4306e-02
+[archi2] epoch  10 | train 6.9263e-01 | val 9.4989e-02 | best 9.4306e-02
+[archi2] epoch  15 | train 6.5825e-01 | val 9.2126e-02 | best 9.2126e-02
+[archi2] epoch  20 | train 6.2543e-01 | val 9.3631e-02 | best 9.0420e-02
+[archi2] epoch  25 | train 6.0700e-01 | val 1.0181e-01 | best 9.0211e-02
+[archi2] epoch  30 | train 5.9424e-01 | val 9.8830e-02 | best 8.9875e-02
+[archi2] epoch  35 | train 5.6943e-01 | val 9.6381e-02 | best 8.9875e-02
+[archi2] epoch  39 | train 5.7478e-01 | val 9.4576e-02 | best 8.7451e-02
+[archi2] modèle sauvé -> ./runs/baseline_narrow_archi2_seed7/knet_archi2.pt
+   loss train divisée par 8 (fenêtres TBPTT) pour l'affichage
 
+== Évaluation en distribution ==
+groupe             MSE KNet      MSE EKF    gain dB
+position             0.7432       3.2529      -6.41
+vitesse              0.0215       0.0874      -6.08
+acceleration         0.0038       0.0140      -5.65
+biais                0.0578       0.0600      -0.16
 
-# ==========================================================================
-# 4. CORRECTION DE LA COURBE DE LOSS D'ENTRAÎNEMENT
-# ==========================================================================
+   Delta_dB (position) : -6.39 +/- 1.66 dB (IC95, n=50)
+   Delta_dB < 0  =>  KalmanNet meilleur que l'EKF
 
-def facteur_correction_loss():
-    """Nombre de fenêtres TBPTT par séquence.
-
-    Dans train(), la loss d'entraînement est sommée une fois par fenêtre
-    TBPTT (8 fenêtres pour T=160 et TBPTT=20) mais divisée seulement par
-    le nombre de batches. Elle ressort donc 8 fois trop grande, alors que
-    la loss de validation, elle, est bien divisée par T. Sans cette
-    correction la figure montre un écart train/val spectaculaire et faux.
-
-    On corrige l'affichage a posteriori plutôt que de modifier train() :
-    les poids appris, eux, sont corrects, et les runs déjà effectués
-    restent comparables.
-    """
-    return math.ceil(CFG.T / getattr(CFG, "TBPTT", 20))
-
-
-# ==========================================================================
-# 5. ÉVALUATION EN DISTRIBUTION
-# ==========================================================================
-
-def mse_groupe(xhat, xtrue, indices):
-    """Erreur quadratique moyenne sur un sous-ensemble de composantes."""
-    return ((xhat[:, indices, 0] - xtrue[:, indices, 0]) ** 2).mean().item()
+== Manifeste  -> ./runs/baseline_narrow_archi2_seed7/manifest.json
+== Figure     -> ./runs/baseline_narrow_archi2_seed7/loss_archi2.png
+== Checkpoint -> ./runs/baseline_narrow_archi2_seed7/knet_archi2.pt
 
 
-def evaluer(sm, model, ekf, data_test):
-    """Compare KalmanNet et l'EKF sur chaque trajectoire de test.
 
-    Le Delta_dB est calculé trajectoire par trajectoire, puis moyenné.
-    C'est ce qui permet d'assortir le résultat d'un intervalle de
-    confiance : une moyenne sans dispersion ne se compare à rien.
-    """
-    Xte, Yte, Ute, Mte = data_test
-    n = Xte.shape[0]
-
-    mse_knet = {g: [] for g in GROUPES}
-    mse_ekf = {g: [] for g in GROUPES}
-    delta_pos = []
-
-    for i in range(n):
-        X, Y, U, M = Xte[i], Yte[i], Ute[i], Mte[i]
-        x_ekf, _ = ekf.run(Y, U, M)
-        x_knet = run_knet(sm, model, Y, U, M)
-
-        for g, idx in GROUPES.items():
-            mse_knet[g].append(mse_groupe(x_knet, X, idx))
-            mse_ekf[g].append(mse_groupe(x_ekf, X, idx))
-
-        delta_pos.append(10.0 * np.log10(mse_knet["position"][-1]
-                                         / mse_ekf["position"][-1]))
-
-    delta_pos = np.array(delta_pos)
-    ic95 = 1.96 * delta_pos.std(ddof=1) / np.sqrt(n)
-
-    return {
-        "n_test": n,
-        "mse_knet": {g: float(np.mean(v)) for g, v in mse_knet.items()},
-        "mse_ekf": {g: float(np.mean(v)) for g, v in mse_ekf.items()},
-        "delta_db_position": float(delta_pos.mean()),
-        "delta_db_ic95": float(ic95),
-    }
-
-
-def afficher_resultats(res):
-    print(f"{'groupe':<14} {'MSE KNet':>12} {'MSE EKF':>12} {'gain dB':>10}")
-    for g in GROUPES:
-        mk, me = res["mse_knet"][g], res["mse_ekf"][g]
-        print(f"{g:<14} {mk:>12.4f} {me:>12.4f} {10*np.log10(mk/me):>+10.2f}")
-    print()
-    print(f"   Delta_dB (position) : {res['delta_db_position']:+.2f} "
-          f"+/- {res['delta_db_ic95']:.2f} dB (IC95, n={res['n_test']})")
-    print("   Delta_dB < 0  =>  KalmanNet meilleur que l'EKF")
-
-
-# ==========================================================================
-# 6. PROGRAMME PRINCIPAL
-# ==========================================================================
-
-def main():
-    apply_config()
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
-
-    # Les trois jeux utilisent des graines différentes : aucune trajectoire
-    # d'entraînement ne peut se retrouver en validation ou en test.
-    seed_train, seed_val, seed_test = SEED, SEED + 1, SEED + 99
-    assert len({seed_train, seed_val, seed_test}) == 3
-
-    print(f"== Run : {RUN_NAME} ==")
-    print(f"   sortie  : {OUT_DIR}")
-    print(f"   device  : {CFG.DEVICE}")
-    print(f"   config  : noise_sweep={CFG.TRAIN_NOISE_SWEEP} "
-          f"cmd_randomize={CFG.TRAIN_CMD_RANDOMIZE} "
-          f"init_offset={CFG.INIT_OFFSET_SCALE}")
-    print(f"   graines : train={seed_train} val={seed_val} test={seed_test}")
-
-    sm = SystemModel()
-    ekf = EKF(sm)
-
-    # --- Données ---------------------------------------------------------
-    print("\n== Génération des données ==")
-    t0 = time.time()
-    data_train = generate_dataset(sm, N_TRAIN, seed=seed_train,
-                                  noise_sweep=CFG.TRAIN_NOISE_SWEEP)
-    data_val = generate_dataset(sm, N_VAL, seed=seed_val,
-                                noise_sweep=CFG.TRAIN_NOISE_SWEEP)
-    data_test = generate_dataset(sm, N_TEST, seed=seed_test,
-                                 noise_sweep=CFG.TRAIN_NOISE_SWEEP)
-    save_dataset(data_train, data_val, data_test)
-    print(f"   {time.time() - t0:.1f} s")
-
-    # --- Entraînement ----------------------------------------------------
-    print(f"\n== Entraînement {ARCHI} ==")
-    model = KalmanNetNN(sm, archi=ARCHI)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"   paramètres : {n_params}")
-
-    t0 = time.time()
-    hist_train, hist_val, ckpt = train(sm, model, data_train, data_val, tag=ARCHI)
-    duree = time.time() - t0
-
-    # Correction de l'échelle avant de tracer (voir section 4)
-    k = facteur_correction_loss()
-    hist_train = [v / k for v in hist_train]
-    print(f"   loss train divisée par {k} (fenêtres TBPTT) pour l'affichage")
-    fig = plot_loss(hist_train, hist_val, ARCHI, OUT_DIR)
-
-    # On recharge le meilleur checkpoint, pas le modèle de la dernière epoch
-    etat = torch.load(ckpt, map_location=sm.device)
-    model.load_state_dict(etat["state_dict"])
-
-    # --- Évaluation ------------------------------------------------------
-    print("\n== Évaluation en distribution ==")
-    res = evaluer(sm, model, ekf, data_test)
-    afficher_resultats(res)
-
-    # --- Traçabilité -----------------------------------------------------
-    manifeste = {
-        "run_name": RUN_NAME,
-        "seed": SEED,
-        "archi": ARCHI,
-        "narrow": NARROW,
-        "n_train": N_TRAIN, "n_val": N_VAL, "n_test": N_TEST,
-        "T": CFG.T, "n_epochs": CFG.N_EPOCHS, "lr": CFG.LR,
-        "noise_sweep": CFG.TRAIN_NOISE_SWEEP,
-        "cmd_randomize": CFG.TRAIN_CMD_RANDOMIZE,
-        "init_offset_scale": CFG.INIT_OFFSET_SCALE,
-        "n_params": n_params,
-        "train_time_s": round(duree, 1),
-        "best_val_loss": float(min(hist_val)),
-        "hist_train": hist_train,
-        "hist_val": hist_val,
-        "resultats": res,
-        "checkpoint": ckpt,
-    }
-    chemin = os.path.join(OUT_DIR, "manifest.json")
-    with open(chemin, "w", encoding="utf-8") as fh:
-        json.dump(manifeste, fh, indent=2, ensure_ascii=False)
-
-    print(f"\n== Manifeste  -> {chemin}")
-    print(f"== Figure     -> {fig}")
-    print(f"== Checkpoint -> {ckpt}")
-
-
-if __name__ == "__main__":
-    main()
