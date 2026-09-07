@@ -1,97 +1,119 @@
 """
-CHARGEMENT DES MODÈLES ET EXÉCUTION DES FILTRES
+MÉTRIQUES COMMUNES
 
-Ce fichier regroupe tout ce qui touche aux checkpoints et aux tenseurs
-torch. Le reste du code appelle ces fonctions sans jamais manipuler
-directement un tenseur de forme (T, 24, 1).
+Ce fichier définit la façon de mesurer, et rien d'autre : pas de
+génération de données, pas d'entraînement, pas de figure. Il est importé
+par tous les scripts de balayage, pour qu'ils mesurent exactement la même
+chose avec le même code.
 
-Trois estimateurs sont disponibles pour une même trajectoire :
-  - EKF nominal : filtre avec son R par défaut
-  - EKF oracle  : filtre avec le vrai R du niveau de bruit testé
-  - KalmanNet   : le réseau entraîné
-
-Pourquoi deux EKF ? Voir la section correspondante du README.
+IMPORTANT : le dictionnaire GROUPES ci-dessous doit être identique à
+celui de ton script de baseline (Train_archi2_etroit.py). Si tu modifies
+l'un, modifie l'autre — sinon la baseline et les balayages ne mesureraient
+plus la même grandeur, et les comparaisons n'auraient plus de sens.
 """
 
-import os
-import torch
-
-from KalmanNet_Drones import KalmanNetNN, run_knet
-from metriques import db_vers_echelle
+import numpy as np
 
 
 # ==========================================================================
-# 1. CHARGEMENT DES CHECKPOINTS
+# 1. DÉCOUPAGE DU VECTEUR D'ÉTAT
 # ==========================================================================
+# Le vecteur d'état fait 24 composantes = 3 drones x 8 variables.
+# Pour chaque drone : x, y, vx, vy, ax, ay, bx, by
+# Donc le drone 1 occupe les indices 0 à 7, le drone 2 les indices 8 à 15,
+# le drone 3 les indices 16 à 23.
 
-def chemin_checkpoint(dossier_runs, archi, seed):
-    """Reconstruit le chemin d'un checkpoint de baseline.
+BASES = (0, 8, 16)          # indice de départ de chaque drone
 
-    Correspond à l'arborescence produite par le script d'entraînement :
-    runs/baseline_narrow_archi2_seed42/knet_archi2.pt
-    """
-    return os.path.join(dossier_runs,
-                        f"baseline_narrow_{archi}_seed{seed}",
-                        f"knet_{archi}.pt")
-
-
-def charger_un_modele(sm, chemin, archi_defaut="archi2"):
-    """Recharge un KalmanNet entraîné et le met en mode évaluation.
-
-    model.eval() désactive les comportements propres à l'entraînement
-    (dropout, batchnorm). Ici ça ne change rien au calcul, mais c'est la
-    pratique correcte et ça évite les surprises si l'architecture évolue.
-    """
-    etat = torch.load(chemin, map_location=sm.device)
-    model = KalmanNetNN(sm, archi=etat.get("archi", archi_defaut))
-    model.load_state_dict(etat["state_dict"])
-    model.eval()
-    return model
-
-
-def charger_les_baselines(sm, dossier_runs, archi, seeds):
-    """Charge tous les checkpoints disponibles.
-
-    Renvoie un dictionnaire {seed: modele}. Un checkpoint manquant est
-    signalé mais ne fait pas planter : on peut vouloir lancer un balayage
-    avec deux graines sur trois.
-    """
-    modeles = {}
-    for seed in seeds:
-        chemin = chemin_checkpoint(dossier_runs, archi, seed)
-        if os.path.exists(chemin):
-            modeles[seed] = charger_un_modele(sm, chemin, archi)
-            print(f"   checkpoint chargé : graine {seed}")
-        else:
-            print(f"!! checkpoint introuvable, graine ignorée : {chemin}")
-    return modeles
+GROUPES = {
+    "position":     [0, 1,  8,  9, 16, 17],
+    "vitesse":      [2, 3, 10, 11, 18, 19],
+    "acceleration": [4, 5, 12, 13, 20, 21],
+    "biais":        [6, 7, 14, 15, 22, 23],
+}
 
 
 # ==========================================================================
-# 2. EXÉCUTION DES FILTRES
+# 2. ERREUR QUADRATIQUE
 # ==========================================================================
 
-def lancer_ekf_nominal(sm, ekf, Y, U, M):
-    """EKF avec son R par défaut, celui du point de fonctionnement nominal."""
-    return ekf.run(Y, U, M)[0]
+def mse_groupe(xhat, xtrue, indices):
+    """Erreur quadratique moyenne sur un sous-ensemble de composantes.
 
-
-def lancer_ekf_oracle(sm, ekf, Y, U, M, niveau_db):
-    """EKF à qui on donne le vrai R du niveau de bruit testé.
-
-    On modifie temporairement sm.R, on lance le filtre, puis on restaure
-    la valeur d'origine. Le try/finally garantit que la restauration a
-    lieu même si le filtre lève une erreur — sinon tous les calculs
-    suivants seraient faussés sans avertissement.
+    Le .mean() sans argument moyenne TOUT d'un coup : les composantes
+    choisies ET les pas de temps de la trajectoire. Le résultat est donc
+    un seul nombre par trajectoire.
     """
-    R_sauvegarde = sm.R
-    try:
-        sm.R = sm.R_gen * (db_vers_echelle(niveau_db) ** 2)
-        return ekf.run(Y, U, M)[0]
-    finally:
-        sm.R = R_sauvegarde
+    return ((xhat[:, indices, 0] - xtrue[:, indices, 0]) ** 2).mean().item()
 
 
-def lancer_kalmannet(sm, model, Y, U, M):
-    """KalmanNet sur une trajectoire. Simple relais vers run_knet."""
-    return run_knet(sm, model, Y, U, M)
+def mse_par_groupe(xhat, xtrue):
+    """Dictionnaire {nom du groupe : MSE} pour une trajectoire."""
+    return {nom: mse_groupe(xhat, xtrue, idx) for nom, idx in GROUPES.items()}
+
+
+# ==========================================================================
+# 3. MÉTRIQUE CENTRALE DE L'ÉTUDE
+# ==========================================================================
+
+def delta_db(mse_knet, mse_ekf):
+    """Delta_dB = 10 log10(MSE_KalmanNet / MSE_EKF).
+
+    Négatif  -> KalmanNet fait mieux que l'EKF
+    Nul      -> les deux se valent (point de parité)
+    Positif  -> KalmanNet fait moins bien
+
+    Pour repasser en facteur linéaire : facteur = 10^(Delta_dB / 10).
+    Exemple : -5.7 dB  ->  0.27, soit une erreur 3.7 fois plus faible.
+    """
+    return 10.0 * np.log10(mse_knet / mse_ekf)
+
+
+def moyenne_ic95(valeurs):
+    """Moyenne et demi-largeur de l'intervalle de confiance à 95 %.
+
+    IC95 = 1.96 * ecart_type / racine(n)
+
+    ddof=1 est le diviseur (n-1), estimateur sans biais de l'écart-type.
+    Le 1.96 vient de l'approximation normale ; pour n >= 50 c'est
+    suffisant (la valeur exacte de Student vaut 2.01 à n=50).
+    """
+    v = np.asarray(valeurs, dtype=float)
+    n = len(v)
+    if n < 2:
+        return float(v.mean()), float("nan")
+    return float(v.mean()), float(1.96 * v.std(ddof=1) / np.sqrt(n))
+
+
+# ==========================================================================
+# 4. CONVERSION DES NIVEAUX DE BRUIT
+# ==========================================================================
+
+def db_vers_echelle(niveau_db):
+    """Convertit un niveau de bruit en dB vers un facteur multiplicatif.
+
+    Convention reprise de ton code : r_scale = 10^(-niveau_db / 20).
+
+    niveau_db =   0  ->  r_scale = 1     bruit nominal (celui de l'entraînement)
+    niveau_db = -20  ->  r_scale = 10    dix fois plus bruité
+    niveau_db = +20  ->  r_scale = 0.1   dix fois moins bruité
+
+    Attention au signe : un niveau en dB PLUS GRAND veut dire MOINS de bruit.
+    """
+    return 10.0 ** (-niveau_db / 20.0)
+
+
+# ==========================================================================
+# 5. AFFICHAGE
+# ==========================================================================
+
+def afficher_tableau(mse_knet, mse_ekf):
+    """Tableau MSE par groupe d'états, avec le gain en dB et en facteur."""
+    print(f"{'groupe':<14} {'MSE KNet':>12} {'MSE EKF':>12} "
+          f"{'gain dB':>10} {'facteur':>10}")
+    for nom in GROUPES:
+        mk, me = mse_knet[nom], mse_ekf[nom]
+        d = delta_db(mk, me)
+        facteur = 10.0 ** (-d / 10.0)
+        print(f"{nom:<14} {mk:>12.4f} {me:>12.4f} {d:>+10.2f} "
+              f"{facteur:>9.2f}x")
