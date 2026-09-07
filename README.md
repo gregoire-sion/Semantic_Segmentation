@@ -1,3 +1,4 @@
+<img width="1820" height="700" alt="balayage_offset_dev" src="https://github.com/user-attachments/assets/b57b7af8-5d34-4c79-880b-7e6b0e3ac280" />
 == Balayage axe 2 : amplitude de l'offset initial ==
    jeu d'évaluation : dev (graine de base 21250)
    échelles         : [0.0, 0.3, 0.6, 1.0, 1.5, 2.0, 3.0, 5.0]
