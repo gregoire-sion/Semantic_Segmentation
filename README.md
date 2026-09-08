@@ -1,31 +1,40 @@
 """
-BALAYAGE — AXE 1 : NIVEAU DE BRUIT DE MESURE
+BALAYAGE — AXE 4 : FAMILLE DE COMMANDE
 
-Ce script ne contient QUE ce qui est propre à l'axe "bruit" :
-  - les niveaux de bruit à balayer
-  - comment générer des trajectoires à un niveau donné
-  - quel EKF sert de référence (ici l'oracle, voir README)
+Cet axe est différent des trois autres : il n'est pas NUMÉRIQUE mais
+CATÉGORIEL. On ne balaye pas une grandeur continue, on compare des
+familles de commande distinctes.
 
-Tout le travail commun est délégué à moteur_balayage.py.
+Conséquence : la notion de "franchissement d'un seuil" n'a aucun sens ici
+(on n'interpole pas entre "brutal" et "ou"). Ce script réutilise donc la
+fonction balayer() du moteur, mais fait sa propre figure en barres et ne
+calcule aucune frontière.
 
-Les modèles évalués sont les trois baselines ÉTROITES déjà entraînées.
-Aucun réentraînement n'a lieu ici.
+EKF NOMINAL comme référence : changer la commande ne modifie pas le R.
+
+À VÉRIFIER AVANT DE LANCER
+Les noms de familles ci-dessous viennent de ton generate_dataset.py et de
+CFG.TRAIN_CMD_FAMILIES. Si build_command_ood n'accepte pas exactement les
+kinds "3phases" et "brutal", ou si les noms de familles diffèrent, il faut
+corriger le dictionnaire FAMILLES. Le script s'arrête proprement avec un
+message si une famille échoue.
 
 À LANCER :
-    python balayage_bruit.py
-
-Essai à blanc (quelques minutes) : mettre en bas de la section réglages
-    N_TRAJECTOIRES = 10
-    NIVEAUX_DB = [-10, 0, 10]
+    python balayage_commande.py
 """
+
+import os
+import json
+import time
 
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 
-from KalmanNet_Drones import CFG, SystemModel, EKF, generate_trajectory
-from metriques import db_vers_echelle
-from chargement_modeles import charger_les_baselines, lancer_ekf_oracle
-from moteur_balayage import lancer_un_axe
+from KalmanNet_Drones import (CFG, SystemModel, EKF, generate_trajectory,
+                              build_command_ood)
+from chargement_modeles import charger_les_baselines, lancer_ekf_nominal
+from moteur_balayage import balayer
 
 
 # ==========================================================================
@@ -41,73 +50,206 @@ SEEDS = [42, 1234, 7]
 # dans des dossiers distincts, donc rien n'est écrasé.
 VARIANTE = "narrow"
 
-# Niveaux de bruit balayés. Rappel du signe : plus le nombre est GRAND,
-# MOINS il y a de bruit. 0 dB = le niveau vu à l'entraînement.
-NIVEAUX_DB = [-20, -15, -10, -5, 0, 5, 10, 15, 20, 30]
+N_TRAJECTOIRES = 150
 
-N_TRAJECTOIRES = 150        # par niveau ; 150 donne un IC95 d'environ 1 dB
-
-# Jeu d'évaluation : "dev" pour explorer et diagnostiquer (étapes 1 à 4),
-# "test" UNIQUEMENT pour la mesure finale de l'étape 5. Ne pas regarder
-# le jeu "test" avant d'avoir figé la correction, sinon on retombe dans
-# la circularité que le protocole cherche à éviter.
 JEU = "dev"
+SEED_DEV = 23250
+SEED_TEST = 33250
 
-SEED_DEV = 20250
-SEED_TEST = 30250
-
-# Ces deux réglages sont FIGÉS au point d'entraînement : on ne balaye
-# qu'un seul facteur à la fois.
+# Figés au point d'entraînement.
 OFFSET_INITIAL = 0.3
-COMMANDE_RANDOMISEE = False
 
-DOSSIER_SORTIE = f"./runs/balayage_bruit_{VARIANTE}"
+DOSSIER_SORTIE = f"./runs/balayage_commande_{VARIANTE}"
+
+# La famille vue à l'entraînement, mise en évidence sur la figure.
+FAMILLE_ENTRAINEMENT = "nominal_3phases"
 
 
 # ==========================================================================
-# 2. CE QUI EST PROPRE À L'AXE BRUIT
+# 2. LES FAMILLES DE COMMANDE
+# ==========================================================================
+# Chaque entrée est une fonction qui prend (rng) et renvoie soit None
+# (la commande par défaut de generate_trajectory est alors utilisée),
+# soit une séquence de commande construite explicitement.
+
+def _nominal(sm, rng):
+    """Commande 3 phases historique, celle de l'entraînement."""
+    CFG.TRAIN_CMD_RANDOMIZE = False
+    return None
+
+
+def _phases3_rand(sm, rng):
+    """Variante randomisée des 3 phases.
+
+    ATTENTION : cette famille passe par build_command_sequence avec
+    TRAIN_CMD_RANDOMIZE = True, ce qui déclenche un import du module
+    ood_commands. Si ce fichier n'existe pas chez toi, la famille est
+    automatiquement ignorée (voir familles_disponibles()).
+    """
+    CFG.TRAIN_CMD_RANDOMIZE = True
+    CFG.TRAIN_CMD_FAMILIES = ("phases3_rand",)
+    return None
+
+
+def _ou(sm, rng):
+    """Commande de type processus d'Ornstein-Uhlenbeck.
+
+    Même dépendance à ood_commands que _phases3_rand.
+    """
+    CFG.TRAIN_CMD_RANDOMIZE = True
+    CFG.TRAIN_CMD_FAMILIES = ("ou",)
+    return None
+
+
+def _ood_3phases(sm, rng):
+    """Famille hors distribution : 3 phases version OOD."""
+    CFG.TRAIN_CMD_RANDOMIZE = False
+    return build_command_ood(CFG.T, sm.dt, rng, kind="3phases")
+
+
+def _ood_brutal(sm, rng):
+    """Famille hors distribution : manœuvres brutales."""
+    CFG.TRAIN_CMD_RANDOMIZE = False
+    return build_command_ood(CFG.T, sm.dt, rng, kind="brutal")
+
+
+FAMILLES = {
+    "nominal_3phases": _nominal,
+    "phases3_rand": _phases3_rand,
+    "ou": _ou,
+    "ood_3phases": _ood_3phases,
+    "ood_brutal": _ood_brutal,
+}
+
+# Familles qui ont besoin du module externe ood_commands.
+FAMILLES_EXTERNES = ("phases3_rand", "ou")
+
+
+def familles_disponibles():
+    """Liste des familles réellement utilisables sur cette installation.
+
+    phases3_rand et ou passent par le module ood_commands. S'il n'est pas
+    présent, on les retire de la liste plutôt que de laisser le balayage
+    planter au milieu d'un calcul de 30 minutes.
+    """
+    try:
+        import ood_commands  # noqa: F401
+        return list(FAMILLES)
+    except ImportError:
+        gardees = [n for n in FAMILLES if n not in FAMILLES_EXTERNES]
+        print("!! module ood_commands introuvable : familles ignorées "
+              f"{list(FAMILLES_EXTERNES)}")
+        return gardees
+
+
+# ==========================================================================
+# 3. GÉNÉRATION
 # ==========================================================================
 
 def graine_de_base():
-    """Graine du jeu d'évaluation choisi."""
     return SEED_DEV if JEU == "dev" else SEED_TEST
 
 
-def generer_trajectoires(sm, niveau_db, n):
-    """n trajectoires générées au niveau de bruit demandé.
+def generer_trajectoires(sm, nom_famille, n):
+    """n trajectoires pour la famille de commande demandée.
 
-    La graine ne dépend que du niveau et du jeu, jamais du modèle : les
-    trois baselines sont donc évaluées sur exactement les mêmes
-    trajectoires (comparaison appariée).
+    La graine est LA MÊME pour toutes les familles. Les offsets initiaux
+    et les tirages de bruit sont donc identiques d'une famille à l'autre :
+    seule la commande change. C'est ce qui permet d'attribuer un écart de
+    performance à la commande, et non au hasard du tirage.
 
-    Les jeux dev et test utilisent des graines très éloignées, donc des
-    trajectoires entièrement différentes.
+    On n'utilise pas hash(nom_famille) : Python randomise le hachage des
+    chaînes à chaque démarrage de l'interpréteur, ce qui rendrait le
+    balayage non reproductible d'une exécution à l'autre.
     """
-    graine = graine_de_base() + int(round(niveau_db))
-    rng = np.random.default_rng(graine)
-    r_scale = db_vers_echelle(niveau_db)
-    return [generate_trajectory(sm, rng, r_scale=r_scale) for _ in range(n)]
+    fabrique = FAMILLES[nom_famille]
+    rng = np.random.default_rng(graine_de_base())
+
+    trajectoires = []
+    for _ in range(n):
+        u_seq = fabrique(sm, rng)
+        if u_seq is None:
+            trajectoires.append(generate_trajectory(sm, rng, r_scale=1.0))
+        else:
+            trajectoires.append(
+                generate_trajectory(sm, rng, u_seq=u_seq, r_scale=1.0))
+    return trajectoires
 
 
 # ==========================================================================
-# 3. PROGRAMME PRINCIPAL
+# 4. FIGURE EN BARRES
+# ==========================================================================
+
+def tracer_familles(points, seeds, chemin_figure):
+    """Diagramme en barres : une barre par famille et par graine.
+
+    Pas de courbe ici : les familles ne sont pas ordonnées, une ligne
+    reliant "ou" à "brutal" n'aurait aucun sens.
+    """
+    noms = [p["valeur"] for p in points]
+    x = np.arange(len(noms))
+    largeur = 0.8 / len(seeds)
+
+    fig, (ax_rel, ax_abs) = plt.subplots(1, 2, figsize=(14, 5))
+
+    for i, seed in enumerate(seeds):
+        d = [p["par_seed"][str(seed)]["delta_db"] for p in points]
+        ic = [p["par_seed"][str(seed)]["ic95"] for p in points]
+        ax_rel.bar(x + i * largeur - 0.4 + largeur / 2, d, largeur,
+                   yerr=ic, capsize=3, label=f"graine {seed}")
+
+    ax_rel.axhline(0, color="k", lw=1.2)
+    ax_rel.axhline(3.0, color="crimson", ls="-.", lw=1.4, label="repère +3 dB")
+    ax_rel.set_xticks(x)
+    ax_rel.set_xticklabels(noms, rotation=20, ha="right", fontsize=8)
+    ax_rel.set_ylabel(r"$\Delta_{dB}$ position   (< 0 : KNet meilleur)")
+    ax_rel.set_title("Performance relative")
+    ax_rel.grid(True, axis="y", ls=":", alpha=0.7)
+    ax_rel.legend(fontsize=8)
+
+    for i, seed in enumerate(seeds):
+        mse = [p["par_seed"][str(seed)]["mse_knet_position"] for p in points]
+        ax_abs.bar(x + i * largeur - 0.4 + largeur / 2, mse, largeur,
+                   label=f"KNet graine {seed}")
+    mse_ekf = [p["mse_ekf_position"] for p in points]
+    ax_abs.plot(x, mse_ekf, "ks--", lw=2, label="EKF de référence")
+
+    ax_abs.set_yscale("log")
+    ax_abs.set_xticks(x)
+    ax_abs.set_xticklabels(noms, rotation=20, ha="right", fontsize=8)
+    ax_abs.set_ylabel("MSE position (échelle log)")
+    ax_abs.set_title("Performance absolue")
+    ax_abs.grid(True, axis="y", ls=":", alpha=0.7, which="both")
+    ax_abs.legend(fontsize=8)
+
+    fig.suptitle("Généralisation aux familles de commande — "
+                 "baseline étroite archi2")
+    fig.tight_layout()
+    fig.savefig(chemin_figure, dpi=140)
+    plt.close(fig)
+    return chemin_figure
+
+
+# ==========================================================================
+# 5. PROGRAMME PRINCIPAL
 # ==========================================================================
 
 def main():
     torch.manual_seed(graine_de_base())
     np.random.seed(graine_de_base())
 
-    # On fige tous les facteurs sauf celui qu'on balaye.
-    CFG.TRAIN_CMD_RANDOMIZE = COMMANDE_RANDOMISEE
     CFG.INIT_OFFSET_P0 = True
     CFG.INIT_OFFSET_SCALE = OFFSET_INITIAL
+    os.makedirs(DOSSIER_SORTIE, exist_ok=True)
 
-    print("== Balayage axe 1 : niveau de bruit de mesure ==")
+    print("== Balayage axe 4 : famille de commande ==")
     print(f"   jeu d'évaluation : {JEU} (graine de base {graine_de_base()})")
-    print(f"   niveaux          : {NIVEAUX_DB}")
-    print(f"   trajectoires     : {N_TRAJECTOIRES} par niveau")
-    print(f"   offset figé      : {OFFSET_INITIAL}")
-    print(f"   modèles          : variante {VARIANTE}, aucun réentraînement\n")
+    noms = familles_disponibles()
+    print(f"   familles         : {noms}")
+    print(f"   entraînement sur : {FAMILLE_ENTRAINEMENT}")
+    print(f"   trajectoires     : {N_TRAJECTOIRES} par famille")
+    print(f"   modèles          : variante {VARIANTE}")
+    print(f"   EKF de référence : nominal\n")
 
     sm = SystemModel()
     ekf = EKF(sm)
@@ -118,26 +260,33 @@ def main():
         raise SystemExit("Aucun checkpoint trouvé. Vérifie DOSSIER_RUNS.")
     print()
 
-    # Les deux fonctions ci-dessous adaptent les fonctions de cet axe à la
-    # signature attendue par le moteur : il appelle generer_trajectoires
-    # avec la seule valeur balayée, et estimer_ekf avec la valeur et une
-    # trajectoire.
-    config = {
-        "nom": f"balayage_bruit_{VARIANTE}_{JEU}",
+    debut = time.time()
+    points = balayer(
+        sm, modeles, noms,
+        lambda nom: generer_trajectoires(sm, nom, N_TRAJECTOIRES),
+        lambda nom, Y, U, M: lancer_ekf_nominal(sm, ekf, Y, U, M),
+    )
+
+    nom_sortie = f"balayage_commande_{VARIANTE}_{JEU}"
+    figure = tracer_familles(points, sorted(modeles),
+                             os.path.join(DOSSIER_SORTIE, nom_sortie + ".png"))
+
+    sortie = {
+        "axe": "famille_de_commande",
+        "type": "categoriel",
         "jeu": JEU,
-        "dossier_sortie": DOSSIER_SORTIE,
-        "valeurs": NIVEAUX_DB,
-        "generer_trajectoires":
-            lambda niveau: generer_trajectoires(sm, niveau, N_TRAJECTOIRES),
-        "estimer_ekf":
-            lambda niveau, Y, U, M: lancer_ekf_oracle(sm, ekf, Y, U, M, niveau),
-        "titre": "Généralisation au niveau de bruit — baseline étroite archi2",
-        "label_x": "Niveau de bruit  1/r²  [dB]   (gauche = plus bruité)",
-        "valeur_entrainement": 0,
-        "seuils": (0.0, 3.0),
-        "seuil_repere": 3.0,
+        "seeds": sorted(modeles),
+        "familles": noms,
+        "famille_entrainement": FAMILLE_ENTRAINEMENT,
+        "points": points,
+        "duree_s": round(time.time() - debut, 1),
     }
-    lancer_un_axe(sm, modeles, config)
+    chemin_json = os.path.join(DOSSIER_SORTIE, nom_sortie + ".json")
+    with open(chemin_json, "w", encoding="utf-8") as fh:
+        json.dump(sortie, fh, indent=2, ensure_ascii=False)
+
+    print(f"\n== Résultats -> {chemin_json}")
+    print(f"== Figure    -> {figure}")
 
 
 if __name__ == "__main__":
