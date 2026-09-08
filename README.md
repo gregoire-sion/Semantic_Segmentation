@@ -1,293 +1,100 @@
 """
-BALAYAGE — AXE 4 : FAMILLE DE COMMANDE
+CHARGEMENT DES MODÈLES ET EXÉCUTION DES FILTRES
 
-Cet axe est différent des trois autres : il n'est pas NUMÉRIQUE mais
-CATÉGORIEL. On ne balaye pas une grandeur continue, on compare des
-familles de commande distinctes.
+Ce fichier regroupe tout ce qui touche aux checkpoints et aux tenseurs
+torch. Le reste du code appelle ces fonctions sans jamais manipuler
+directement un tenseur de forme (T, 24, 1).
 
-Conséquence : la notion de "franchissement d'un seuil" n'a aucun sens ici
-(on n'interpole pas entre "brutal" et "ou"). Ce script réutilise donc la
-fonction balayer() du moteur, mais fait sa propre figure en barres et ne
-calcule aucune frontière.
+Trois estimateurs sont disponibles pour une même trajectoire :
+  - EKF nominal : filtre avec son R par défaut
+  - EKF oracle  : filtre avec le vrai R du niveau de bruit testé
+  - KalmanNet   : le réseau entraîné
 
-EKF NOMINAL comme référence : changer la commande ne modifie pas le R.
-
-À VÉRIFIER AVANT DE LANCER
-Les noms de familles ci-dessous viennent de ton generate_dataset.py et de
-CFG.TRAIN_CMD_FAMILIES. Si build_command_ood n'accepte pas exactement les
-kinds "3phases" et "brutal", ou si les noms de familles diffèrent, il faut
-corriger le dictionnaire FAMILLES. Le script s'arrête proprement avec un
-message si une famille échoue.
-
-À LANCER :
-    python balayage_commande.py
+Pourquoi deux EKF ? Voir la section correspondante du README.
 """
 
 import os
-import json
-import time
-
-import numpy as np
 import torch
-import matplotlib.pyplot as plt
 
-from KalmanNet_Drones import (CFG, SystemModel, EKF, generate_trajectory,
-                              build_command_ood)
-from chargement_modeles import charger_les_baselines, lancer_ekf_nominal
-from moteur_balayage import balayer
+from KalmanNet_Drones import KalmanNetNN, run_knet
+from metriques import db_vers_echelle
 
 
 # ==========================================================================
-# 1. RÉGLAGES
+# 1. CHARGEMENT DES CHECKPOINTS
 # ==========================================================================
 
-DOSSIER_RUNS = "./runs"
-ARCHI = "archi2"
-SEEDS = [42, 1234, 7]
+def chemin_checkpoint(dossier_runs, archi, seed, variante="narrow"):
+    """Reconstruit le chemin d'un checkpoint de baseline.
 
-# Modèles évalués : "narrow" = baseline étroite, "wide" = modèle
-# entraîné avec randomisation de domaine. Les sorties sont écrites
-# dans des dossiers distincts, donc rien n'est écrasé.
-VARIANTE = "narrow"
-
-N_TRAJECTOIRES = 150
-
-JEU = "dev"
-SEED_DEV = 23250
-SEED_TEST = 33250
-
-# Figés au point d'entraînement.
-OFFSET_INITIAL = 0.3
-
-DOSSIER_SORTIE = f"./runs/balayage_commande_{VARIANTE}"
-
-# La famille vue à l'entraînement, mise en évidence sur la figure.
-FAMILLE_ENTRAINEMENT = "nominal_3phases"
-
-
-# ==========================================================================
-# 2. LES FAMILLES DE COMMANDE
-# ==========================================================================
-# Chaque entrée est une fonction qui prend (rng) et renvoie soit None
-# (la commande par défaut de generate_trajectory est alors utilisée),
-# soit une séquence de commande construite explicitement.
-
-def _nominal(sm, rng):
-    """Commande 3 phases historique, celle de l'entraînement."""
-    CFG.TRAIN_CMD_RANDOMIZE = False
-    return None
-
-
-def _phases3_rand(sm, rng):
-    """Variante randomisée des 3 phases.
-
-    ATTENTION : cette famille passe par build_command_sequence avec
-    TRAIN_CMD_RANDOMIZE = True, ce qui déclenche un import du module
-    ood_commands. Si ce fichier n'existe pas chez toi, la famille est
-    automatiquement ignorée (voir familles_disponibles()).
+    variante vaut "narrow" (config étroite) ou "wide" (randomisation de
+    domaine). Correspond à l'arborescence produite par le script
+    d'entraînement :
+        runs/baseline_narrow_archi2_seed42/knet_archi2.pt
+        runs/baseline_wide_archi2_seed42/knet_archi2.pt
     """
-    CFG.TRAIN_CMD_RANDOMIZE = True
-    CFG.TRAIN_CMD_FAMILIES = ("phases3_rand",)
-    return None
+    return os.path.join(dossier_runs,
+                        f"baseline_{variante}_{archi}_seed{seed}",
+                        f"knet_{archi}.pt")
 
 
-def _ou(sm, rng):
-    """Commande de type processus d'Ornstein-Uhlenbeck.
+def charger_un_modele(sm, chemin, archi_defaut="archi2"):
+    """Recharge un KalmanNet entraîné et le met en mode évaluation.
 
-    Même dépendance à ood_commands que _phases3_rand.
+    model.eval() désactive les comportements propres à l'entraînement
+    (dropout, batchnorm). Ici ça ne change rien au calcul, mais c'est la
+    pratique correcte et ça évite les surprises si l'architecture évolue.
     """
-    CFG.TRAIN_CMD_RANDOMIZE = True
-    CFG.TRAIN_CMD_FAMILIES = ("ou",)
-    return None
+    etat = torch.load(chemin, map_location=sm.device)
+    model = KalmanNetNN(sm, archi=etat.get("archi", archi_defaut))
+    model.load_state_dict(etat["state_dict"])
+    model.eval()
+    return model
 
 
-def _ood_3phases(sm, rng):
-    """Famille hors distribution : 3 phases version OOD."""
-    CFG.TRAIN_CMD_RANDOMIZE = False
-    return build_command_ood(CFG.T, sm.dt, rng, kind="3phases")
+def charger_les_baselines(sm, dossier_runs, archi, seeds, variante="narrow"):
+    """Charge tous les checkpoints disponibles d'une variante.
 
-
-def _ood_brutal(sm, rng):
-    """Famille hors distribution : manœuvres brutales."""
-    CFG.TRAIN_CMD_RANDOMIZE = False
-    return build_command_ood(CFG.T, sm.dt, rng, kind="brutal")
-
-
-FAMILLES = {
-    "nominal_3phases": _nominal,
-    "phases3_rand": _phases3_rand,
-    "ou": _ou,
-    "ood_3phases": _ood_3phases,
-    "ood_brutal": _ood_brutal,
-}
-
-# Familles qui ont besoin du module externe ood_commands.
-FAMILLES_EXTERNES = ("phases3_rand", "ou")
-
-
-def familles_disponibles():
-    """Liste des familles réellement utilisables sur cette installation.
-
-    phases3_rand et ou passent par le module ood_commands. S'il n'est pas
-    présent, on les retire de la liste plutôt que de laisser le balayage
-    planter au milieu d'un calcul de 30 minutes.
+    Renvoie un dictionnaire {seed: modele}. Un checkpoint manquant est
+    signalé mais ne fait pas planter : on peut vouloir lancer un balayage
+    avec deux graines sur trois.
     """
-    try:
-        import ood_commands  # noqa: F401
-        return list(FAMILLES)
-    except ImportError:
-        gardees = [n for n in FAMILLES if n not in FAMILLES_EXTERNES]
-        print("!! module ood_commands introuvable : familles ignorées "
-              f"{list(FAMILLES_EXTERNES)}")
-        return gardees
-
-
-# ==========================================================================
-# 3. GÉNÉRATION
-# ==========================================================================
-
-def graine_de_base():
-    return SEED_DEV if JEU == "dev" else SEED_TEST
-
-
-def generer_trajectoires(sm, nom_famille, n):
-    """n trajectoires pour la famille de commande demandée.
-
-    La graine est LA MÊME pour toutes les familles. Les offsets initiaux
-    et les tirages de bruit sont donc identiques d'une famille à l'autre :
-    seule la commande change. C'est ce qui permet d'attribuer un écart de
-    performance à la commande, et non au hasard du tirage.
-
-    On n'utilise pas hash(nom_famille) : Python randomise le hachage des
-    chaînes à chaque démarrage de l'interpréteur, ce qui rendrait le
-    balayage non reproductible d'une exécution à l'autre.
-    """
-    fabrique = FAMILLES[nom_famille]
-    rng = np.random.default_rng(graine_de_base())
-
-    trajectoires = []
-    for _ in range(n):
-        u_seq = fabrique(sm, rng)
-        if u_seq is None:
-            trajectoires.append(generate_trajectory(sm, rng, r_scale=1.0))
+    modeles = {}
+    for seed in seeds:
+        chemin = chemin_checkpoint(dossier_runs, archi, seed, variante)
+        if os.path.exists(chemin):
+            modeles[seed] = charger_un_modele(sm, chemin, archi)
+            print(f"   checkpoint chargé : graine {seed}")
         else:
-            trajectoires.append(
-                generate_trajectory(sm, rng, u_seq=u_seq, r_scale=1.0))
-    return trajectoires
+            print(f"!! checkpoint introuvable, graine ignorée : {chemin}")
+    return modeles
 
 
 # ==========================================================================
-# 4. FIGURE EN BARRES
+# 2. EXÉCUTION DES FILTRES
 # ==========================================================================
 
-def tracer_familles(points, seeds, chemin_figure):
-    """Diagramme en barres : une barre par famille et par graine.
+def lancer_ekf_nominal(sm, ekf, Y, U, M):
+    """EKF avec son R par défaut, celui du point de fonctionnement nominal."""
+    return ekf.run(Y, U, M)[0]
 
-    Pas de courbe ici : les familles ne sont pas ordonnées, une ligne
-    reliant "ou" à "brutal" n'aurait aucun sens.
+
+def lancer_ekf_oracle(sm, ekf, Y, U, M, niveau_db):
+    """EKF à qui on donne le vrai R du niveau de bruit testé.
+
+    On modifie temporairement sm.R, on lance le filtre, puis on restaure
+    la valeur d'origine. Le try/finally garantit que la restauration a
+    lieu même si le filtre lève une erreur — sinon tous les calculs
+    suivants seraient faussés sans avertissement.
     """
-    noms = [p["valeur"] for p in points]
-    x = np.arange(len(noms))
-    largeur = 0.8 / len(seeds)
-
-    fig, (ax_rel, ax_abs) = plt.subplots(1, 2, figsize=(14, 5))
-
-    for i, seed in enumerate(seeds):
-        d = [p["par_seed"][str(seed)]["delta_db"] for p in points]
-        ic = [p["par_seed"][str(seed)]["ic95"] for p in points]
-        ax_rel.bar(x + i * largeur - 0.4 + largeur / 2, d, largeur,
-                   yerr=ic, capsize=3, label=f"graine {seed}")
-
-    ax_rel.axhline(0, color="k", lw=1.2)
-    ax_rel.axhline(3.0, color="crimson", ls="-.", lw=1.4, label="repère +3 dB")
-    ax_rel.set_xticks(x)
-    ax_rel.set_xticklabels(noms, rotation=20, ha="right", fontsize=8)
-    ax_rel.set_ylabel(r"$\Delta_{dB}$ position   (< 0 : KNet meilleur)")
-    ax_rel.set_title("Performance relative")
-    ax_rel.grid(True, axis="y", ls=":", alpha=0.7)
-    ax_rel.legend(fontsize=8)
-
-    for i, seed in enumerate(seeds):
-        mse = [p["par_seed"][str(seed)]["mse_knet_position"] for p in points]
-        ax_abs.bar(x + i * largeur - 0.4 + largeur / 2, mse, largeur,
-                   label=f"KNet graine {seed}")
-    mse_ekf = [p["mse_ekf_position"] for p in points]
-    ax_abs.plot(x, mse_ekf, "ks--", lw=2, label="EKF de référence")
-
-    ax_abs.set_yscale("log")
-    ax_abs.set_xticks(x)
-    ax_abs.set_xticklabels(noms, rotation=20, ha="right", fontsize=8)
-    ax_abs.set_ylabel("MSE position (échelle log)")
-    ax_abs.set_title("Performance absolue")
-    ax_abs.grid(True, axis="y", ls=":", alpha=0.7, which="both")
-    ax_abs.legend(fontsize=8)
-
-    fig.suptitle("Généralisation aux familles de commande — "
-                 "baseline étroite archi2")
-    fig.tight_layout()
-    fig.savefig(chemin_figure, dpi=140)
-    plt.close(fig)
-    return chemin_figure
+    R_sauvegarde = sm.R
+    try:
+        sm.R = sm.R_gen * (db_vers_echelle(niveau_db) ** 2)
+        return ekf.run(Y, U, M)[0]
+    finally:
+        sm.R = R_sauvegarde
 
 
-# ==========================================================================
-# 5. PROGRAMME PRINCIPAL
-# ==========================================================================
-
-def main():
-    torch.manual_seed(graine_de_base())
-    np.random.seed(graine_de_base())
-
-    CFG.INIT_OFFSET_P0 = True
-    CFG.INIT_OFFSET_SCALE = OFFSET_INITIAL
-    os.makedirs(DOSSIER_SORTIE, exist_ok=True)
-
-    print("== Balayage axe 4 : famille de commande ==")
-    print(f"   jeu d'évaluation : {JEU} (graine de base {graine_de_base()})")
-    noms = familles_disponibles()
-    print(f"   familles         : {noms}")
-    print(f"   entraînement sur : {FAMILLE_ENTRAINEMENT}")
-    print(f"   trajectoires     : {N_TRAJECTOIRES} par famille")
-    print(f"   modèles          : variante {VARIANTE}")
-    print(f"   EKF de référence : nominal\n")
-
-    sm = SystemModel()
-    ekf = EKF(sm)
-
-    modeles = charger_les_baselines(sm, DOSSIER_RUNS, ARCHI, SEEDS,
-                                 VARIANTE)
-    if not modeles:
-        raise SystemExit("Aucun checkpoint trouvé. Vérifie DOSSIER_RUNS.")
-    print()
-
-    debut = time.time()
-    points = balayer(
-        sm, modeles, noms,
-        lambda nom: generer_trajectoires(sm, nom, N_TRAJECTOIRES),
-        lambda nom, Y, U, M: lancer_ekf_nominal(sm, ekf, Y, U, M),
-    )
-
-    nom_sortie = f"balayage_commande_{VARIANTE}_{JEU}"
-    figure = tracer_familles(points, sorted(modeles),
-                             os.path.join(DOSSIER_SORTIE, nom_sortie + ".png"))
-
-    sortie = {
-        "axe": "famille_de_commande",
-        "type": "categoriel",
-        "jeu": JEU,
-        "seeds": sorted(modeles),
-        "familles": noms,
-        "famille_entrainement": FAMILLE_ENTRAINEMENT,
-        "points": points,
-        "duree_s": round(time.time() - debut, 1),
-    }
-    chemin_json = os.path.join(DOSSIER_SORTIE, nom_sortie + ".json")
-    with open(chemin_json, "w", encoding="utf-8") as fh:
-        json.dump(sortie, fh, indent=2, ensure_ascii=False)
-
-    print(f"\n== Résultats -> {chemin_json}")
-    print(f"== Figure    -> {figure}")
-
-
-if __name__ == "__main__":
-    main()
+def lancer_kalmannet(sm, model, Y, U, M):
+    """KalmanNet sur une trajectoire. Simple relais vers run_knet."""
+    return run_knet(sm, model, Y, U, M)
