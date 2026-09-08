@@ -1,29 +1,30 @@
 """
-BALAYAGE — AXE 2 : AMPLITUDE DE L'OFFSET INITIAL
+BALAYAGE — AXE 1 : NIVEAU DE BRUIT DE MESURE
 
-L'offset initial est l'écart entre l'état réel du système au départ et
-l'état que le filtre suppose au départ. La trajectoire vraie démarre à
-x0 + echelle * (L @ xi), où L vient de la décomposition de Cholesky de
-P0 ; le filtre, lui, démarre toujours à x0 exactement.
+Ce script ne contient QUE ce qui est propre à l'axe "bruit" :
+  - les niveaux de bruit à balayer
+  - comment générer des trajectoires à un niveau donné
+  - quel EKF sert de référence (ici l'oracle, voir README)
 
-echelle = 0.3 est le point d'entraînement de la baseline étroite.
-echelle = 1.0 correspond à une perturbation cohérente avec P0.
+Tout le travail commun est délégué à moteur_balayage.py.
 
-DIFFÉRENCE AVEC L'AXE BRUIT : ici on utilise l'EKF NOMINAL, pas l'oracle.
-Changer l'offset initial ne modifie en rien le R du filtre, donc son
-réglage de bruit reste correct. Un EKF oracle n'aurait aucun sens ici.
+Les modèles évalués sont les trois baselines ÉTROITES déjà entraînées.
+Aucun réentraînement n'a lieu ici.
 
 À LANCER :
-    python balayage_offset.py
+    python balayage_bruit.py
 
-Essai à blanc : N_TRAJECTOIRES = 10 et ECHELLES = [0.3, 1.0, 3.0]
+Essai à blanc (quelques minutes) : mettre en bas de la section réglages
+    N_TRAJECTOIRES = 10
+    NIVEAUX_DB = [-10, 0, 10]
 """
 
 import numpy as np
 import torch
 
 from KalmanNet_Drones import CFG, SystemModel, EKF, generate_trajectory
-from chargement_modeles import charger_les_baselines, lancer_ekf_nominal
+from metriques import db_vers_echelle
+from chargement_modeles import charger_les_baselines, lancer_ekf_oracle
 from moteur_balayage import lancer_un_axe
 
 
@@ -40,47 +41,52 @@ SEEDS = [42, 1234, 7]
 # dans des dossiers distincts, donc rien n'est écrasé.
 VARIANTE = "narrow"
 
-# Amplitudes balayées. 0.3 = point d'entraînement, 0.0 = le filtre part
-# de l'état vrai (cas irréaliste mais utile comme borne).
-ECHELLES = [0.0, 0.3, 0.6, 1.0, 1.5, 2.0, 3.0, 5.0]
+# Niveaux de bruit balayés. Rappel du signe : plus le nombre est GRAND,
+# MOINS il y a de bruit. 0 dB = le niveau vu à l'entraînement.
+NIVEAUX_DB = [-20, -15, -10, -5, 0, 5, 10, 15, 20, 30]
 
-N_TRAJECTOIRES = 150
+N_TRAJECTOIRES = 150        # par niveau ; 150 donne un IC95 d'environ 1 dB
 
-JEU = "dev"                 # "test" uniquement à l'étape 5
-SEED_DEV = 21250
-SEED_TEST = 31250
+# Jeu d'évaluation : "dev" pour explorer et diagnostiquer (étapes 1 à 4),
+# "test" UNIQUEMENT pour la mesure finale de l'étape 5. Ne pas regarder
+# le jeu "test" avant d'avoir figé la correction, sinon on retombe dans
+# la circularité que le protocole cherche à éviter.
+JEU = "dev"
 
-# Figés au point d'entraînement : on ne balaye qu'un facteur à la fois.
-NIVEAU_BRUIT_DB = 0.0       # bruit nominal
+SEED_DEV = 20250
+SEED_TEST = 30250
+
+# Ces deux réglages sont FIGÉS au point d'entraînement : on ne balaye
+# qu'un seul facteur à la fois.
+OFFSET_INITIAL = 0.3
 COMMANDE_RANDOMISEE = False
 
-DOSSIER_SORTIE = f"./runs/balayage_offset_{VARIANTE}"
+DOSSIER_SORTIE = f"./runs/balayage_bruit_{VARIANTE}"
 
 
 # ==========================================================================
-# 2. CE QUI EST PROPRE À L'AXE OFFSET
+# 2. CE QUI EST PROPRE À L'AXE BRUIT
 # ==========================================================================
 
 def graine_de_base():
+    """Graine du jeu d'évaluation choisi."""
     return SEED_DEV if JEU == "dev" else SEED_TEST
 
 
-def generer_trajectoires(sm, echelle, n):
-    """n trajectoires avec l'amplitude d'offset initial demandée.
+def generer_trajectoires(sm, niveau_db, n):
+    """n trajectoires générées au niveau de bruit demandé.
 
-    generate_trajectory lit CFG.INIT_OFFSET_SCALE au moment de l'appel :
-    il suffit donc de modifier ce réglage avant de générer. C'est le même
-    mécanisme que dans le script de baseline.
+    La graine ne dépend que du niveau et du jeu, jamais du modèle : les
+    trois baselines sont donc évaluées sur exactement les mêmes
+    trajectoires (comparaison appariée).
 
-    La graine dépend de l'échelle mais pas du modèle : les trois
-    baselines voient exactement les mêmes trajectoires.
+    Les jeux dev et test utilisent des graines très éloignées, donc des
+    trajectoires entièrement différentes.
     """
-    CFG.INIT_OFFSET_SCALE = echelle
-    CFG.INIT_OFFSET_P0 = (echelle > 0.0)
-
-    graine = graine_de_base() + int(round(echelle * 100))
+    graine = graine_de_base() + int(round(niveau_db))
     rng = np.random.default_rng(graine)
-    return [generate_trajectory(sm, rng, r_scale=1.0) for _ in range(n)]
+    r_scale = db_vers_echelle(niveau_db)
+    return [generate_trajectory(sm, rng, r_scale=r_scale) for _ in range(n)]
 
 
 # ==========================================================================
@@ -91,15 +97,17 @@ def main():
     torch.manual_seed(graine_de_base())
     np.random.seed(graine_de_base())
 
+    # On fige tous les facteurs sauf celui qu'on balaye.
     CFG.TRAIN_CMD_RANDOMIZE = COMMANDE_RANDOMISEE
+    CFG.INIT_OFFSET_P0 = True
+    CFG.INIT_OFFSET_SCALE = OFFSET_INITIAL
 
-    print("== Balayage axe 2 : amplitude de l'offset initial ==")
+    print("== Balayage axe 1 : niveau de bruit de mesure ==")
     print(f"   jeu d'évaluation : {JEU} (graine de base {graine_de_base()})")
-    print(f"   échelles         : {ECHELLES}")
-    print(f"   trajectoires     : {N_TRAJECTOIRES} par échelle")
-    print(f"   bruit figé       : {NIVEAU_BRUIT_DB} dB (nominal)")
-    print(f"   modèles          : variante {VARIANTE}")
-    print(f"   EKF de référence : nominal (pas d'oracle sur cet axe)\n")
+    print(f"   niveaux          : {NIVEAUX_DB}")
+    print(f"   trajectoires     : {N_TRAJECTOIRES} par niveau")
+    print(f"   offset figé      : {OFFSET_INITIAL}")
+    print(f"   modèles          : variante {VARIANTE}, aucun réentraînement\n")
 
     sm = SystemModel()
     ekf = EKF(sm)
@@ -110,18 +118,22 @@ def main():
         raise SystemExit("Aucun checkpoint trouvé. Vérifie DOSSIER_RUNS.")
     print()
 
+    # Les deux fonctions ci-dessous adaptent les fonctions de cet axe à la
+    # signature attendue par le moteur : il appelle generer_trajectoires
+    # avec la seule valeur balayée, et estimer_ekf avec la valeur et une
+    # trajectoire.
     config = {
-        "nom": f"balayage_offset_{VARIANTE}_{JEU}",
+        "nom": f"balayage_bruit_{VARIANTE}_{JEU}",
         "jeu": JEU,
         "dossier_sortie": DOSSIER_SORTIE,
-        "valeurs": ECHELLES,
+        "valeurs": NIVEAUX_DB,
         "generer_trajectoires":
-            lambda echelle: generer_trajectoires(sm, echelle, N_TRAJECTOIRES),
+            lambda niveau: generer_trajectoires(sm, niveau, N_TRAJECTOIRES),
         "estimer_ekf":
-            lambda echelle, Y, U, M: lancer_ekf_nominal(sm, ekf, Y, U, M),
-        "titre": "Généralisation à l'offset initial — baseline étroite archi2",
-        "label_x": "Amplitude de l'offset initial (x écart-type de P0)",
-        "valeur_entrainement": 0.3,
+            lambda niveau, Y, U, M: lancer_ekf_oracle(sm, ekf, Y, U, M, niveau),
+        "titre": "Généralisation au niveau de bruit — baseline étroite archi2",
+        "label_x": "Niveau de bruit  1/r²  [dB]   (gauche = plus bruité)",
+        "valeur_entrainement": 0,
         "seuils": (0.0, 3.0),
         "seuil_repere": 3.0,
     }
