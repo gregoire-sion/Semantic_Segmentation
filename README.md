@@ -1,408 +1,360 @@
 """
-COMPARAISON DES BALAYAGES : ÉTROITE vs LARGE vs ÉTENDU
+ENTRAÎNEMENT — TROIS VARIANTES
 
-Ce script ne lance aucun calcul. Il relit les fichiers JSON déjà produits
-par les balayages et les met face à face, axe par axe.
+Un seul script, trois configurations d'entraînement possibles, choisies
+par la constante VARIANTE en haut du fichier :
 
-CE QU'IL PRODUIT
-  - une figure par axe, superposant les modèles disponibles
-  - un tableau récapitulatif : frontières et Delta_dB au point nominal
-  - un JSON de synthèse
-
-LES TROIS MODÈLES COMPARÉS
   "narrow"      baseline étroite : un seul point de fonctionnement
-  "wide"        modèle large : bruit et commande randomisés, offset fixé à 1,0
-  "offsetsweep" modèle étendu : comme large, mais l'offset initial est lui
-                aussi tiré au hasard dans [0, 2] à chaque trajectoire
+  "wide"        randomisation du bruit et de la commande, offset fixé à 1,0
+  "offsetsweep" comme "wide", mais l'offset initial est lui aussi TIRÉ
+                au hasard dans [0, 2] à chaque trajectoire
+  "offsethigh"  idem, mais sur la plage HAUTE [2, 4] : on entraîne sur des
+                erreurs initiales importantes pour voir si le réseau s'en
+                sort ensuite sur des erreurs faibles
 
-Le modèle étendu n'existe que pour l'axe offset : c'est le seul axe où il
-change quelque chose. Sur les autres axes il est simplement absent des
-dossiers, et le script l'ignore sans rien signaler d'anormal.
+POURQUOI LA TROISIÈME VARIANTE
+Le balayage a montré que la baseline décroche dès un offset de 0,73, et
+que le modèle "wide" ne fait guère mieux (0,90) — alors qu'il a été
+entraîné à un offset de 1,0. Mais "wide" ne RANDOMISE pas l'offset : il
+le déplace seulement de 0,3 à 1,0. Le test honnête n'a donc jamais été
+fait.
 
-CE QU'IL FAUT AVOIR LANCÉ AVANT
-  balayage_offset.py, balayage_bruit.py, balayage_commande.py
-  avec VARIANTE = "narrow", puis "wide" (et "offsetsweep" pour l'offset)
+La variante "offsetsweep" tranche entre deux hypothèses :
+  - problème de représentativité → montrer de grandes erreurs initiales
+    suffit, la frontière doit reculer nettement au-delà de 2
+  - problème structurel → les features sont normalisées L2, le réseau
+    reste aveugle à l'ampleur de son erreur, et la frontière ne bougera
+    pas beaucoup
 
-Le script cherche les JSON dans les dossiers runs/balayage_<axe>_<variante>/
-et prend le premier trouvé. Un axe absent est signalé et ignoré : on peut
-donc lancer la comparaison avec seulement deux axes sur trois.
+Les deux issues sont un résultat exploitable.
 
+PRÉREQUIS
+Cette variante suppose que KalmanNet_Drones.py a été modifié pour
+accepter TRAIN_OFFSET_SWEEP et TRAIN_OFFSET_RANGE (voir
+patch_kalmannet_drones.md). Sans la modification, le script s'arrête avec
+un message explicite plutôt que d'entraîner silencieusement un modèle à
+offset fixe.
 
-UNE PRÉCAUTION DE LECTURE
-Tous les modèles sont testés dans des conditions IDENTIQUES, celles de la
-baseline étroite (offset figé à 0,3 sur l'axe bruit, bruit figé à 0 dB sur
-l'axe offset). C'est ce qu'il faut pour une comparaison équitable, mais
-cela signifie qu'aucun modèle n'est testé à son propre optimum sur les
-axes croisés. Un minimum décalé n'est donc pas une anomalie.
-
-OÙ SE LIT LA GÉNÉRALISATION DU MODÈLE ÉTENDU
-Son entraînement couvre les offsets [0, 2] : la zone est tracée en fond
-sur la figure. Les points 3,0 et 5,0 sont HORS de cette zone, et ce sont
-eux seuls qui mesurent la généralisation. Jusqu'à 2,0 on mesure
-l'apprentissage du domaine couvert, ce qui est utile mais différent.
-
-À LANCER :
-    python comparaison_narrow_wide.py
+À LANCER (trois fois, en changeant SEED) :
+    python entrainement.py
 """
 
 import os
-import glob
 import json
+import math
+import time
 
 import numpy as np
-import matplotlib.pyplot as plt
+import torch
 
-from moteur_balayage import franchissement
+from KalmanNet_Drones import (
+    CFG, SystemModel, EKF, KalmanNetNN,
+    generate_dataset, save_dataset, train, run_knet, plot_loss,
+)
+from metriques import (
+    GROUPES, mse_par_groupe, delta_db, moyenne_ic95, afficher_tableau,
+)
 
 
 # ==========================================================================
-# 1. RÉGLAGES
+# 1. RÉGLAGES DE L'EXPÉRIENCE
+#    Les deux seules lignes à modifier d'un run à l'autre.
 # ==========================================================================
 
-DOSSIER_RUNS = "./runs"
-JEU = "dev"
+SEED = 42                     # 42, puis 1234, puis 7
+VARIANTE = "narrow"           # "narrow" | "wide" | "offsetsweep" | "offsethigh"
 
-# Axes numériques : valeur balayée continue, courbe et frontière possibles.
-AXES_NUMERIQUES = {
-    "balayage_offset": {
-        "titre": "Offset initial",
-        "label_x": "Amplitude de l'offset initial (x écart-type de P0)",
-        "point_entrainement_narrow": 0.3,
-        "point_entrainement_wide": 1.0,
-        # Le modèle étendu ne s'entraîne pas sur un point mais sur la
-        # plage [0, 2] : on la trace comme une zone, pas comme une ligne.
-        "plage_entrainement_offsetsweep": (0.0, 2.0),
+ARCHI = "archi2"
+
+N_TRAIN = 400
+N_VAL = 80
+N_TEST = 50                   # >= 50 pour un intervalle de confiance utile
+
+RUN_NAME = f"baseline_{VARIANTE}_{ARCHI}_seed{SEED}"
+OUT_DIR = os.path.join("./runs", RUN_NAME)
+
+
+# ==========================================================================
+# 2. LES TROIS CONFIGURATIONS
+# ==========================================================================
+# Chaque entrée décrit entièrement une variante. Mettre les trois côte à
+# côte dans un seul dictionnaire rend les différences lisibles d'un coup
+# d'œil, au lieu de les disséminer dans des branches if/else.
+#
+# offset_range : None  -> offset fixe, valeur donnée par offset_scale
+#                (a, b) -> offset tiré au hasard dans [a, b] par trajectoire
+
+CONFIGURATIONS = {
+    "narrow": {
+        "bruit_sweep": False,
+        "bruit_db": (0.0, 0.0),
+        "commande_randomisee": False,
+        "familles": (),
+        "offset_scale": 0.3,
+        "offset_range": None,
     },
-    "balayage_bruit": {
-        "titre": "Niveau de bruit de mesure",
-        "label_x": "Niveau de bruit  1/r²  [dB]   (gauche = plus bruité)",
-        "point_entrainement_narrow": 0.0,
-        "point_entrainement_wide": None,   # plage [-10, +30], pas un point
+    "wide": {
+        "bruit_sweep": True,
+        "bruit_db": (-10.0, 30.0),
+        "commande_randomisee": True,
+        "familles": ("phases3_rand", "ou"),
+        "offset_scale": 1.0,
+        "offset_range": None,
+    },
+    "offsetsweep": {
+        "bruit_sweep": True,
+        "bruit_db": (-10.0, 30.0),
+        "commande_randomisee": True,
+        "familles": ("phases3_rand", "ou"),
+        "offset_scale": 1.0,        # ignoré quand offset_range est défini
+        "offset_range": (0.0, 2.0),
+    },
+    # Même largeur de plage que "offsetsweep", mais décalée vers le haut.
+    # Les deux variantes sont donc directement comparables : seule la
+    # POSITION du domaine change, pas sa taille.
+    "offsethigh": {
+        "bruit_sweep": True,
+        "bruit_db": (-10.0, 30.0),
+        "commande_randomisee": True,
+        "familles": ("phases3_rand", "ou"),
+        "offset_scale": 3.0,        # ignoré quand offset_range est défini
+        "offset_range": (2.0, 4.0),
     },
 }
 
-# Axe catégoriel : familles non ordonnées, diagramme en barres, pas de
-# frontière (on n'interpole pas entre deux familles).
-AXES_CATEGORIELS = {
-    "balayage_commande": {"titre": "Familles de commande"},
-}
 
-SEUILS = (0.0, 3.0)
+def appliquer_configuration():
+    """Écrase les réglages de CFG pour la variante choisie.
 
-DOSSIER_SORTIE = "./runs/comparaison"
-
-# Les trois variantes, dans l'ordre où elles doivent apparaître partout :
-# figures, tableaux, légendes. Ajouter une variante se fait ici et nulle
-# part ailleurs.
-VARIANTES = ("narrow", "wide", "offsetsweep")
-
-COULEURS = {
-    "narrow": "tab:blue",
-    "wide": "tab:red",
-    "offsetsweep": "tab:green",
-}
-
-ETIQUETTES = {
-    "narrow": "baseline étroite",
-    "wide": "modèle large",
-    "offsetsweep": "modèle étendu",
-}
-
-# Abréviations pour la colonne des écarts, où la place manque.
-ABREGE = {"narrow": "étr", "wide": "lrg", "offsetsweep": "étd"}
-
-
-# ==========================================================================
-# 2. LECTURE DES FICHIERS
-# ==========================================================================
-
-def charger_json(nom_axe, variante):
-    """Trouve et lit le JSON d'un balayage.
-
-    On cherche par motif plutôt que par nom exact : les fichiers produits
-    avant l'ajout de la constante VARIANTE s'appellent simplement
-    balayage_bruit_dev.json, les plus récents balayage_bruit_narrow_dev.json.
-    Le dossier, lui, porte toujours la variante.
+    Attention : la plupart des attributs de CFG sont lus au moment de
+    l'exécution, donc les modifier ici suffit. Mais OUT_DIR et
+    DATASET_PATH sont calculés une seule fois, à l'import du module :
+    il faut donc les réécrire explicitement, sinon les sorties partent
+    dans les anciens dossiers et écrasent d'anciens résultats.
     """
-    dossier = os.path.join(DOSSIER_RUNS, f"{nom_axe}_{variante}")
-    fichiers = sorted(glob.glob(os.path.join(dossier, "*.json")))
-    if not fichiers:
-        # Le modèle étendu n'est balayé que sur l'axe offset : son absence
-        # ailleurs est normale et ne mérite pas d'avertissement.
-        if variante != "offsetsweep":
-            print(f"!! aucun JSON dans {dossier}")
-        return None
-    with open(fichiers[0], encoding="utf-8") as fh:
-        return json.load(fh)
+    if VARIANTE not in CONFIGURATIONS:
+        raise SystemExit(f"Variante inconnue : {VARIANTE!r}. "
+                         f"Choisir parmi {sorted(CONFIGURATIONS)}.")
+    config = CONFIGURATIONS[VARIANTE]
+
+    CFG.SEED = SEED
+    CFG.ARCHI_TO_TRAIN = ARCHI
+    CFG.N_TRAIN, CFG.N_VAL, CFG.N_TEST = N_TRAIN, N_VAL, N_TEST
+    CFG.USE_SAVED_DATASET = False
+    CFG.MODE_MONTE_CARLO = False
+    CFG.PLOT_MSE_DB = False
+    CFG.PLOT_NCI = False
+
+    CFG.TRAIN_NOISE_SWEEP = config["bruit_sweep"]
+    CFG.TRAIN_NOISE_DB = config["bruit_db"]
+    CFG.TRAIN_CMD_RANDOMIZE = config["commande_randomisee"]
+    if config["familles"]:
+        CFG.TRAIN_CMD_FAMILIES = config["familles"]
+
+    CFG.INIT_OFFSET_P0 = True
+    CFG.INIT_OFFSET_SCALE = config["offset_scale"]
+
+    if config["offset_range"] is None:
+        CFG.TRAIN_OFFSET_SWEEP = False
+    else:
+        verifier_patch_applique()
+        CFG.TRAIN_OFFSET_SWEEP = True
+        CFG.TRAIN_OFFSET_RANGE = config["offset_range"]
+
+    CFG.OUT_DIR = OUT_DIR
+    CFG.DATASET_PATH = os.path.join(OUT_DIR, "dataset.npz")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    return config
 
 
-def courbe_moyenne(donnees):
-    """Delta_dB moyenné sur les graines, valeur par valeur.
+def verifier_patch_applique():
+    """Vérifie que generate_trajectory sait tirer l'offset au hasard.
 
-    On recalcule depuis les points plutôt que de lire la clé "resume" :
-    cela marche pour les deux formats de JSON (numérique et catégoriel).
+    Sans cette vérification, un oubli du patch produirait silencieusement
+    un modèle à offset fixe portant le nom "offsetsweep" — une erreur
+    coûteuse à détecter, puisqu'elle ne se verrait qu'aux résultats.
     """
-    seeds = [str(s) for s in donnees["seeds"]]
-    valeurs, moyennes, incertitudes = [], [], []
-    for point in donnees["points"]:
-        valeurs.append(point["valeur"])
-        moyennes.append(np.mean([point["par_seed"][s]["delta_db"]
-                                 for s in seeds]))
-        incertitudes.append(np.mean([point["par_seed"][s]["ic95"]
-                                     for s in seeds]))
-    return valeurs, np.array(moyennes), np.array(incertitudes)
+    import inspect
+    from KalmanNet_Drones import generate_trajectory
+    code = inspect.getsource(generate_trajectory)
+    if "TRAIN_OFFSET_SWEEP" not in code:
+        raise SystemExit(
+            "generate_trajectory ne gère pas TRAIN_OFFSET_SWEEP.\n"
+            "Applique d'abord la modification décrite dans "
+            "patch_kalmannet_drones.md, sinon l'offset resterait fixe.")
 
 
-def mse_moyennes(donnees):
-    """MSE position : celle de KalmanNet (moyennée sur les graines) et
-    celle de l'EKF de référence."""
-    seeds = [str(s) for s in donnees["seeds"]]
-    knet, ekf = [], []
-    for point in donnees["points"]:
-        knet.append(np.mean([point["par_seed"][s]["mse_knet_position"]
-                             for s in seeds]))
-        ekf.append(point["mse_ekf_position"])
-    return np.array(knet), np.array(ekf)
+def resume_configuration(config):
+    """Description lisible de la configuration, pour l'affichage et le JSON."""
+    if config["offset_range"] is None:
+        offset = f"fixe à {config['offset_scale']}"
+    else:
+        lo, hi = config["offset_range"]
+        offset = f"tiré dans [{lo}, {hi}]"
 
-
-# ==========================================================================
-# 3. FIGURE POUR UN AXE NUMÉRIQUE
-# ==========================================================================
-
-def figure_axe_numerique(nom_axe, config, donnees_par_variante, chemin):
-    """Deux panneaux, deux variantes superposées."""
-    fig, (ax_rel, ax_abs) = plt.subplots(1, 2, figsize=(13, 5))
-
-    for variante, donnees in donnees_par_variante.items():
-        valeurs, moyennes, ic = courbe_moyenne(donnees)
-        couleur = COULEURS[variante]
-
-        ax_rel.plot(valeurs, moyennes, marker="o", lw=2, color=couleur,
-                    label=ETIQUETTES[variante])
-        ax_rel.fill_between(valeurs, moyennes - ic, moyennes + ic,
-                            color=couleur, alpha=0.15)
-
-        knet, ekf = mse_moyennes(donnees)
-        ax_abs.plot(valeurs, knet, marker="o", lw=2, color=couleur,
-                    label=f"KNet {ETIQUETTES[variante]}")
-
-    # L'EKF est le même dans les deux cas : on ne le trace qu'une fois.
-    une_variante = next(iter(donnees_par_variante.values()))
-    valeurs, _, _ = courbe_moyenne(une_variante)
-    _, ekf = mse_moyennes(une_variante)
-    ax_abs.plot(valeurs, ekf, "ks--", lw=2, label="EKF de référence")
-
-    ax_rel.axhline(0, color="k", lw=1.2, label="parité avec l'EKF")
-    ax_rel.axhline(3.0, color="crimson", ls="-.", lw=1.2, label="repère +3 dB")
-
-    for variante in VARIANTES:
-        if variante not in donnees_par_variante:
-            continue
-        point = config.get(f"point_entrainement_{variante}")
-        if point is not None:
-            ax_rel.axvline(point, color=COULEURS[variante], ls=":", lw=1.4)
-        plage = config.get(f"plage_entrainement_{variante}")
-        if plage is not None:
-            lo, hi = plage
-            ax_rel.axvspan(lo, hi, color=COULEURS[variante], alpha=0.08)
-
-    ax_rel.set_xlabel(config["label_x"])
-    ax_rel.set_ylabel(r"$\Delta_{dB}$ position   (< 0 : KNet meilleur)")
-    ax_rel.set_title("Performance relative")
-    ax_rel.grid(True, ls=":", alpha=0.7)
-    ax_rel.legend(fontsize=8)
-
-    ax_abs.set_yscale("log")
-    ax_abs.set_xlabel(config["label_x"])
-    ax_abs.set_ylabel("MSE position (échelle log)")
-    ax_abs.set_title("Performance absolue")
-    ax_abs.grid(True, ls=":", alpha=0.7, which="both")
-    ax_abs.legend(fontsize=8)
-
-    fig.suptitle(f"{config['titre']} — étroite vs large "
-                 f"(pointillés : point d'entraînement de chaque modèle)")
-    fig.tight_layout()
-    fig.savefig(chemin, dpi=140)
-    plt.close(fig)
-    return chemin
+    bruit = (f"tiré dans {config['bruit_db']} dB"
+             if config["bruit_sweep"] else "fixe à 0 dB")
+    commande = (f"tirée parmi {list(config['familles'])}"
+                if config["commande_randomisee"] else "3 phases nominale")
+    return {"bruit": bruit, "commande": commande, "offset": offset}
 
 
 # ==========================================================================
-# 4. FIGURE POUR UN AXE CATÉGORIEL
+# 3. CORRECTION DE LA COURBE DE LOSS
 # ==========================================================================
 
-def figure_axe_categoriel(config, donnees_par_variante, chemin):
-    """Barres groupées : une paire narrow/wide par famille."""
-    une_variante = next(iter(donnees_par_variante.values()))
-    noms = [p["valeur"] for p in une_variante["points"]]
-    x = np.arange(len(noms))
-    largeur = 0.35
+def facteur_correction_loss():
+    """Nombre de fenêtres TBPTT par séquence.
 
-    fig, (ax_rel, ax_abs) = plt.subplots(1, 2, figsize=(14, 5))
+    Dans train(), la loss d'entraînement est sommée une fois par fenêtre
+    TBPTT (8 fenêtres pour T=160 et TBPTT=20) mais divisée seulement par
+    le nombre de batches. Elle ressort donc 8 fois trop grande, alors que
+    la loss de validation est bien divisée par T. Sans cette correction,
+    la figure montre un écart train/val spectaculaire et faux.
 
-    for i, (variante, donnees) in enumerate(donnees_par_variante.items()):
-        _, moyennes, ic = courbe_moyenne(donnees)
-        decalage = (i - 0.5) * largeur
-        ax_rel.bar(x + decalage, moyennes, largeur, yerr=ic, capsize=3,
-                   color=COULEURS[variante], label=ETIQUETTES[variante])
-
-        knet, _ = mse_moyennes(donnees)
-        ax_abs.bar(x + decalage, knet, largeur, color=COULEURS[variante],
-                   label=f"KNet {ETIQUETTES[variante]}")
-
-    _, ekf = mse_moyennes(une_variante)
-    ax_abs.plot(x, ekf, "ks--", lw=2, label="EKF de référence")
-
-    ax_rel.axhline(0, color="k", lw=1.2)
-    ax_rel.axhline(3.0, color="crimson", ls="-.", lw=1.2, label="repère +3 dB")
-    for ax in (ax_rel, ax_abs):
-        ax.set_xticks(x)
-        ax.set_xticklabels(noms, rotation=20, ha="right", fontsize=8)
-        ax.grid(True, axis="y", ls=":", alpha=0.7)
-        ax.legend(fontsize=8)
-
-    ax_rel.set_ylabel(r"$\Delta_{dB}$ position")
-    ax_rel.set_title("Performance relative")
-    ax_abs.set_yscale("log")
-    ax_abs.set_ylabel("MSE position (échelle log)")
-    ax_abs.set_title("Performance absolue")
-
-    fig.suptitle(f"{config['titre']} — étroite vs large")
-    fig.tight_layout()
-    fig.savefig(chemin, dpi=140)
-    plt.close(fig)
-    return chemin
-
-
-# ==========================================================================
-# 5. SYNTHÈSE CHIFFRÉE
-# ==========================================================================
-
-def frontieres(donnees, seuils):
-    """Franchissement de chaque seuil sur la courbe moyenne."""
-    valeurs, moyennes, _ = courbe_moyenne(donnees)
-    return {str(s): franchissement(valeurs, list(moyennes), s) for s in seuils}
-
-
-def texte_frontiere(valeur):
-    return f"{valeur:+.2f}" if valeur is not None else "hors plage"
-
-
-def synthese_numerique(nom_axe, donnees_par_variante):
-    """Tableau des frontières, une colonne par variante présente.
-
-    L'écart est toujours mesuré par rapport à la baseline étroite, qui
-    sert de référence à toute l'étude.
+    On corrige l'affichage a posteriori plutôt que de modifier train() :
+    les poids appris sont corrects, et les runs déjà faits restent
+    comparables.
     """
-    presentes = [v for v in VARIANTES if v in donnees_par_variante]
-    resultats = {v: frontieres(donnees_par_variante[v], SEUILS)
-                 for v in presentes}
-
-    print(f"\n-- {nom_axe} --")
-    entete = f"{'seuil':>10}"
-    for v in presentes:
-        entete += f" {ETIQUETTES[v]:>18}"
-    if "narrow" in presentes:
-        entete += f" {'écart / étroite':>18}"
-    print(entete)
-
-    for seuil in SEUILS:
-        cle = str(seuil)
-        etiquette = "parité" if seuil == 0 else f"+{seuil:g} dB"
-        ligne = f"{etiquette:>10}"
-        for v in presentes:
-            ligne += f" {texte_frontiere(resultats[v][cle]):>18}"
-
-        if "narrow" in presentes:
-            reference = resultats["narrow"][cle]
-            ecarts = []
-            for v in presentes:
-                if v == "narrow":
-                    continue
-                valeur = resultats[v][cle]
-                if reference is not None and valeur is not None:
-                    ecarts.append(f"{ABREGE[v]} {valeur - reference:+.2f}")
-            ligne += f" {' '.join(ecarts) if ecarts else 'n/a':>18}"
-        print(ligne)
-
-    return resultats
-
-
-def synthese_categorielle(nom_axe, donnees_par_variante):
-    """Delta_dB par famille, une colonne par variante présente."""
-    une = next(iter(donnees_par_variante.values()))
-    noms = [p["valeur"] for p in une["points"]]
-
-    presentes = [v for v in VARIANTES if v in donnees_par_variante]
-    resultats = {}
-    for variante in presentes:
-        _, moyennes, _ = courbe_moyenne(donnees_par_variante[variante])
-        resultats[variante] = {n: float(m) for n, m in zip(noms, moyennes)}
-
-    print(f"\n-- {nom_axe} --")
-    entete = f"{'famille':<24}"
-    for v in presentes:
-        entete += f" {ETIQUETTES[v]:>18}"
-    print(entete)
-
-    for nom in noms:
-        ligne = f"{nom:<24}"
-        for v in presentes:
-            valeur = resultats[v].get(nom)
-            ligne += f" {valeur:>+18.2f}" if valeur is not None else f" {'-':>18}"
-        print(ligne)
-
-    return resultats
+    return math.ceil(CFG.T / getattr(CFG, "TBPTT", 20))
 
 
 # ==========================================================================
-# 6. PROGRAMME PRINCIPAL
+# 4. ÉVALUATION EN DISTRIBUTION
+# ==========================================================================
+
+def evaluer(sm, model, ekf, data_test):
+    """Compare KalmanNet et l'EKF sur chaque trajectoire de test.
+
+    Le Delta_dB est calculé trajectoire par trajectoire, puis moyenné.
+    C'est ce qui permet d'assortir le résultat d'un intervalle de
+    confiance : une moyenne sans dispersion ne se compare à rien.
+    """
+    Xte, Yte, Ute, Mte = data_test
+    n = Xte.shape[0]
+
+    mse_knet = {g: [] for g in GROUPES}
+    mse_ekf = {g: [] for g in GROUPES}
+    deltas = []
+
+    for i in range(n):
+        X, Y, U, M = Xte[i], Yte[i], Ute[i], Mte[i]
+        x_ekf, _ = ekf.run(Y, U, M)
+        x_knet = run_knet(sm, model, Y, U, M)
+
+        mk, me = mse_par_groupe(x_knet, X), mse_par_groupe(x_ekf, X)
+        for g in GROUPES:
+            mse_knet[g].append(mk[g])
+            mse_ekf[g].append(me[g])
+        deltas.append(delta_db(mk["position"], me["position"]))
+
+    moyenne, ic95 = moyenne_ic95(deltas)
+
+    return {
+        "n_test": n,
+        "mse_knet": {g: float(np.mean(v)) for g, v in mse_knet.items()},
+        "mse_ekf": {g: float(np.mean(v)) for g, v in mse_ekf.items()},
+        "delta_db_position": moyenne,
+        "delta_db_ic95": ic95,
+    }
+
+
+# ==========================================================================
+# 5. PROGRAMME PRINCIPAL
 # ==========================================================================
 
 def main():
-    os.makedirs(DOSSIER_SORTIE, exist_ok=True)
-    print("== Comparaison baseline étroite vs modèle large ==")
-    print("   (les deux modèles sont testés dans des conditions identiques,")
-    print("    celles de la baseline étroite)\n")
+    config = appliquer_configuration()
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
 
-    synthese = {}
-    figures = []
+    # Graines distinctes : aucune trajectoire d'entraînement ne peut se
+    # retrouver en validation ou en test.
+    seed_train, seed_val, seed_test = SEED, SEED + 1, SEED + 99
+    assert len({seed_train, seed_val, seed_test}) == 3
 
-    # --- Axes numériques -------------------------------------------------
-    for nom_axe, config in AXES_NUMERIQUES.items():
-        donnees = {}
-        for variante in VARIANTES:
-            d = charger_json(nom_axe, variante)
-            if d is not None:
-                donnees[variante] = d
-        if not donnees:
-            continue
+    description = resume_configuration(config)
+    print(f"== Run : {RUN_NAME} ==")
+    print(f"   sortie   : {OUT_DIR}")
+    print(f"   device   : {CFG.DEVICE}")
+    print(f"   bruit    : {description['bruit']}")
+    print(f"   commande : {description['commande']}")
+    print(f"   offset   : {description['offset']}")
+    print(f"   graines  : train={seed_train} val={seed_val} test={seed_test}")
 
-        chemin = os.path.join(DOSSIER_SORTIE, f"comparaison_{nom_axe}.png")
-        figures.append(figure_axe_numerique(nom_axe, config, donnees, chemin))
-        synthese[nom_axe] = synthese_numerique(nom_axe, donnees)
+    sm = SystemModel()
+    ekf = EKF(sm)
 
-    # --- Axe catégoriel --------------------------------------------------
-    for nom_axe, config in AXES_CATEGORIELS.items():
-        donnees = {}
-        for variante in VARIANTES:
-            d = charger_json(nom_axe, variante)
-            if d is not None:
-                donnees[variante] = d
-        if not donnees:
-            continue
+    # --- Données ---------------------------------------------------------
+    print("\n== Génération des données ==")
+    t0 = time.time()
+    data_train = generate_dataset(sm, N_TRAIN, seed=seed_train,
+                                  noise_sweep=CFG.TRAIN_NOISE_SWEEP)
+    data_val = generate_dataset(sm, N_VAL, seed=seed_val,
+                                noise_sweep=CFG.TRAIN_NOISE_SWEEP)
+    data_test = generate_dataset(sm, N_TEST, seed=seed_test,
+                                 noise_sweep=CFG.TRAIN_NOISE_SWEEP)
+    save_dataset(data_train, data_val, data_test)
+    print(f"   {time.time() - t0:.1f} s")
 
-        chemin = os.path.join(DOSSIER_SORTIE, f"comparaison_{nom_axe}.png")
-        figures.append(figure_axe_categoriel(config, donnees, chemin))
-        synthese[nom_axe] = synthese_categorielle(nom_axe, donnees)
+    # --- Entraînement ----------------------------------------------------
+    print(f"\n== Entraînement {ARCHI} ==")
+    model = KalmanNetNN(sm, archi=ARCHI)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"   paramètres : {n_params}")
 
-    chemin_json = os.path.join(DOSSIER_SORTIE, "comparaison.json")
-    with open(chemin_json, "w", encoding="utf-8") as fh:
-        json.dump(synthese, fh, indent=2, ensure_ascii=False)
+    t0 = time.time()
+    hist_train, hist_val, ckpt = train(sm, model, data_train, data_val, tag=ARCHI)
+    duree = time.time() - t0
 
-    print(f"\n== Synthèse -> {chemin_json}")
-    for f in figures:
-        print(f"== Figure   -> {f}")
+    k = facteur_correction_loss()
+    hist_train = [v / k for v in hist_train]
+    print(f"   loss train divisée par {k} (fenêtres TBPTT) pour l'affichage")
+    fig = plot_loss(hist_train, hist_val, ARCHI, OUT_DIR)
+
+    # On recharge le meilleur checkpoint, pas le modèle de la dernière epoch.
+    etat = torch.load(ckpt, map_location=sm.device)
+    model.load_state_dict(etat["state_dict"])
+
+    # --- Évaluation ------------------------------------------------------
+    # Attention : le jeu de test suit la MÊME configuration que
+    # l'entraînement. Pour la variante offsetsweep, il contient donc des
+    # offsets variés — ce Delta_dB n'est pas directement comparable à
+    # celui des deux autres variantes. La comparaison équitable se fait
+    # via les balayages, où les conditions de test sont identiques.
+    print("\n== Évaluation en distribution ==")
+    res = evaluer(sm, model, ekf, data_test)
+    afficher_tableau(res["mse_knet"], res["mse_ekf"])
+    print()
+    print(f"   Delta_dB (position) : {res['delta_db_position']:+.2f} "
+          f"+/- {res['delta_db_ic95']:.2f} dB (IC95, n={res['n_test']})")
+    print("   Delta_dB < 0  =>  KalmanNet meilleur que l'EKF")
+
+    # --- Traçabilité -----------------------------------------------------
+    manifeste = {
+        "run_name": RUN_NAME,
+        "variante": VARIANTE,
+        "seed": SEED,
+        "archi": ARCHI,
+        "configuration": config,
+        "description": description,
+        "n_train": N_TRAIN, "n_val": N_VAL, "n_test": N_TEST,
+        "T": CFG.T, "n_epochs": CFG.N_EPOCHS, "lr": CFG.LR,
+        "n_params": n_params,
+        "train_time_s": round(duree, 1),
+        "best_val_loss": float(min(hist_val)),
+        "hist_train": hist_train,
+        "hist_val": hist_val,
+        "resultats": res,
+        "checkpoint": ckpt,
+    }
+    chemin = os.path.join(OUT_DIR, "manifest.json")
+    with open(chemin, "w", encoding="utf-8") as fh:
+        json.dump(manifeste, fh, indent=2, ensure_ascii=False)
+
+    print(f"\n== Manifeste  -> {chemin}")
+    print(f"== Figure     -> {fig}")
+    print(f"== Checkpoint -> {ckpt}")
 
 
 if __name__ == "__main__":
